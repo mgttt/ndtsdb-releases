@@ -4,6 +4,23 @@
 
 **核心已完成** — 从零到一个功能完整的嵌入式时序数据库。
 
+### 迁移发现的问题 (quant-lib → ndtsdb)
+
+从 DuckDB 迁移到 ndtsdb 过程中发现的架构限制：
+
+| 限制 | 影响 | 当前 workaround | 优先级 |
+|------|------|-----------------|--------|
+| **Append-only 写入** | 无法 DELETE/UPDATE，需重写整个文件 | 读取→过滤→重写 | 🔴 高 |
+| **有限 SQL 支持** | 无 JOIN、子查询、复杂 WHERE | 手动 TS 过滤 | 🔴 高 |
+| **无二级索引** | SymbolTable 仅支持主键，无范围索引 | 全表扫描 | 🟡 中 |
+| **字符串字典编码** | 需手动管理 SymbolTable | 封装在 Provider 层 | 🟡 中 |
+| **无事务支持** | 无 ACID，chunk 写入可能部分失败 | CRC32 + 定期备份 | 🟡 中 |
+| **分析能力弱** | 无 GROUP BY、窗口函数、统计函数 | 手动计算或导出 | 🟢 低 |
+
+**结论**：ndtsdb 适合**追加型时序数据**（K线、Tick），不适合**频繁更新**的 OLTP 场景。
+
+---
+
 | 能力 | 实现 | 性能 |
 |------|------|------|
 | 列式存储 | ColumnarTable, 8 字节对齐 | 6.9M writes/s |
@@ -28,34 +45,74 @@
 
 ## 下一步方向
 
-### 值得做 (高收益)
+### 🔴 高优先级（解决迁移阻塞问题）
 
-**1. quant-lab 新工具逐步接入** ⭐⭐⭐
+**1. 支持 UPDATE/DELETE（重写优化）** ⭐⭐⭐
 
-quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
-新增工具/模块优先用 ndtsdb，逐步验证：
-- 新的数据采集管道 → AppendWriter
-- 新的回测引擎 → MmapMergeStream
-- 新的分析工具 → SAMPLE BY / 窗口函数
+Append-only 是最大限制。方案：
+- 添加 `CompactWriter`：读取旧 chunk → 应用变更 → 写入新文件
+- 支持 tombstone 标记（软删除，定期 compact）
+- 参考 LSM-Tree 的合并策略
 
-**2. 真实数据验证**
+```typescript
+// 目标 API
+await table.deleteWhere({ symbol: 'BTC', before: 1700000000000 });
+await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
+```
 
-现有基准都是合成数据。需要用真实 Binance/TV K 线数据测试：
-- 实际压缩率
-- 实际回放性能
-- 实际内存占用
+**2. 增强 SQL 执行器** ⭐⭐⭐
 
-### 可以做 (中等收益)
+当前 SQL 仅支持简单 SELECT。需添加：
+- JOIN 支持（至少 INNER JOIN）
+- 复杂 WHERE（AND/OR 嵌套）
+- 子查询（用于先过滤再聚合）
+- 聚合函数（COUNT DISTINCT, STDDEV）
 
-**4. 错误处理规范化**
+### 🟡 中优先级（提升易用性）
+
+**3. 自动二级索引**
+
+当前 SymbolTable 只支持 symbol → id 映射。需支持：
+- 范围查询索引（BTree on timestamp）
+- 多列复合索引
+- 自动维护（写入时更新索引）
+
+```typescript
+const table = new IndexedTable([
+  { name: 'timestamp', type: 'int64', index: 'btree' },
+  { name: 'price', type: 'float64', index: 'bitmap' },
+]);
+```
+
+**4. 字符串原生支持**
+
+当前需手动用 SymbolTable。目标：
+- ColumnarTable 直接支持 `string` 类型
+- 内部自动字典编码（对用户透明）
+- 可变长字符串存储（当前固定字典）
+
+**5. 轻量级事务**
+
+Chunk 级原子写入：
+- 多 chunk 批量写入的原子性
+- 回滚机制（写入失败时删除临时 chunk）
+- WAL（Write-Ahead Log）用于崩溃恢复
+
+### 🟢 低优先级（锦上添花）
+
+**6. 错误处理规范化**
 
 目前异常处理不一致（有些 throw，有些 console.warn）。统一为：
 - 可恢复错误: 返回 Result 类型
 - 不可恢复: throw 标准 Error 子类
 
-**5. `bun test` 自动化**
+**7. 真实数据验证**
 
-10 个测试文件都是手动运行的。改为 bun test 格式，加 CI。
+现有基准都是合成数据。需用真实 Binance/TV K 线验证：
+- 实际压缩率
+- 实际回放性能
+- 内存占用（特别是 mmap 场景）
+- 与 DuckDB 的端到端性能对比
 
 ### 不急的 (低收益或过度工程)
 
@@ -111,6 +168,8 @@ quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
 
 ## 里程碑
 
+### 已完成
+
 | 版本 | 时间 | 完成 |
 |------|------|------|
 | v0.8 | 02-08 | 列式存储 + C SIMD + SQL + 压缩 + 索引 + mmap |
@@ -120,9 +179,17 @@ quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
 | **v0.9.0** | 02-09 PM | **io_uring 评估** → 结论：不适合小文件场景 |
 | **v0.9.0** | 02-09 PM | **Gorilla 压缩移入 C** (3.9M/s 压缩, 11.5M/s 解压) |
 | **v0.9.0** | 02-09 PM | **重命名 data-lib → ndtsdb** |
-| TBD | - | quant-lib 集成 |
-| TBD | - | 格式统一 (v1 → DLv2) |
-| TBD | - | 真实数据验证 |
+| **v0.10.0** | 02-09 | **quant-lib 完全迁移** → DuckDB 依赖移除 |
+
+### 规划中
+
+| 版本 | 优先级 | 目标 |
+|------|--------|------|
+| **v0.11.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
+| **v0.12.0** | 🔴 高 | SQL JOIN + 复杂 WHERE |
+| **v0.13.0** | 🟡 中 | 自动二级索引（BTree） |
+| **v0.14.0** | 🟡 中 | 原生字符串类型（透明字典编码） |
+| **v1.0.0** | 🟢 低 | 事务支持（WAL + 原子写入）|
 
 ---
 
@@ -132,3 +199,28 @@ quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
 2. **零依赖核心** — 核心模块不依赖第三方库
 3. **渐进式加速** — JS → C FFI，自动回退到 JS
 4. **保持精简** — ~5600 行 TS，不膨胀
+5. **场景聚焦** — 专攻时序追加，不追求通用 OLTP
+
+### 适用场景
+
+✅ **强烈推荐**：
+- K线/Tick 数据采集（追加写入）
+- 全市场回测（mmap 多路归并）
+- 实时指标计算（SAMPLE BY + 窗口函数）
+- 日志/事件流存储
+
+❌ **不建议使用**：
+- 频繁 UPDATE/DELETE 的 OLTP
+- 复杂关系查询（多表 JOIN）
+- 需要 ACID 事务的金融交易
+- 字符串为主的数据（如用户评论）
+
+### 与 DuckDB 对比
+
+| 场景 | DuckDB | ndtsdb | 建议 |
+|------|--------|--------|------|
+| K线存储 | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ndtsdb（更快，更小） |
+| SQL 分析 | ⭐⭐⭐⭐⭐ | ⭐⭐ | DuckDB（完整 SQL） |
+| 事务处理 | ⭐⭐⭐⭐ | ⭐ | DuckDB（ACID） |
+| 嵌入式 | ⭐⭐ | ⭐⭐⭐⭐⭐ | ndtsdb（零依赖） |
+| 部署体积 | ~100MB | ~100KB | ndtsdb（轻量） |
