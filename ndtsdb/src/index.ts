@@ -1,0 +1,87 @@
+// ============================================================
+// ndtsdb: N-Dimensional Time Series Database
+//
+// 高性能嵌入式时序数据库 · 为量化交易而生
+// 技术栈: Bun · TypeScript · C FFI · mmap · zero-copy · Gorilla
+// ============================================================
+
+// ─── 核心存储 ────────────────────────────────────────
+
+export { ColumnarTable } from './columnar.js';
+export type { ColumnarType } from './columnar.js';
+
+// ─── 增量写入 + 完整性校验 ───────────────────────────
+
+export { AppendWriter, crc32 } from './append.js';
+
+// ─── 压缩 ────────────────────────────────────────────
+
+export { GorillaCompressor, GorillaDecompressor } from './compression.js';
+
+// ─── libndts (C FFI) ─────────────────────────────────
+
+export {
+  isNdtsReady,
+  int64ToF64,
+  countingSortArgsort,
+  gatherF64,
+  gorillaCompress,
+  gorillaDecompress,
+  binarySearchI64,
+  binarySearchBatchI64,
+  prefixSum,
+  deltaEncode,
+  deltaDecode,
+  ema,
+  sma,
+  rollingStd,
+} from './ndts-ffi.js';
+
+// ─── mmap + 全市场回放 ──────────────────────────────
+
+export { MmapPool, MmappedColumnarTable } from './mmap/pool.js';
+export { SmartPrefetcher, ProgressiveLoader } from './mmap/prefetcher.js';
+export { MmapMergeStream } from './mmap/merge.js';
+export type { ReplayTick, ReplaySnapshot, ReplayConfig, ReplayStats } from './mmap/merge.js';
+
+// ─── SQL ─────────────────────────────────────────────
+
+export { SQLParser, parseSQL } from './sql/parser.js';
+export { SQLExecutor } from './sql/executor.js';
+export type { SQLStatement, SQLSelect, SQLCondition, SQLQueryResult, SQLUpsert } from './sql/parser.js';
+
+// ─── 索引 ────────────────────────────────────────────
+
+export { RoaringBitmap, BitmapIndex, IndexManager } from './index/bitmap.js';
+export { BTreeIndex, TimestampIndex } from './index/btree.js';
+
+// ─── 时序查询 ────────────────────────────────────────
+
+export { sampleBy, ohlcv, latestOn, movingAverage, exponentialMovingAverage, rollingStdDev } from './query.js';
+export type { SampleByColumn, SampleByResult, AggType } from './query.js';
+
+// ─── 并行查询 ────────────────────────────────────────
+
+export { ParallelQueryEngine, parallelScan, parallelAggregate } from './parallel.js';
+
+// ─── 云存储 ──────────────────────────────────────────
+
+export { TieredStorageManager } from './cloud.js';
+
+// ─── 行式存储 (兼容) ─────────────────────────────────
+
+export { TSDB } from './storage.js';
+export { PartitionManager } from './partition.js';
+export { SymbolTable } from './symbol.js';
+export { WAL } from './wal.js';
+
+// ─── 类型 ────────────────────────────────────────────
+
+export type {
+  Row,
+  QueryOptions,
+  PartitionConfig,
+  TSDBOptions,
+  ColumnType,
+  ColumnDef,
+} from './types.js';

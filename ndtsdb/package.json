@@ -1,0 +1,23 @@
+{
+  "name": "ndtsdb",
+  "version": "0.9.2.3",
+  "description": "Lightweight embedded time-series database inspired by QuestDB",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "test": "bun test tests/ndtsdb.test.ts",
+    "test:smoke": "bun tests/smoke-test.ts",
+    "test:suite": "bun tests/test-suite.ts",
+    "test:all": "bun tests/smoke-test.ts && bun tests/test-suite.ts",
+    "benchmark": "bun tests/benchmark.ts",
+    "benchmark:3000": "bun tests/benchmark-3000.ts --full",
+    "example": "bun tests/example.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
