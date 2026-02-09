@@ -4,8 +4,21 @@
 // 目标：支持时序场景常用的 SQL 子集，并逐步扩展到窗口聚合能力。
 // ============================================================
 
-import { ColumnarTable } from '../columnar.js';
-import type { SQLStatement, SQLSelect, SQLCondition, SQLOperator, SQLUpsert } from './parser.js';
+import { ColumnarTable, type ColumnarType } from '../columnar.js';
+import type { SQLStatement, SQLSelect, SQLCondition, SQLOperator, SQLUpsert, SQLCreateTable } from './parser.js';
+
+type RollingStdFn = (src: Float64Array, window: number) => Float64Array;
+
+// 可选 native 加速：在 Bun 环境下尝试加载；在 Node 环境自动回退到纯 JS（避免 bun:ffi 导致 import 崩溃）
+let rollingStdNative: RollingStdFn | null = null;
+try {
+  if (typeof (globalThis as any).Bun !== 'undefined') {
+    const mod = await import('../ndts-ffi.js');
+    rollingStdNative = (mod as any).rollingStd as RollingStdFn;
+  }
+} catch {
+  rollingStdNative = null;
+}
 
 export interface SQLQueryResult {
   columns: string[];
@@ -45,6 +58,8 @@ export class SQLExecutor {
         return this.executeInsert(statement.data);
       case 'UPSERT':
         return this.executeUpsert(statement.data);
+      case 'CREATE TABLE':
+        return this.executeCreateTable(statement.data);
       default:
         throw new Error(`Unsupported statement type: ${statement.type}`);
     }
@@ -54,6 +69,10 @@ export class SQLExecutor {
   private executeSelect(select: SQLSelect): SQLQueryResult {
     const table = this.getTable(select.from);
     if (!table) throw new Error(`Table not found: ${select.from}`);
+
+    // Fast path: tail window query (典型用于波动率脚本：ORDER BY ts DESC LIMIT 1 + 多个 STDDEV(...) OVER (...))
+    const tail = this.tryExecuteTailWindow(select, table);
+    if (tail) return tail;
 
     const allColumns = table.getColumnNames ? table.getColumnNames() : this.inferColumnNames(table);
 
@@ -122,8 +141,16 @@ export class SQLExecutor {
         continue;
       }
 
-      // fallback：直接取原列名
-      out[s.name] = row[s.expr];
+      const expr = this.normalizeExpr(s.expr);
+
+      // 纯列名
+      if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr)) {
+        out[s.name] = row[expr];
+        continue;
+      }
+
+      // 表达式（向 DuckDB/SQLite 看齐：支持基础算术 + 常用函数）
+      out[s.name] = this.evalScalarExpr(expr, row);
     }
     return out;
   }
@@ -158,13 +185,39 @@ export class SQLExecutor {
     return matching;
   }
 
+  private sqlEquals(a: any, b: any): boolean {
+    if (a === b) return true;
+
+    // bigint ↔ number (only safe for finite integers)
+    if (typeof a === 'bigint' && typeof b === 'number' && Number.isFinite(b) && Number.isInteger(b)) {
+      return a === BigInt(b);
+    }
+    if (typeof a === 'number' && typeof b === 'bigint' && Number.isFinite(a) && Number.isInteger(a)) {
+      return BigInt(a) === b;
+    }
+
+    // bigint ↔ numeric string
+    if (typeof a === 'bigint' && typeof b === 'string' && /^[+-]?\d+$/.test(b)) {
+      try {
+        return a === BigInt(b);
+      } catch {}
+    }
+    if (typeof a === 'string' && typeof b === 'bigint' && /^[+-]?\d+$/.test(a)) {
+      try {
+        return BigInt(a) === b;
+      } catch {}
+    }
+
+    return false;
+  }
+
   private evaluateCondition(value: any, operator: SQLOperator, compareValue: any): boolean {
     switch (operator) {
       case '=':
-        return value === compareValue;
+        return this.sqlEquals(value, compareValue);
       case '!=':
       case '<>':
-        return value !== compareValue;
+        return !this.sqlEquals(value, compareValue);
       case '<':
         return value < compareValue;
       case '>':
@@ -174,7 +227,7 @@ export class SQLExecutor {
       case '>=':
         return value >= compareValue;
       case 'IN':
-        return Array.isArray(compareValue) && compareValue.includes(value);
+        return Array.isArray(compareValue) && compareValue.some((v) => this.sqlEquals(value, v));
       case 'LIKE':
         return this.likeMatch(String(value), String(compareValue));
       default:
@@ -185,6 +238,154 @@ export class SQLExecutor {
   private likeMatch(value: string, pattern: string): boolean {
     const regex = pattern.replace(/%/g, '.*').replace(/_/g, '.');
     return new RegExp(`^${regex}$`, 'i').test(value);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fast path: ORDER BY <col> DESC LIMIT 1 + window aggs over that <col>
+  // ---------------------------------------------------------------------------
+
+  private tryExecuteTailWindow(select: SQLSelect, table: ColumnarTable): SQLQueryResult | null {
+    // 条件尽量保守：只优化我们确定的波动率模式
+    if (!select.limit || select.limit !== 1) return null;
+    if (select.offset !== undefined) return null;
+    if (select.where && select.where.length > 0) return null;
+    if (select.groupBy && select.groupBy.length > 0) return null;
+    if (!select.orderBy || select.orderBy.length !== 1) return null;
+
+    const ob = select.orderBy[0];
+    if (ob.direction !== 'DESC') return null;
+    const orderCol = ob.column;
+
+    if (!table.getColumnNames || !table.getColumn) return null;
+
+    const rowCount = table.getRowCount();
+    if (rowCount <= 0) {
+      return { columns: [], rows: [], rowCount: 0 };
+    }
+    const lastIdx = rowCount - 1;
+
+    // 规范化选择项（保留 alias）
+    const selections: SelectItem[] = select.columns.map((c) => {
+      if (typeof c === 'string') return { expr: c, name: c };
+      return { expr: c.expr, name: c.alias || c.expr };
+    });
+
+    // 只允许：纯列名（可 alias） + window expr
+    const windowItems: Array<{ spec: WindowSpec; name: string; rawExpr: string }> = [];
+    for (const s of selections) {
+      const expr = this.normalizeExpr(s.expr);
+
+      // 纯列名 or *
+      const isIdent = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr);
+      if (expr === '*' || isIdent) continue;
+
+      const spec = this.parseWindowExpr(expr);
+      if (!spec) return null;
+
+      // 仅支持无 partition 的 tail 计算（每个 symbol 文件本身就是单分区）
+      if (spec.partitionBy && spec.partitionBy.length > 0) return null;
+
+      // OVER 必须 ORDER BY orderCol ASC
+      if (!spec.orderBy) return null;
+      if (spec.orderBy.column !== orderCol) return null;
+      if ((spec.orderBy.direction || 'ASC') !== 'ASC') return null;
+
+      // frame 必须是 ROWS BETWEEN N PRECEDING AND CURRENT ROW (N 为数字或 UNBOUNDED)
+      if (spec.frame && spec.frame.kind !== 'rows') return null;
+
+      windowItems.push({ spec, name: s.name, rawExpr: expr });
+    }
+
+    // 至少要有一个 window expr，否则没必要
+    if (windowItems.length === 0) return null;
+
+    const outRow: Record<string, any> = {};
+
+    // 先填充列名（含 alias）
+    for (const s of selections) {
+      const expr = this.normalizeExpr(s.expr);
+      if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr)) {
+        const col = table.getColumn(expr);
+        if (col) outRow[s.name] = (col as any)[lastIdx];
+      }
+    }
+
+    // 计算每个 window expr 的 last 值
+    for (const item of windowItems) {
+      const val = this.computeWindowTail(table, lastIdx, item.spec);
+      outRow[item.name] = val;
+    }
+
+    return {
+      columns: selections.map((s) => s.name),
+      rows: [outRow],
+      rowCount: 1,
+    };
+  }
+
+  private computeWindowTail(table: ColumnarTable, lastIdx: number, spec: WindowSpec): number {
+    if (spec.func === 'row_number') return lastIdx + 1;
+
+    const argCol = spec.arg && spec.arg !== '*' ? spec.arg : undefined;
+    if (!argCol) {
+      // count(*)
+      if (spec.func === 'count') return lastIdx + 1;
+      return NaN;
+    }
+
+    const col = table.getColumn(argCol) as any;
+    if (!col) return NaN;
+
+    const preceding = spec.frame?.preceding ?? 'unbounded';
+    const winLen = preceding === 'unbounded' ? (lastIdx + 1) : (preceding as number) + 1;
+
+    const start = Math.max(0, lastIdx - winLen + 1);
+    const n = lastIdx - start + 1;
+    if (n <= 0) return NaN;
+
+    if (spec.func === 'count') return n;
+
+    // 单 pass 聚合
+    let sum = 0;
+    let sumSq = 0;
+    let min = Infinity;
+    let max = -Infinity;
+
+    for (let i = start; i <= lastIdx; i++) {
+      const raw = col[i];
+      const v = typeof raw === 'bigint' ? Number(raw) : Number(raw);
+      if (!Number.isFinite(v)) return NaN;
+
+      sum += v;
+      sumSq += v * v;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+
+    switch (spec.func) {
+      case 'sum':
+        return sum;
+      case 'avg':
+        return sum / n;
+      case 'min':
+        return min;
+      case 'max':
+        return max;
+      case 'variance': {
+        if (n <= 1) return 0;
+        const mean = sum / n;
+        const varSamp = (sumSq - n * mean * mean) / (n - 1);
+        return Math.max(0, varSamp);
+      }
+      case 'stddev': {
+        if (n <= 1) return 0;
+        const mean = sum / n;
+        const varSamp = (sumSq - n * mean * mean) / (n - 1);
+        return Math.sqrt(Math.max(0, varSamp));
+      }
+      default:
+        return NaN;
+    }
   }
 
   private getColumnValue(table: ColumnarTable, column: string, rowIndex: number): any {
@@ -375,6 +576,75 @@ export class SQLExecutor {
 
       const preceding = spec.frame?.preceding ?? 'unbounded';
       const winLen = preceding === 'unbounded' ? Infinity : (preceding as number) + 1;
+
+      // Fast path: 固定 ROWS window 的 variance/stddev 用 libndts (rollingStd) 加速
+      // - rollingStd 是「population std」，这里转换成「sample std/var」以对齐 DuckDB/SQL 常见语义
+      if ((spec.func === 'stddev' || spec.func === 'variance') && rollingStdNative && winLen !== Infinity && argCol) {
+        const w = winLen as number;
+
+        if (w <= 1) {
+          for (let p = 0; p < indices.length; p++) {
+            out[indices[p]] = 0;
+          }
+          continue;
+        }
+
+        const values = new Float64Array(indices.length);
+        let allFinite = true;
+        for (let p = 0; p < indices.length; p++) {
+          const ridx = indices[p];
+          const raw = rows[ridx][argCol];
+          const v = typeof raw === 'bigint' ? Number(raw) : Number(raw);
+          if (!Number.isFinite(v)) {
+            allFinite = false;
+            break;
+          }
+          values[p] = v;
+        }
+
+        if (allFinite) {
+          const popStd = indices.length >= w ? rollingStdNative(values, w) : null;
+          const ratio = w / (w - 1); // pop → samp
+          const scale = Math.sqrt(ratio);
+
+          let sum = 0;
+          let sumSq = 0;
+
+          for (let p = 0; p < indices.length; p++) {
+            const ridx = indices[p];
+            const v = values[p];
+
+            // 前 w-1 行：frame 实际长度 < w，按真实 n 做 sample 统计（SQL window 语义）
+            if (!popStd || p < w - 1) {
+              sum += v;
+              sumSq += v * v;
+              const n = p + 1;
+              if (n <= 1) {
+                out[ridx] = 0;
+              } else {
+                const mean = sum / n;
+                const varSamp = (sumSq - n * mean * mean) / (n - 1);
+                out[ridx] = spec.func === 'stddev' ? Math.sqrt(Math.max(0, varSamp)) : Math.max(0, varSamp);
+              }
+              continue;
+            }
+
+            const sPop = popStd[p];
+            if (!Number.isFinite(sPop)) {
+              out[ridx] = NaN;
+              continue;
+            }
+
+            if (spec.func === 'stddev') {
+              out[ridx] = sPop * scale;
+            } else {
+              out[ridx] = (sPop * sPop) * ratio;
+            }
+          }
+
+          continue;
+        }
+      }
 
       // 目前 window 聚合仅支持数值列（count(*) 例外）
       const buf = winLen !== Infinity ? new Float64Array(winLen) : null;
@@ -635,6 +905,45 @@ export class SQLExecutor {
       }
       return 0;
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // CREATE TABLE
+  // ---------------------------------------------------------------------------
+
+  private executeCreateTable(create: SQLCreateTable): number {
+    const name = create.table;
+    if (this.getTable(name)) {
+      throw new Error(`Table already exists: ${name}`);
+    }
+
+    const columnDefs = create.columns.map((c) => ({
+      name: c.name,
+      type: this.mapSQLTypeToColumnarType(c.type),
+    }));
+
+    const table = new ColumnarTable(columnDefs);
+    this.registerTable(name, table);
+
+    return 0;
+  }
+
+  private mapSQLTypeToColumnarType(type: string): ColumnarType {
+    const t = String(type).trim().toUpperCase();
+
+    // int64
+    if (['INT64', 'BIGINT', 'LONG', 'TIMESTAMP', 'I64'].includes(t)) return 'int64';
+
+    // int32
+    if (['INT', 'INTEGER', 'INT32', 'I32'].includes(t)) return 'int32';
+
+    // int16
+    if (['INT16', 'SMALLINT', 'SHORT', 'I16'].includes(t)) return 'int16';
+
+    // float64
+    if (['FLOAT', 'FLOAT64', 'DOUBLE', 'REAL', 'DECIMAL', 'NUMERIC', 'F64'].includes(t)) return 'float64';
+
+    throw new Error(`Unsupported column type: ${type}`);
   }
 
   // ---------------------------------------------------------------------------

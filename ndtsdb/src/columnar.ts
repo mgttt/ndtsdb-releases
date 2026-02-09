@@ -20,6 +20,28 @@ export class ColumnarTable {
   private capacity: number;
   private readonly growthFactor = 1.5;
 
+  /**
+   * 从现有 TypedArray 直接创建表视图（零拷贝）。
+   * 主要用于：AppendWriter.readAll / mmap 读出来后，用 SQL 引擎做分析。
+   */
+  static fromColumns(
+    columnDefs: ColumnDef[],
+    columns: Map<string, TypedArray>,
+    rowCount?: number,
+  ): ColumnarTable {
+    const first = columnDefs[0];
+    const firstArr = first ? columns.get(first.name) : undefined;
+    const inferred = firstArr ? firstArr.length : 0;
+    const rc = rowCount ?? inferred;
+
+    const t = new ColumnarTable(columnDefs, Math.max(1, rc));
+    t.columns = columns;
+    t.rowCount = rc;
+    t.capacity = rc;
+
+    return t;
+  }
+
   constructor(columnDefs: ColumnDef[], initialCapacity = 1000) {
     this.columnDefs = columnDefs;
     this.capacity = initialCapacity;

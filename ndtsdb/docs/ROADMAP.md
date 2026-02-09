@@ -15,7 +15,7 @@
 | **无二级索引** | SymbolTable 仅支持主键，无范围索引 | 全表扫描 | 🟡 中 |
 | **字符串字典编码** | 需手动管理 SymbolTable | 封装在 Provider 层 | 🟡 中 |
 | **无事务支持** | 无 ACID，chunk 写入可能部分失败 | CRC32 + 定期备份 | 🟡 中 |
-| **分析能力弱** | 无 GROUP BY、窗口函数（STDDEV OVER）、聚合函数 | 阻塞波动率计算 | 🔴 **P0** |
+| **分析能力弱** | ~~无 GROUP BY、窗口函数~~ ✅ 已实现 | 阻塞波动率计算 | ✅ **已解决** |
 
 #### 迁移落地（集成层）额外发现
 
@@ -37,7 +37,7 @@
 | 完整性校验 | CRC32 header + per-chunk | ✅ |
 | C SIMD (libndts) | 8 平台预编译 (Zig CC) | 143M rows/s |
 | Gorilla 压缩 | Delta-of-Delta + XOR | 70-95% |
-| SQL | 递归下降解析器 | 5.9M rows/s |
+| SQL | 递归下降解析器 + 窗口函数 + GROUP BY | 5.9M rows/s |
 | 索引 | Roaring Bitmap + B-Tree | ✅ |
 | mmap 回放 | MinHeap O(log N) 多路归并 | 1.0M ticks/s @ 3000 |
 | ASOF JOIN | 点查 + snapshot 回放 | <12ms @ 3000 |
@@ -85,87 +85,63 @@
 
 ---
 
-**P0: 原生统计聚合函数支持（窗口函数 + GROUP BY）** ⭐⭐⭐⭐⭐
+**P0: SQL 功能补全（quant-lib 迁移剩余需求）** ⭐⭐⭐⭐⭐
 
-**紧急程度**: P0（阻塞生产任务）
+**状态**: 窗口函数 + GROUP BY ✅ **已实现**（executor.ts 已支持）
 
-**前因后果**:
-- quant-lib 从 DuckDB 迁移到 ndtsdb 后（commit 65a283c4c），采集任务已修复正常运行
-- 但 `calculate-volatility.ts` 仍失败，因其依赖 DuckDB SQL 窗口函数计算标准差
-- 该脚本每小时生成波动率报告（`docs/myvol.md`），是核心监控功能
-- 当前被迫选择：A) 重写为纯 JS（性能差） B) 回退 DuckDB（破坏迁移完整性） C) 等待 ndtsdb 支持
+**仍需补充的 SQL 功能**:
 
-**具体功能需求**（供参考，待实际开发时调整）:
+| 功能 | 状态 | 需求来源 | 优先级 |
+|------|------|----------|--------|
+| **窗口函数 OVER** | ✅ 已实现 | `calculate-volatility.ts` | ✅ 可用 |
+| **GROUP BY 聚合** | ✅ 已实现 | 通用分析 | ✅ 可用 |
+| **STDDEV/VARIANCE** | ✅ 已实现 | 波动率计算 | ✅ 可用 |
+| **PARTITION BY** | ⚠️ 部分可用 | 多币种并行 | 🟡 需验证 |
+| **CTE (WITH)** | ❌ 缺失 | `futu-positions-volatility.ts` | 🔴 高 |
+| **多列 IN** | ❌ 缺失 | 多条件匹配 | 🔴 高 |
+| **字符串拼接 `\|\|`** | ❌ 缺失 | 生成 symbol 标识 | 🟡 中 |
+| **ROUND/SQRT** | ❌ 缺失 | 数值格式化 | 🟡 中 |
+| **JOIN** | ❌ 缺失 | 多表关联 | 🟢 低 |
+| **子查询** | ❌ 缺失 | 复杂过滤 | 🟢 低 |
 
-1. **窗口聚合函数**（OVER 子句）
+**具体需求详情**:
+
+1. **CTE (WITH 子句)** 🔴 高
    ```sql
-   -- 滑动窗口标准差（核心需求）
-   SELECT 
-     symbol,
-     STDDEV(close) OVER (
-       PARTITION BY symbol 
-       ORDER BY timestamp 
-       ROWS BETWEEN 96 PRECEDING AND CURRENT ROW
-     ) AS rolling_std_1d
-   FROM klines;
+   -- 当前不支持
+   WITH periods AS (
+     SELECT ... FROM klines
+   )
+   SELECT * FROM periods WHERE rn = 1;
    ```
-   - 需支持：`STDDEV`, `VARIANCE`, `AVG`, `SUM`, `MIN`, `MAX`
-   - 窗口类型：`ROWS BETWEEN N PRECEDING AND CURRENT ROW`
-   - 分区：`PARTITION BY symbol`
-   - 排序：`ORDER BY timestamp`
+   **Workaround**: 应用层分步查询，或拆分为临时表
 
-2. **GROUP BY 聚合**
+2. **多列 IN 子句** 🔴 高
    ```sql
-   -- 分组统计（辅助需求）
-   SELECT 
-     symbol,
-     COUNT(*) as total,
-     AVG(volume) as avg_volume,
-     STDDEV(close) as price_volatility
-   FROM klines
-   WHERE timestamp > 1700000000000
-   GROUP BY symbol;
+   -- 当前不支持
+   WHERE (base_currency, quote_currency) IN (('AAPL','USD'), ('TSLA','USD'))
+   ```
+   **Workaround**: 展开为 `WHERE (a='AAPL' AND b='USD') OR (a='TSLA' AND b='USD')`
+
+3. **PARTITION BY 修复** 🟡 中
+   - 代码已存在但快速路径 `tryExecuteTailWindow` 会拒绝带 PARTITION BY 的查询
+   - 需统一处理逻辑，确保 PARTITION BY 在所有场景可用
+
+4. **内置函数扩展** 🟡 中
+   ```sql
+   -- 字符串拼接
+   SELECT base_currency || '/' || quote_currency AS symbol
+   
+   -- 数学函数
+   SELECT ROUND(vol / price * 100, 2) AS vol_pct,
+          STDDEV(close) / SQRT(days) AS normalized_vol
    ```
 
-3. **性能要求**（参考）
-   - 目标：3000 symbols × 5000 rows/symbol ≤ 5 秒（SQL 总执行时间）
-   - 可接受：C FFI 实现（如已有的 `sma`, `ema`）+ TypeScript 协调
-   - 不可接受：纯 JS 循环（已知性能瓶颈）
-
-4. **API 形式**（建议，非强制）
-   ```typescript
-   // 方案 A: SQL 扩展（最理想，符合现有 API 风格）
-   const results = db.query(`
-     SELECT symbol, stddev_window(close, 96) as vol_1d
-     FROM klines ORDER BY timestamp
-   `);
-   
-   // 方案 B: 专用 API（如现有 SAMPLE BY）
-   const volatility = db.calculateVolatility({
-     symbol: 'BTC/USDT',
-     column: 'close',
-     windows: [96, 192, 384], // 1d, 2d, 4d (15分钟K线)
-   });
-   
-   // 方案 C: C FFI + 手动循环（性能最优，但不够优雅）
-   const prices = db.queryColumn('close', { symbol: 'BTC/USDT' });
-   const vol = libndts.rolling_stddev(prices, 96); // 已有 rolling_std
-   ```
-
-**技术建议**（供参考）:
-- **优先级 1**: 复用现有 `rolling_std` C 函数，扩展为支持 PARTITION BY 的 TypeScript 协调层
-- **优先级 2**: 在 SQL 解析器中添加 `OVER` 子句支持（参考 DuckDB 窗口函数实现）
-- **优先级 3**: 添加 `GROUP BY` + 聚合函数（COUNT, AVG, STDDEV 等）
-
-**验收标准**:
-- ✅ `calculate-volatility.ts` 无需重写即可运行（或仅需微调 SQL）
-- ✅ 30 个币种 × 2500 条 K线 的波动率计算 < 10 秒
-- ✅ 生成 `docs/myvol.md` 报告（按 1d/2d/14d/49d 波动率排序）
-
-**相关文件**:
-- 待修复脚本: `quant-lib/scripts/calculate-volatility.ts`
-- 已有 C 函数: `ndtsdb/native/ndts.c` (`rolling_std`, `sma`, `ema`)
-- SQL 解析器: `ndtsdb/src/sql/parser.ts`, `ndtsdb/src/sql/executor.ts`
+**已实现验证**:
+- ✅ `calculate-volatility.ts` 已使用 ndtsdb SQL 成功运行
+- ✅ `STDDEV(close) OVER (ORDER BY timestamp ROWS BETWEEN N PRECEDING AND CURRENT ROW)` 可用
+- ✅ `ROW_NUMBER() OVER (...)` 可用
+- ✅ `GROUP BY symbol + AVG/MIN/MAX/COUNT/STDDEV` 可用
 
 ---
 
@@ -182,13 +158,19 @@ await table.deleteWhere({ symbol: 'BTC', before: 1700000000000 });
 await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
 ```
 
-**2. 增强 SQL 执行器** ⭐⭐⭐
+**2. SQL 执行器增强（剩余功能）** ⭐⭐⭐
 
-当前 SQL 仅支持简单 SELECT。需添加：
-- JOIN 支持（至少 INNER JOIN）
-- 复杂 WHERE（AND/OR 嵌套）
-- 子查询（用于先过滤再聚合）
-- 基础聚合函数（COUNT DISTINCT, SUM, AVG）
+当前已实现：SELECT/WHERE/ORDER BY/LIMIT/GROUP BY/窗口函数/基础聚合
+
+仍需添加：
+- ~~基础聚合~~ ✅ 已实现 COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE
+- ~~窗口函数~~ ✅ 已实现 ROW_NUMBER/STDDEV/AVG/SUM... OVER (...)
+- ~~GROUP BY~~ ✅ 已实现
+- CTE (WITH 子句) - 用于复杂查询分层
+- JOIN 支持（至少 INNER JOIN）- 多表关联
+- 子查询（WHERE col IN (SELECT ...)）
+- 复杂 WHERE（嵌套括号优先级）
+- HAVING 子句（GROUP BY 后过滤）
 
 ### 🟡 中优先级（提升易用性）
 
@@ -303,15 +285,17 @@ Chunk 级原子写入：
 | **v0.9.0** | 02-09 PM | **重命名 data-lib → ndtsdb** |
 | **v0.10.0** | 02-09 PM | **quant-lib 完全迁移** → DuckDB 依赖移除 |
 | **v0.10.1** | 02-09 22:15 | **修复 quant-lib scripts**: `db.connect()` → `db.init()`, 路径 `klines.duckdb` → `ndtsdb/` |
-| **v0.10.1** | 02-09 22:20 | **发现阻塞**: `calculate-volatility.ts` 需要窗口聚合函数（STDDEV OVER），提升为 P0 |
+| **v0.10.2** | 02-09 23:00 | **SQL 窗口函数**: 已实现 STDDEV/ROW_NUMBER/AVG... OVER (ORDER BY ... ROWS BETWEEN) |
+| **v0.10.2** | 02-09 23:00 | **SQL GROUP BY**: 已实现 COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/FIRST/LAST |
 
 ### 规划中
 
 | 版本 | 优先级 | 目标 |
 |------|--------|------|
-| **v0.11.0** | 🔴 **P0** | **窗口聚合函数（STDDEV OVER + GROUP BY）** ← 阻塞生产 |
+| ~~v0.11.0~~ | ✅ **已完成** | ~~窗口聚合函数（STDDEV OVER + GROUP BY）~~ |
+| **v0.11.0** | 🔴 **P0** | **SQL CTE (WITH 子句) + 多列 IN** ← 阻塞 `futu-positions-volatility.ts` |
 | **v0.12.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
-| **v0.13.0** | 🔴 高 | SQL JOIN + 复杂 WHERE |
+| **v0.13.0** | 🔴 高 | SQL JOIN + 子查询 + HAVING |
 | **v0.14.0** | 🟡 中 | 自动二级索引（BTree） |
 | **v0.15.0** | 🟡 中 | 原生字符串类型（透明字典编码） |
 | **v1.0.0** | 🟢 低 | 事务支持（WAL + 原子写入）|
