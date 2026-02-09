@@ -1,0 +1,33 @@
+name: ndtsdb Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g., 0.9.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout moltbaby
+        uses: actions/checkout@v4
+        with:
+          repository: mgttt/moltbaby
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: moltbaby
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ndtsdb-v${{ inputs.version }}
+          name: ndtsdb v${{ inputs.version }}
+          files: moltbaby/ndtsdb/native/dist/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
