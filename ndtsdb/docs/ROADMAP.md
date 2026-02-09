@@ -17,6 +17,15 @@
 | **无事务支持** | 无 ACID，chunk 写入可能部分失败 | CRC32 + 定期备份 | 🟡 中 |
 | **分析能力弱** | 无 GROUP BY、窗口函数（STDDEV OVER）、聚合函数 | 阻塞波动率计算 | 🔴 **P0** |
 
+#### 迁移落地（集成层）额外发现
+
+这些问题不完全是 ndtsdb 引擎能力缺失，但会直接阻塞「quant-lib/quant-lab 端到端迁移」：
+
+- **KlineDatabase 兼容层缺失/接口回归**：`connect()`/`init()` 语义变更、缺少 `upsertKlines()` / `getLatestTimestamp()` / `getLatestKline()` 等调用点，导致系统策略（如 volatility collector）与缓存层（SmartKlineCache）直接无法运行。
+- **timestamp 单位不一致（秒 vs 毫秒）**：Provider 输出 timestamp=Unix 秒，但部分脚本仍按毫秒计算 age/barsNeeded，导致拉取数量被放大 1000 倍。
+- **DuckDB 残留工具链/文档**：duckdb-async 已从主依赖移除，但 `export/validate/migrate` 等工具仍 import duckdb-async；同时仍存在 `klines.duckdb` 的路径叙述，需明确“迁移工具是否保留/如何隔离”。
+- **TypeScript/tsc 生态打包问题（NodeNext）**：在部分 tsc 编译环境中出现 `Cannot find module 'ndtsdb'`（依赖解析/类型声明可见性问题），需要明确 ndtsdb 的 types/exports 与安装方式，保证被下游稳定消费。
+
 **结论**：ndtsdb 适合**追加型时序数据**（K线、Tick），不适合**频繁更新**的 OLTP 场景。
 
 ---
@@ -46,6 +55,35 @@
 ## 下一步方向
 
 ### 🔴 高优先级（解决迁移阻塞问题）
+
+**P0: 迁移稳定性（KlineDatabase 兼容层 + 时间戳语义统一）** ⭐⭐⭐⭐⭐
+
+**目标**：让 quant-lib/quant-lab 在“完全不依赖 DuckDB”的前提下，端到端能跑通采集、缓存、报表、paper-trading。
+
+**需要落地的最小改动集**：
+
+1) **补齐 KlineDatabase 的兼容层（不要让上层代码被迫大改）**
+- `connect()` 作为 `init()` 的 alias（或保留 connect 并内部调用 init）
+- 实现/恢复：
+  - `upsertKlines(klines)`（可先走：读取→去重→排序→重写/或小范围 overlap 合并）
+  - `getLatestTimestamp(symbol, interval)`（优先 O(1)/O(logN)；短期可读末尾 chunk，避免全量 readAll）
+  - `getLatestKline(symbol, interval)`
+
+2) **时间戳语义“一刀切”**
+- 全链路固定：Kline.timestamp = **Unix 秒**
+- 所有脚本计算 barsNeeded/age/window 时，统一用秒（必要时：`Date.now()` → `Math.floor(Date.now()/1000)`）
+- 在关键入口加断言/监控（例如：发现 timestamp > 1e12 直接判定为毫秒并报错）
+
+3) **迁移工具链隔离策略（决定是否保留 DuckDB 工具）**
+- 如果保留 `export-duckdb-klines / validate-ndtsdb-migration`：
+  - 将 duckdb-async 作为**可选 dev 工具依赖**，不要污染运行时依赖
+  - 或者拆出独立包/目录（例如 `tools/duckdb-*` + 单独 lock/deps）
+- 文档明确：DuckDB 仅用于“历史数据导出”，生产链路不依赖
+
+4) **回归测试（防止迁移反复拉扯）**
+- 增加最小端到端：采集 → upsert → latestTs → 生成波动率/指标（即使先不走 SQL）
+
+---
 
 **P0: 原生统计聚合函数支持（窗口函数 + GROUP BY）** ⭐⭐⭐⭐⭐
 

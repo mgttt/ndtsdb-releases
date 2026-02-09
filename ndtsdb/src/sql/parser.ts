@@ -233,29 +233,41 @@ export class SQLParser {
   }
 
   // 解析列或表达式
+  // 注意：需要支持函数参数中的逗号，例如 ROUND(x, 2)
+  // 所以只能在括号深度为 0 时把逗号当作列分隔符
   private parseColumnOrExpr(): string | { expr: string; alias?: string } {
-    const start = this.tokenPos;
     let expr = '';
-    
-    // 解析函数或列名
+    let depth = 0;
+
     while (this.tokenPos < this.tokens.length) {
       const token = this.peek();
       if (!token) break;
-      
+
       const upper = token.toUpperCase();
-      if (['FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', ','].includes(upper)) {
+
+      // 只在 depth==0 时识别子句边界
+      if (depth === 0 && ['FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET'].includes(upper)) {
         break;
       }
-      
-      if (upper === 'AS') {
+
+      // 只在 depth==0 时把逗号当作列分隔
+      if (depth === 0 && token === ',') {
+        break;
+      }
+
+      // alias 也只在 depth==0 生效
+      if (depth === 0 && upper === 'AS') {
         this.consume('AS');
         const alias = this.consumeIdentifier();
         return { expr: expr.trim(), alias };
       }
-      
+
+      if (token === '(') depth++;
+      if (token === ')') depth = Math.max(0, depth - 1);
+
       expr += this.consume() + ' ';
     }
-    
+
     return expr.trim();
   }
 
