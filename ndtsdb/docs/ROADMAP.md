@@ -1,4 +1,4 @@
-# data-lib Roadmap
+# ndtsdb Roadmap
 
 ## 现状总结 (2026-02-09)
 
@@ -10,7 +10,6 @@
 | 增量写入 | AppendWriter, DLv2 chunked 格式 | 3.3M rows/s |
 | 完整性校验 | CRC32 header + per-chunk | ✅ |
 | C SIMD (libndts) | 8 平台预编译 (Zig CC) | 143M rows/s |
-| WASM SIMD | Rust → wasm-bindgen | 备选 |
 | Gorilla 压缩 | Delta-of-Delta + XOR | 70-95% |
 | SQL | 递归下降解析器 | 5.9M rows/s |
 | 索引 | Roaring Bitmap + B-Tree | ✅ |
@@ -34,7 +33,7 @@
 **1. quant-lab 新工具逐步接入** ⭐⭐⭐
 
 quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
-新增工具/模块优先用 data-lib，逐步验证：
+新增工具/模块优先用 ndtsdb，逐步验证：
 - 新的数据采集管道 → AppendWriter
 - 新的回测引擎 → MmapMergeStream
 - 新的分析工具 → SAMPLE BY / 窗口函数
@@ -92,6 +91,22 @@ quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
 - 网络 socket IO
 - 需要真正异步不阻塞主线程的场景
 
+**WASM SIMD 备选方案**
+
+曾实现 Rust → wasm-bindgen 的 WASM SIMD 版本（51KB），**结论：不需要**。
+
+| 方案 | 性能 | 部署 | 结论 |
+|------|------|------|------|
+| C FFI (libndts) | 143M rows/s | 8 平台预编译 | ✅ 主力方案 |
+| WASM SIMD | ~86M rows/s | 单文件，浏览器可用 | ❌ 不需要 |
+| 纯 JS | 45M rows/s | 零依赖 | ✅ 自动回退 |
+
+**原因**：
+- Bun 的 FFI 已足够高效，无 N-API 开销
+- libndts 覆盖 8 平台，无需浏览器兼容性
+- WASM 增加 51KB 体积，性能不如 C FFI
+- 纯 JS 回退已足够应对无原生库场景
+
 ---
 
 ## 里程碑
@@ -115,5 +130,5 @@ quant-lab 中已有的 DuckDB 使用保持不动（成熟稳定）。
 
 1. **嵌入式优先** — `import` 即用，不需要独立服务
 2. **零依赖核心** — 核心模块不依赖第三方库
-3. **渐进式加速** — JS → WASM → C FFI，自动降级
+3. **渐进式加速** — JS → C FFI，自动回退到 JS
 4. **保持精简** — ~5600 行 TS，不膨胀

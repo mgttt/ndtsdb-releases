@@ -1,4 +1,4 @@
-# data-lib Architecture
+# ndtsdb Architecture
 
 ## 技术栈
 
@@ -6,9 +6,8 @@
 |---|---|---|
 | **Runtime** | Bun | 高性能 JS 运行时，原生 FFI、mmap 支持 |
 | **语言** | TypeScript | 核心逻辑，类型安全 |
-| **原生加速** | C + SIMD | 向量化过滤/聚合，6 平台交叉编译 |
+| **原生加速** | C + SIMD | 向量化过滤/聚合，8 平台交叉编译 |
 | **FFI** | Bun FFI (dlopen) | 零开销调用 C 函数，无需 N-API |
-| **WASM** | Rust → wasm-bindgen | 可移植 SIMD，浏览器兼容备选 |
 | **交叉编译** | Zig CC | 一套源码编译 Linux/macOS/Windows × x64/ARM64 |
 | **内存映射** | mmap (Bun.mmap) | 虚拟地址映射，OS 管理页缓存 |
 | **零拷贝** | TypedArray views | ArrayBuffer 上的视图，无 memcpy |
@@ -45,7 +44,7 @@
 
 ## 存储格式
 
-### 二进制列式文件 (.bin)
+### 二进制列式文件 (.ndts)
 
 ```
 ┌──────────────────────────────┐
@@ -71,10 +70,10 @@
 
 ```
 data/
-├── BTCUSDT.bin     # 每个产品一个文件
-├── ETHUSDT.bin     # 高频写入无锁冲突
-├── AAPL.bin        # 文件级隔离，单点故障不扩散
-└── ...             # 3000+ 文件
+├── BTCUSDT.ndts     # 每个产品一个文件
+├── ETHUSDT.ndts     # 高频写入无锁冲突
+├── AAPL.ndts        # 文件级隔离，单点故障不扩散
+└── ...              # 3000+ 文件
 ```
 
 ---
@@ -125,12 +124,6 @@ data/
 - `simd_filter_f64_gt/lt/eq` — 向量化过滤
 - `simd_sum_f64` — 向量化求和
 - `simd_min/max_f64` — 向量化极值
-
-### WASM SIMD (备选)
-
-- Rust → wasm-bindgen → `simd.wasm` (51 KB)
-- 浏览器兼容，无需原生库
-- 性能约为 C FFI 的 60-80%
 
 ---
 
@@ -236,10 +229,10 @@ LIMIT 10
 
 ## 业界对标
 
-| 能力 | data-lib | QuestDB | ClickHouse | kdb+ |
+| 能力 | ndtsdb | QuestDB | ClickHouse | kdb+ |
 |------|----------|---------|------------|------|
 | 语言 | TS + C FFI | Java + C++ | C++ | q |
-| SIMD | ✅ C + WASM | ✅ JIT | ✅ | ✅ |
+| SIMD | ✅ C FFI | ✅ JIT | ✅ | ✅ |
 | mmap | ✅ Bun.mmap | ✅ | ✅ | ✅ |
 | zero-copy | ✅ TypedArray | ✅ | ✅ | ✅ |
 | ASOF JOIN | ✅ MergeStream | ✅ 原生 | ❌ | ✅ |

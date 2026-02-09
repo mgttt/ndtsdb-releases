@@ -1,6 +1,6 @@
 # C FFI 多平台支持
 
-data-lib 现在支持 **多平台原生 SIMD**，使用 Zig 交叉编译。
+ndtsdb 现在支持 **多平台原生 SIMD**，使用 Zig 交叉编译。
 
 ## 支持的平台
 
@@ -18,13 +18,13 @@ data-lib 现在支持 **多平台原生 SIMD**，使用 Zig 交叉编译。
 ### 1. 自动检测平台
 
 ```typescript
-import { isFFIReady, getPlatform, ffiSumF64 } from 'data-lib/src/ffi';
+import { isNdtsReady, int64ToF64, countingSortArgsort } from 'ndtsdb';
 
-if (isFFIReady()) {
-  const info = getPlatform();
-  console.log(info);  // { platform: 'linux', arch: 'x64', libName: 'libsimd-linux-x64.so' }
-  
-  const sum = ffiSumF64(prices);  // 1162M/s
+if (isNdtsReady()) {
+  // 例：把 int64 timestamp 转成 float64，然后做排序/argsort 等 SIMD/FFI 加速操作
+  const tsF64 = int64ToF64(timestampsI64);
+  const idx = countingSortArgsort(tsF64);
+  console.log(idx.length);
 }
 ```
 

@@ -174,7 +174,7 @@ KEY (symbol, interval, timestamp);
 
 - **v0.9.2** (2026-02-09)
   - SymbolTable.getId() / has() — 只读查询不创建新 ID
-  - quant-lib DataLibProvider 迁移支持
+  - quant-lib NdtsdbProvider 迁移支持
 
 - **v0.9.1** (2026-02-09)
   - 新增 UPSERT SQL 支持 (INSERT ON CONFLICT / UPSERT INTO)

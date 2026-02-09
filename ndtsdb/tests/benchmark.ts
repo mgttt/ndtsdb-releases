@@ -15,7 +15,7 @@ const schema: ColumnDef[] = [
 ];
 
 async function benchmark() {
-  console.log('⚡ data-lib 性能基准测试\n');
+  console.log('⚡ ndtsdb 性能基准测试\n');
   console.log('=' .repeat(50));
 
   // 清理旧数据
