@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>N-Dimensional Time Series Database</b><br>
-  <i>高性能嵌入式时序数据库 · 为量化交易而生</i>
+  <i>全功能时序数据库 · 为极速量化交易而生</i>
 </p>
 
 <p align="center">
