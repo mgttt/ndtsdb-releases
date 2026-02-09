@@ -15,7 +15,7 @@
 | **无二级索引** | SymbolTable 仅支持主键，无范围索引 | 全表扫描 | 🟡 中 |
 | **字符串字典编码** | 需手动管理 SymbolTable | 封装在 Provider 层 | 🟡 中 |
 | **无事务支持** | 无 ACID，chunk 写入可能部分失败 | CRC32 + 定期备份 | 🟡 中 |
-| **分析能力弱** | 无 GROUP BY、窗口函数、统计函数 | 手动计算或导出 | 🟢 低 |
+| **分析能力弱** | 无 GROUP BY、窗口函数（STDDEV OVER）、聚合函数 | 阻塞波动率计算 | 🔴 **P0** |
 
 **结论**：ndtsdb 适合**追加型时序数据**（K线、Tick），不适合**频繁更新**的 OLTP 场景。
 
@@ -47,6 +47,90 @@
 
 ### 🔴 高优先级（解决迁移阻塞问题）
 
+**P0: 原生统计聚合函数支持（窗口函数 + GROUP BY）** ⭐⭐⭐⭐⭐
+
+**紧急程度**: P0（阻塞生产任务）
+
+**前因后果**:
+- quant-lib 从 DuckDB 迁移到 ndtsdb 后（commit 65a283c4c），采集任务已修复正常运行
+- 但 `calculate-volatility.ts` 仍失败，因其依赖 DuckDB SQL 窗口函数计算标准差
+- 该脚本每小时生成波动率报告（`docs/myvol.md`），是核心监控功能
+- 当前被迫选择：A) 重写为纯 JS（性能差） B) 回退 DuckDB（破坏迁移完整性） C) 等待 ndtsdb 支持
+
+**具体功能需求**（供参考，待实际开发时调整）:
+
+1. **窗口聚合函数**（OVER 子句）
+   ```sql
+   -- 滑动窗口标准差（核心需求）
+   SELECT 
+     symbol,
+     STDDEV(close) OVER (
+       PARTITION BY symbol 
+       ORDER BY timestamp 
+       ROWS BETWEEN 96 PRECEDING AND CURRENT ROW
+     ) AS rolling_std_1d
+   FROM klines;
+   ```
+   - 需支持：`STDDEV`, `VARIANCE`, `AVG`, `SUM`, `MIN`, `MAX`
+   - 窗口类型：`ROWS BETWEEN N PRECEDING AND CURRENT ROW`
+   - 分区：`PARTITION BY symbol`
+   - 排序：`ORDER BY timestamp`
+
+2. **GROUP BY 聚合**
+   ```sql
+   -- 分组统计（辅助需求）
+   SELECT 
+     symbol,
+     COUNT(*) as total,
+     AVG(volume) as avg_volume,
+     STDDEV(close) as price_volatility
+   FROM klines
+   WHERE timestamp > 1700000000000
+   GROUP BY symbol;
+   ```
+
+3. **性能要求**（参考）
+   - 目标：3000 symbols × 5000 rows/symbol ≤ 5 秒（SQL 总执行时间）
+   - 可接受：C FFI 实现（如已有的 `sma`, `ema`）+ TypeScript 协调
+   - 不可接受：纯 JS 循环（已知性能瓶颈）
+
+4. **API 形式**（建议，非强制）
+   ```typescript
+   // 方案 A: SQL 扩展（最理想，符合现有 API 风格）
+   const results = db.query(`
+     SELECT symbol, stddev_window(close, 96) as vol_1d
+     FROM klines ORDER BY timestamp
+   `);
+   
+   // 方案 B: 专用 API（如现有 SAMPLE BY）
+   const volatility = db.calculateVolatility({
+     symbol: 'BTC/USDT',
+     column: 'close',
+     windows: [96, 192, 384], // 1d, 2d, 4d (15分钟K线)
+   });
+   
+   // 方案 C: C FFI + 手动循环（性能最优，但不够优雅）
+   const prices = db.queryColumn('close', { symbol: 'BTC/USDT' });
+   const vol = libndts.rolling_stddev(prices, 96); // 已有 rolling_std
+   ```
+
+**技术建议**（供参考）:
+- **优先级 1**: 复用现有 `rolling_std` C 函数，扩展为支持 PARTITION BY 的 TypeScript 协调层
+- **优先级 2**: 在 SQL 解析器中添加 `OVER` 子句支持（参考 DuckDB 窗口函数实现）
+- **优先级 3**: 添加 `GROUP BY` + 聚合函数（COUNT, AVG, STDDEV 等）
+
+**验收标准**:
+- ✅ `calculate-volatility.ts` 无需重写即可运行（或仅需微调 SQL）
+- ✅ 30 个币种 × 2500 条 K线 的波动率计算 < 10 秒
+- ✅ 生成 `docs/myvol.md` 报告（按 1d/2d/14d/49d 波动率排序）
+
+**相关文件**:
+- 待修复脚本: `quant-lib/scripts/calculate-volatility.ts`
+- 已有 C 函数: `ndtsdb/native/ndts.c` (`rolling_std`, `sma`, `ema`)
+- SQL 解析器: `ndtsdb/src/sql/parser.ts`, `ndtsdb/src/sql/executor.ts`
+
+---
+
 **1. 支持 UPDATE/DELETE（重写优化）** ⭐⭐⭐
 
 Append-only 是最大限制。方案：
@@ -66,7 +150,7 @@ await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
 - JOIN 支持（至少 INNER JOIN）
 - 复杂 WHERE（AND/OR 嵌套）
 - 子查询（用于先过滤再聚合）
-- 聚合函数（COUNT DISTINCT, STDDEV）
+- 基础聚合函数（COUNT DISTINCT, SUM, AVG）
 
 ### 🟡 中优先级（提升易用性）
 
@@ -179,16 +263,19 @@ Chunk 级原子写入：
 | **v0.9.0** | 02-09 PM | **io_uring 评估** → 结论：不适合小文件场景 |
 | **v0.9.0** | 02-09 PM | **Gorilla 压缩移入 C** (3.9M/s 压缩, 11.5M/s 解压) |
 | **v0.9.0** | 02-09 PM | **重命名 data-lib → ndtsdb** |
-| **v0.10.0** | 02-09 | **quant-lib 完全迁移** → DuckDB 依赖移除 |
+| **v0.10.0** | 02-09 PM | **quant-lib 完全迁移** → DuckDB 依赖移除 |
+| **v0.10.1** | 02-09 22:15 | **修复 quant-lib scripts**: `db.connect()` → `db.init()`, 路径 `klines.duckdb` → `ndtsdb/` |
+| **v0.10.1** | 02-09 22:20 | **发现阻塞**: `calculate-volatility.ts` 需要窗口聚合函数（STDDEV OVER），提升为 P0 |
 
 ### 规划中
 
 | 版本 | 优先级 | 目标 |
 |------|--------|------|
-| **v0.11.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
-| **v0.12.0** | 🔴 高 | SQL JOIN + 复杂 WHERE |
-| **v0.13.0** | 🟡 中 | 自动二级索引（BTree） |
-| **v0.14.0** | 🟡 中 | 原生字符串类型（透明字典编码） |
+| **v0.11.0** | 🔴 **P0** | **窗口聚合函数（STDDEV OVER + GROUP BY）** ← 阻塞生产 |
+| **v0.12.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
+| **v0.13.0** | 🔴 高 | SQL JOIN + 复杂 WHERE |
+| **v0.14.0** | 🟡 中 | 自动二级索引（BTree） |
+| **v0.15.0** | 🟡 中 | 原生字符串类型（透明字典编码） |
 | **v1.0.0** | 🟢 低 | 事务支持（WAL + 原子写入）|
 
 ---
