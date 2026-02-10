@@ -1045,6 +1045,13 @@ export class AppendWriter {
   }
 
   /**
+   * Alias for readHeaderOnly (for backward compatibility)
+   */
+  static readHeader(path: string): AppendFileHeader {
+    return AppendWriter.readHeaderOnly(path);
+  }
+
+  /**
    * 读取最后一行（不展开全表；按 chunk 跳转到最后一个 chunk）
    */
   static readLastRow(path: string): Record<string, any> | null {
