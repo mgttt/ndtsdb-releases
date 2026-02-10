@@ -59,7 +59,7 @@
 | **PARTITION BY 性能/一致性** | ✅ 已实现 | 通用路径可用；新增 `tryExecutePartitionTail` 快速路径，专门优化 CTE + PARTITION BY + ROW_NUMBER + WHERE rn=1 模式（波动率脚本典型查询），避免全表物化 | ✅ P0 |
 | **复杂 WHERE 表达式** | ✅ 已实现 | 括号优先级 + `AND/OR/NOT`（WHERE AST + executor 评估；并保留 legacy where[] 兼容） | ✅ P0 |
 | **ORDER BY <expr>** | ✅ 已实现 | 支持 alias/ordinal（ORDER BY 1）/标量表达式 + 多 key（对齐 SQLite/DuckDB 常用子集） | ✅ P0 |
-| **HAVING** | ❌ 缺失 | GROUP BY 后过滤 | 🟢 P2 |
+| **HAVING** | ✅ 已实现 | GROUP BY 后过滤（支持 alias/标量表达式条件） | ✅ P1 |
 | **JOIN** | ❌ 缺失 | INNER/LEFT JOIN | 🟢 P2 |
 | **子查询** | ❌ 缺失 | `FROM (SELECT ...)` / `IN (SELECT ...)` | 🟢 P2 |
 

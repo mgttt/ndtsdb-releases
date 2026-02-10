@@ -33,6 +33,7 @@
 - ORDER BY（列名 / alias / ordinal(ORDER BY 1) / 标量表达式；多 key 支持 ASC/DESC）
 - LIMIT / OFFSET
 - GROUP BY（基础聚合）
+- HAVING（GROUP BY 后过滤；支持 alias/标量表达式条件）
 - CTE / WITH（materialize 临时表）
 - CREATE TABLE / INSERT / UPSERT
 

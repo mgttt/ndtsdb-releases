@@ -323,6 +323,42 @@ describe('SQL', () => {
     );
     expect(result.rowCount).toBe(2);
   });
+
+  it('should support GROUP BY + HAVING', () => {
+    const table = new ColumnarTable([
+      { name: 'symbol', type: 'int32' },
+      { name: 'price', type: 'float64' },
+    ]);
+
+    table.appendBatch([
+      { symbol: 0, price: 10.0 },
+      { symbol: 0, price: 20.0 },
+      { symbol: 1, price: 999.0 },
+    ]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', table);
+
+    const sql = "SELECT symbol, COUNT(*) AS c, AVG(price) AS ap FROM t GROUP BY symbol HAVING c > 1 ORDER BY symbol ASC";
+    const result = executor.execute(new SQLParser().parse(sql)) as any;
+
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0].symbol).toBe(0);
+    expect(Number(result.rows[0].c)).toBe(2);
+    expect(Number(result.rows[0].ap)).toBeCloseTo(15.0, 9);
+  });
+
+  it('should reject HAVING without GROUP BY', () => {
+    const table = new ColumnarTable([
+      { name: 'price', type: 'float64' },
+    ]);
+    table.appendBatch([{ price: 1.0 }]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', table);
+
+    expect(() => executor.execute(new SQLParser().parse('SELECT * FROM t HAVING price > 0'))).toThrow();
+  });
 });
 
 // ─── Query Functions ──────────────────────────────

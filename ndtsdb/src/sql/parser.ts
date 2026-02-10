@@ -34,6 +34,8 @@ export interface SQLSelect {
   // new: WHERE AST（括号优先级 + AND/OR/NOT）
   whereExpr?: SQLWhereExpr;
   groupBy?: string[];
+  // HAVING（在 GROUP BY 之后过滤）
+  havingExpr?: SQLWhereExpr;
   orderBy?: { expr: string; direction: 'ASC' | 'DESC' }[];
   limit?: number;
   offset?: number;
@@ -249,6 +251,13 @@ export class SQLParser {
       this.consume('BY');
       groupBy = this.parseIdentifierList();
     }
+
+    let havingExpr: SQLWhereExpr | undefined;
+    if (this.peek()?.toUpperCase() === 'HAVING') {
+      this.consume('HAVING');
+      // HAVING 允许在聚合结果上做表达式比较（支持 alias / scalar expr）
+      havingExpr = this.parseWhereExpr(true);
+    }
     
     let orderBy: { expr: string; direction: 'ASC' | 'DESC' }[] | undefined;
     if (this.peek()?.toUpperCase() === 'ORDER') {
@@ -269,7 +278,7 @@ export class SQLParser {
       offset = parseInt(this.consume());
     }
     
-    return { columns, from, where, whereExpr, groupBy, orderBy, limit, offset };
+    return { columns, from, where, whereExpr, groupBy, havingExpr, orderBy, limit, offset };
   }
 
   // 解析 SELECT 列
@@ -338,7 +347,7 @@ export class SQLParser {
   // WHERE (AST)
   // ---------------------------------------------------------------------------
 
-  private parseWhereExpr(): SQLWhereExpr {
+  private parseWhereExpr(allowExprLHS: boolean = false): SQLWhereExpr {
     const parseOr = (): SQLWhereExpr => {
       let node = parseAnd();
       while (this.peek()?.toUpperCase() === 'OR') {
@@ -375,7 +384,7 @@ export class SQLParser {
         return inner;
       }
 
-      const pred = this.parsePredicate();
+      const pred = this.parsePredicate(allowExprLHS);
       return { type: 'pred', pred };
     };
 
@@ -394,15 +403,42 @@ export class SQLParser {
     return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t);
   }
 
-  private parsePredicate(): Omit<SQLCondition, 'logic'> {
+  private parsePredicate(allowExprLHS: boolean): Omit<SQLCondition, 'logic'> {
     // 支持多列条件：(a,b) IN ((1,2),(3,4))
     let column: string | string[];
+
     if (this.peek() === '(') {
+      // tuple LHS: (a,b) ...
       this.consume('(');
       column = this.parseIdentifierList();
       this.consume(')');
-    } else {
+    } else if (!allowExprLHS) {
       column = this.consumeIdentifier();
+    } else {
+      // expr LHS（用于 HAVING）：读取到操作符为止
+      let expr = '';
+      let depth = 0;
+
+      const isOpToken = (t: string) => {
+        const up = t.toUpperCase();
+        return ['=', '!=', '<>', '<', '>', '<=', '>=', 'LIKE', 'IN'].includes(up);
+      };
+
+      while (this.tokenPos < this.tokens.length) {
+        const token = this.peek();
+        if (!token) break;
+
+        if (depth === 0 && isOpToken(token)) break;
+
+        if (token === '(') depth++;
+        if (token === ')') depth = Math.max(0, depth - 1);
+
+        expr += this.consume() + ' ';
+      }
+
+      expr = expr.trim();
+      if (!expr) throw new Error('Expected predicate expression');
+      column = expr;
     }
 
     const operator = this.parseOperator();

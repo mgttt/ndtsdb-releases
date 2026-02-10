@@ -158,6 +158,10 @@ export class SQLExecutor {
       rowIndices = this.evaluateWhere(table, select.where);
     }
 
+    if ((select as any).havingExpr && (!select.groupBy || select.groupBy.length === 0)) {
+      throw new Error('HAVING requires GROUP BY');
+    }
+
     // SELECT * 快速路径
     if (select.columns[0] === '*') {
       let rows = this.extractRows(table, allColumns, rowIndices);
@@ -197,7 +201,15 @@ export class SQLExecutor {
     if (select.groupBy && select.groupBy.length > 0) {
       // 当前实现不支持「GROUP BY + 窗口函数」混用（后续可扩展）
       rows = this.executeGroupBy(baseRows, rewrittenSel, select.groupBy);
+
+      // HAVING（聚合后过滤）
+      if ((select as any).havingExpr) {
+        rows = this.filterRowsByWhereExpr(rows, (select as any).havingExpr);
+      }
     } else {
+      if ((select as any).havingExpr) {
+        throw new Error('HAVING requires GROUP BY');
+      }
       rows = baseRows.map((r) => this.projectRow(r, rewrittenSel));
     }
 
@@ -387,6 +399,38 @@ export class SQLExecutor {
   private likeMatch(value: string, pattern: string): boolean {
     const regex = pattern.replace(/%/g, '.*').replace(/_/g, '.');
     return new RegExp(`^${regex}$`, 'i').test(value);
+  }
+
+  // 在“行对象”上评估 WHERE/HAVING AST（用于 GROUP BY 后 HAVING）
+  private getConditionValueFromRow(row: Record<string, any>, column: string | string[]): any {
+    if (Array.isArray(column)) return column.map((c) => row[c]);
+
+    const expr = this.normalizeExpr(column);
+    if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr)) return row[expr];
+
+    // 允许在 HAVING 里写简单标量表达式（基于聚合输出/alias）
+    return this.evalScalarExpr(expr, row);
+  }
+
+  private filterRowsByWhereExpr(rows: Array<Record<string, any>>, expr: SQLWhereExpr): Array<Record<string, any>> {
+    const evalNode = (row: Record<string, any>, n: SQLWhereExpr): boolean => {
+      switch (n.type) {
+        case 'pred': {
+          const v = this.getConditionValueFromRow(row, (n.pred as any).column);
+          return this.evaluateCondition(v, (n.pred as any).operator, (n.pred as any).value);
+        }
+        case 'and':
+          return evalNode(row, n.left) && evalNode(row, n.right);
+        case 'or':
+          return evalNode(row, n.left) || evalNode(row, n.right);
+        case 'not':
+          return !evalNode(row, n.expr);
+        default:
+          return false;
+      }
+    };
+
+    return rows.filter((r) => evalNode(r, expr));
   }
 
   // ---------------------------------------------------------------------------
