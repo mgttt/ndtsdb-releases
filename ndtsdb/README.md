@@ -202,4 +202,15 @@ KEY (symbol, interval, timestamp);
 
 ---
 
+## 赞助商
+
+如果您觉得 ndtsdb 对您有帮助，欢迎通过以下方式支持项目发展：
+
+**TON 链钱包**: `UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG`
+
+> 💎 支持赞助数字货币（金额随意）  
+> 🔗 这是 [TON 链](https://ton.foundation/) 的钱包地址
+
+---
+
 MIT

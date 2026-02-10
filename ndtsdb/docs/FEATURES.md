@@ -28,13 +28,15 @@
 
 ### 2.1 SQL 子集
 
-- SELECT / FROM（单表）
+- SELECT / FROM（单表 + JOIN）
 - WHERE（括号优先级 + AND/OR/NOT；基础比较 + LIKE + IN）
+- JOIN（INNER/LEFT；ON 目前支持等值 + AND 链）
 - ORDER BY（列名 / alias / ordinal(ORDER BY 1) / 标量表达式；多 key 支持 ASC/DESC）
 - LIMIT / OFFSET
 - GROUP BY（基础聚合）
 - HAVING（GROUP BY 后过滤；支持 alias/标量表达式条件）
 - CTE / WITH（materialize 临时表）
+- 子查询（FROM (SELECT ...) 派生表；WHERE col IN (SELECT ...)）
 - CREATE TABLE / INSERT / UPSERT
 
 ### 2.2 标量表达式（SQLite/DuckDB 常用子集）
@@ -77,7 +79,6 @@
 
 ## 5. Not Yet (Planned)
 
-- JOIN / 子查询 / HAVING
 - tombstone/增量 compact（避免全量重写；可选）
 - 二级索引（BTree 等）
 - string 持久化（透明字典编码/变长编码）

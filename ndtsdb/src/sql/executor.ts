@@ -28,6 +28,9 @@ export interface SQLQueryResult {
 
 type SelectItem = { expr: string; name: string };
 
+const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$/;
+
+
 type WindowSpec = {
   func: 'row_number' | 'count' | 'sum' | 'avg' | 'min' | 'max' | 'variance' | 'stddev';
   arg?: string; // column name or '*'
@@ -144,45 +147,137 @@ export class SQLExecutor {
       const table = this.getTable(select.from);
       if (!table) throw new Error(`Table not found: ${select.from}`);
 
-      // Fast path 1: simple tail window (no PARTITION BY)
-      const tail = this.tryExecuteTailWindow(select, table);
-      if (tail) return tail;
+      const hasJoins = !!((select as any).joins && (select as any).joins.length > 0);
+
+      if (!hasJoins) {
+        // Fast path 1: simple tail window (no PARTITION BY)
+        const tail = this.tryExecuteTailWindow(select, table);
+        if (tail) return tail;
+      }
 
       const allColumns = table.getColumnNames ? table.getColumnNames() : this.inferColumnNames(table);
 
-    // WHERE 过滤
-    let rowIndices: number[] | undefined;
-    if ((select as any).whereExpr) {
-      rowIndices = this.evaluateWhereExpr(table, (select as any).whereExpr);
-    } else if (select.where && select.where.length > 0) {
-      rowIndices = this.evaluateWhere(table, select.where);
-    }
-
-    if ((select as any).havingExpr && (!select.groupBy || select.groupBy.length === 0)) {
-      throw new Error('HAVING requires GROUP BY');
-    }
-
-    // SELECT * 快速路径
-    if (select.columns[0] === '*') {
-      let rows = this.extractRows(table, allColumns, rowIndices);
-
-      if (select.orderBy && select.orderBy.length > 0) {
-        rows = this.executeOrderBy(rows, select.orderBy, allColumns);
+      if ((select as any).havingExpr && (!select.groupBy || select.groupBy.length === 0)) {
+        throw new Error('HAVING requires GROUP BY');
       }
-      if (select.offset !== undefined) rows = rows.slice(select.offset);
-      if (select.limit !== undefined) rows = rows.slice(0, select.limit);
 
-      return { columns: allColumns, rows, rowCount: rows.length };
-    }
+      // JOIN：先把 FROM + JOIN materialize 成 row objects（再做 WHERE/投影/聚合）
+      if (hasJoins) {
+        const baseAlias = (select as any).fromAlias || select.from;
+        let joinedRows = this.extractRowsNamespaced(table, allColumns, baseAlias, true);
 
-    // 规范化选择项（保留 alias）
-    const selections: SelectItem[] = select.columns.map((c) => {
-      if (typeof c === 'string') return { expr: c, name: c };
-      return { expr: c.expr, name: c.alias || c.expr };
-    });
+        const joinSpecs = (select as any).joins as any[];
+        const joinColumns: string[] = [];
+        joinColumns.push(...allColumns.map((c) => `${baseAlias}.${c}`));
 
-    // 简化实现：直接抽全列，后续再按需裁剪（在大表上可优化）
-    let baseRows = this.extractRows(table, allColumns, rowIndices);
+        for (const j of joinSpecs) {
+          const right = this.getTable(j.table);
+          if (!right) throw new Error(`Table not found: ${j.table}`);
+
+          const rightAlias = j.alias || j.table;
+          const rightCols = right.getColumnNames ? right.getColumnNames() : this.inferColumnNames(right);
+          joinColumns.push(...rightCols.map((c) => `${rightAlias}.${c}`));
+
+          joinedRows = this.executeJoin(joinedRows, baseAlias, right, rightCols, rightAlias, j.type, j.on);
+        }
+
+        // WHERE（在 joined rows 上评估）
+        if ((select as any).whereExpr) {
+          joinedRows = this.filterRowsByWhereExpr(joinedRows, (select as any).whereExpr);
+        }
+
+        // SELECT *
+        if (select.columns[0] === '*') {
+          let outRows = joinedRows.map((r) => this.projectRowByColumns(r, joinColumns));
+
+          if (select.orderBy && select.orderBy.length > 0) {
+            outRows = this.executeOrderBy(outRows, select.orderBy, joinColumns);
+          }
+          if (select.offset !== undefined) outRows = outRows.slice(select.offset);
+          if (select.limit !== undefined) outRows = outRows.slice(0, select.limit);
+
+          return { columns: joinColumns, rows: outRows, rowCount: outRows.length };
+        }
+
+        // explicit projections
+        const selections: SelectItem[] = this.buildSelections(select.columns);
+
+        let baseRows = joinedRows;
+
+        // 投影 / GROUP BY
+        let rows: Array<Record<string, any>>;
+        if (select.groupBy && select.groupBy.length > 0) {
+          rows = this.executeGroupBy(baseRows, selections, select.groupBy);
+          if ((select as any).havingExpr) {
+            rows = this.filterRowsByWhereExpr(rows, (select as any).havingExpr);
+          }
+        } else {
+          if ((select as any).havingExpr) throw new Error('HAVING requires GROUP BY');
+          rows = baseRows.map((r) => this.projectRow(r, selections));
+        }
+
+        const outputColumns = selections.map((s) => s.name);
+        if (select.orderBy && select.orderBy.length > 0) {
+          rows = this.executeOrderBy(rows, select.orderBy, outputColumns);
+        }
+        if (select.offset !== undefined) rows = rows.slice(select.offset);
+        if (select.limit !== undefined) rows = rows.slice(0, select.limit);
+
+        return { columns: outputColumns, rows, rowCount: rows.length };
+      }
+
+      // 非 JOIN：WHERE 过滤（table 上评估；支持 FROM alias：WHERE a.col -> col）
+      const fromAlias = (select as any).fromAlias as string | undefined;
+
+      const stripAliasFromColumn = (col: any): any => {
+        if (!fromAlias) return col;
+        if (Array.isArray(col)) return col.map((c) => stripAliasFromColumn(c));
+        if (typeof col === 'string' && col.startsWith(fromAlias + '.')) return col.slice(fromAlias.length + 1);
+        return col;
+      };
+
+      const stripAliasFromWhereExpr = (expr: any): any => {
+        if (!fromAlias || !expr) return expr;
+        if (expr.type === 'pred') {
+          return { ...expr, pred: { ...expr.pred, column: stripAliasFromColumn(expr.pred.column) } };
+        }
+        if (expr.type === 'not') return { ...expr, expr: stripAliasFromWhereExpr(expr.expr) };
+        if (expr.type === 'and' || expr.type === 'or') {
+          return { ...expr, left: stripAliasFromWhereExpr(expr.left), right: stripAliasFromWhereExpr(expr.right) };
+        }
+        return expr;
+      };
+
+      let rowIndices: number[] | undefined;
+      if ((select as any).whereExpr) {
+        rowIndices = this.evaluateWhereExpr(table, stripAliasFromWhereExpr((select as any).whereExpr));
+      } else if (select.where && select.where.length > 0) {
+        const w = fromAlias
+          ? (select.where as any[]).map((c) => ({ ...c, column: stripAliasFromColumn(c.column) }))
+          : select.where;
+        rowIndices = this.evaluateWhere(table, w as any);
+      }
+
+      // SELECT * 快速路径
+      if (select.columns[0] === '*') {
+        let rows = this.extractRows(table, allColumns, rowIndices);
+        this.applyFromAliasPrefix(rows, allColumns, (select as any).fromAlias);
+
+        if (select.orderBy && select.orderBy.length > 0) {
+          rows = this.executeOrderBy(rows, select.orderBy, allColumns);
+        }
+        if (select.offset !== undefined) rows = rows.slice(select.offset);
+        if (select.limit !== undefined) rows = rows.slice(0, select.limit);
+
+        return { columns: allColumns, rows, rowCount: rows.length };
+      }
+
+      // 规范化选择项（保留 alias）
+      const selections: SelectItem[] = this.buildSelections(select.columns);
+
+      // 简化实现：直接抽全列，后续再按需裁剪（在大表上可优化）
+      let baseRows = this.extractRows(table, allColumns, rowIndices);
+      this.applyFromAliasPrefix(baseRows, allColumns, (select as any).fromAlias);
 
     // 提取内嵌窗口函数（如 vol_1d / price 中的 STDDEV(...) OVER (...)）
     const { selections: rewrittenSel, windowItems } = this.prepareInlineWindows(selections);
@@ -372,6 +467,25 @@ export class SQLExecutor {
       case '>=':
         return value >= compareValue;
       case 'IN': {
+        // 子查询：IN (SELECT ...)
+        if (compareValue && typeof compareValue === 'object' && 'subquery' in compareValue) {
+          const subRes = this.executeSelect((compareValue as any).subquery);
+          if (subRes.rowCount === 0) return false;
+          if (subRes.columns.length === 0) return false;
+
+          // 提取第一列作为 IN 的值集合
+          const col0 = subRes.columns[0];
+          const vals = subRes.rows.map((r: any) => r[col0]);
+
+          // 多列 IN 子查询（暂不支持）
+          if (Array.isArray(value)) {
+            throw new Error('Multi-column IN subquery not yet supported');
+          }
+
+          // 单列 IN
+          return vals.some((v) => this.sqlEquals(value, v));
+        }
+
         if (!Array.isArray(compareValue)) return false;
 
         // 多列 IN: value=[a,b], compareValue=[[a1,b1],[a2,b2]]
@@ -461,11 +575,8 @@ export class SQLExecutor {
     }
     const lastIdx = rowCount - 1;
 
-    // 规范化选择项（保留 alias）
-    const selections: SelectItem[] = select.columns.map((c) => {
-      if (typeof c === 'string') return { expr: c, name: c };
-      return { expr: c.expr, name: c.alias || c.expr };
-    });
+    // 规范化选择项（保留 alias / dotted ident 自动取末段）
+    const selections: SelectItem[] = this.buildSelections(select.columns);
 
     // 允许：纯列名（可 alias） + window expr + 标量表达式（会在单行上求值）
     const windowItems: Array<{ spec: WindowSpec; name: string; rawExpr: string }> = [];
@@ -948,6 +1059,138 @@ export class SQLExecutor {
     return rows;
   }
 
+  private applyFromAliasPrefix(rows: Array<Record<string, any>>, columns: string[], alias?: string): void {
+    if (!alias) return;
+    for (const r of rows) {
+      for (const c of columns) {
+        const k = `${alias}.${c}`;
+        if (!Object.prototype.hasOwnProperty.call(r, k)) r[k] = r[c];
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // JOIN helpers
+  // ---------------------------------------------------------------------------
+
+  private extractRowsNamespaced(
+    table: ColumnarTable,
+    columns: string[],
+    alias: string,
+    includePlain: boolean
+  ): Array<Record<string, any>> {
+    const rows: Array<Record<string, any>> = [];
+    const rowCount = table.getRowCount();
+
+    for (let i = 0; i < rowCount; i++) {
+      const row: Record<string, any> = {};
+      for (const col of columns) {
+        const v = this.getColumnValue(table, col, i);
+        row[`${alias}.${col}`] = v;
+        if (includePlain && row[col] === undefined) row[col] = v;
+      }
+      rows.push(row);
+    }
+
+    return rows;
+  }
+
+  private projectRowByColumns(row: Record<string, any>, cols: string[]): Record<string, any> {
+    const out: Record<string, any> = {};
+    for (const c of cols) out[c] = row[c];
+    return out;
+  }
+
+  private getRowValue(row: Record<string, any>, ref: string, defaultAlias?: string): any {
+    const r = String(ref).trim();
+
+    if (r.includes('.')) return row[r];
+    if (Object.prototype.hasOwnProperty.call(row, r)) return row[r];
+
+    if (defaultAlias) {
+      const key = `${defaultAlias}.${r}`;
+      if (Object.prototype.hasOwnProperty.call(row, key)) return row[key];
+    }
+
+    // fallback: try unique match by suffix
+    const suffix = `.${r}`;
+    let foundKey: string | null = null;
+    for (const k of Object.keys(row)) {
+      if (k.endsWith(suffix)) {
+        if (foundKey) return undefined; // ambiguous
+        foundKey = k;
+      }
+    }
+
+    return foundKey ? row[foundKey] : undefined;
+  }
+
+  private executeJoin(
+    leftRows: Array<Record<string, any>>,
+    leftDefaultAlias: string,
+    rightTable: ColumnarTable,
+    rightCols: string[],
+    rightAlias: string,
+    joinType: 'INNER' | 'LEFT',
+    on: Array<{ left: string; operator: '='; right: string }>
+  ): Array<Record<string, any>> {
+    // right side materialize (namespaced only)
+    const rightRows = this.extractRowsNamespaced(rightTable, rightCols, rightAlias, false);
+
+    // build hash index on right
+    const index = new Map<string, Array<Record<string, any>>>();
+
+    const normRightRef = (s: string) => {
+      const t = String(s).trim();
+      if (t.includes('.')) return t;
+      return `${rightAlias}.${t}`;
+    };
+
+    const normLeftRef = (s: string) => {
+      const t = String(s).trim();
+      if (t.includes('.')) return t;
+      return t; // left rows already have plain keys; keep as-is
+    };
+
+    // determine mapping (swap if condition is reversed)
+    const pairs = on.map((p) => {
+      const l = String(p.left).trim();
+      const r = String(p.right).trim();
+      const leftIsRight = l.startsWith(`${rightAlias}.`);
+      const rightIsRight = r.startsWith(`${rightAlias}.`);
+      if (leftIsRight && !rightIsRight) {
+        return { left: normLeftRef(r), right: normRightRef(l) };
+      }
+      return { left: normLeftRef(l), right: normRightRef(r) };
+    });
+
+    for (const rr of rightRows) {
+      const key = pairs.map((p) => String(this.getRowValue(rr, p.right, rightAlias))).join('\u0000');
+      const arr = index.get(key);
+      if (arr) arr.push(rr);
+      else index.set(key, [rr]);
+    }
+
+    const rightNullTemplate: Record<string, any> = {};
+    for (const c of rightCols) rightNullTemplate[`${rightAlias}.${c}`] = undefined;
+
+    const out: Array<Record<string, any>> = [];
+    for (const lr of leftRows) {
+      const key = pairs.map((p) => String(this.getRowValue(lr, p.left, leftDefaultAlias))).join('\u0000');
+      const matches = index.get(key);
+
+      if (matches && matches.length > 0) {
+        for (const rr of matches) {
+          out.push({ ...lr, ...rr });
+        }
+      } else if (joinType === 'LEFT') {
+        out.push({ ...lr, ...rightNullTemplate });
+      }
+    }
+
+    return out;
+  }
+
   // ---------------------------------------------------------------------------
   // Window functions + aliases
   // ---------------------------------------------------------------------------
@@ -1380,7 +1623,45 @@ export class SQLExecutor {
   }
 
   private normalizeExpr(expr: string): string {
-    return String(expr).replace(/\s+/g, ' ').trim();
+    // also normalize dotted identifiers that may come from tokenized SQL: "t . col" -> "t.col"
+    return String(expr)
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\.\s*/g, '.')
+      .trim();
+  }
+
+  private buildSelections(cols: SQLSelect['columns']): SelectItem[] {
+    const norm = (x: string) => this.normalizeExpr(x);
+
+    // first pass: propose names
+    const proposed: Array<{ expr: string; proposed: string; explicit: boolean }> = cols.map((c: any) => {
+      if (typeof c === 'string') {
+        const expr = norm(c);
+        if (IDENT_RE.test(expr)) {
+          const last = expr.split('.').pop()!;
+          return { expr, proposed: last, explicit: false };
+        }
+        return { expr, proposed: expr, explicit: false };
+      }
+
+      const expr = norm(c.expr);
+      const name = c.alias || expr;
+      return { expr, proposed: name, explicit: true };
+    });
+
+    const counts = new Map<string, number>();
+    for (const p of proposed) {
+      const key = p.proposed;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+
+    return proposed.map((p) => {
+      if (p.explicit) return { expr: p.expr, name: p.proposed };
+
+      // avoid collisions for implicit names: fall back to full expr
+      if ((counts.get(p.proposed) || 0) > 1) return { expr: p.expr, name: p.expr };
+      return { expr: p.expr, name: p.proposed };
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1638,10 +1919,10 @@ export class SQLExecutor {
         continue;
       }
 
-      // identifier
+      // identifier (support dotted: t.col)
       if (/[a-zA-Z_]/.test(ch)) {
         let id = '';
-        while (i < s.length && /[a-zA-Z0-9_]/.test(s[i])) {
+        while (i < s.length && /[a-zA-Z0-9_\.]/.test(s[i])) {
           id += s[i];
           i++;
         }

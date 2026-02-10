@@ -359,6 +359,136 @@ describe('SQL', () => {
 
     expect(() => executor.execute(new SQLParser().parse('SELECT * FROM t HAVING price > 0'))).toThrow();
   });
+
+  it('should support INNER JOIN + qualified columns', () => {
+    const users = new ColumnarTable([
+      { name: 'id', type: 'int32' },
+      { name: 'name', type: 'string' as any },
+    ]);
+
+    // ColumnarTable string is in-memory ok
+    users.appendBatch([
+      { id: 1, name: 'alice' },
+      { id: 2, name: 'bob' },
+    ] as any);
+
+    const orders = new ColumnarTable([
+      { name: 'user_id', type: 'int32' },
+      { name: 'amount', type: 'float64' },
+    ]);
+    orders.appendBatch([
+      { user_id: 1, amount: 10 },
+      { user_id: 1, amount: 20 },
+      { user_id: 3, amount: 999 },
+    ]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('users', users);
+    executor.registerTable('orders', orders);
+
+    const sql = "SELECT u.id AS uid, u.name, o.amount FROM users AS u JOIN orders AS o ON u.id = o.user_id ORDER BY o.amount ASC";
+    const r = executor.execute(new SQLParser().parse(sql)) as any;
+
+    expect(r.rowCount).toBe(2);
+    expect(r.rows[0].uid).toBe(1);
+    expect(r.rows[0].name).toBe('alice');
+    expect(Number(r.rows[0].amount)).toBe(10);
+  });
+
+  it('should support LEFT JOIN (unmatched -> nullish)', () => {
+    const users = new ColumnarTable([
+      { name: 'id', type: 'int32' },
+    ]);
+    users.appendBatch([{ id: 1 }, { id: 2 }]);
+
+    const orders = new ColumnarTable([
+      { name: 'user_id', type: 'int32' },
+      { name: 'amount', type: 'float64' },
+    ]);
+    orders.appendBatch([{ user_id: 1, amount: 10 }]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('users', users);
+    executor.registerTable('orders', orders);
+
+    const sql = "SELECT u.id, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.id ASC";
+    const r = executor.execute(new SQLParser().parse(sql)) as any;
+
+    expect(r.rowCount).toBe(2);
+    expect(r.rows[0].id).toBe(1);
+    expect(Number(r.rows[0].amount)).toBe(10);
+    expect(r.rows[1].id).toBe(2);
+    expect(r.rows[1].amount).toBeUndefined();
+  });
+
+  it('should support subquery in FROM (derived table)', () => {
+    const t = new ColumnarTable([
+      { name: 'id', type: 'int32' },
+      { name: 'price', type: 'float64' },
+    ]);
+    t.appendBatch([
+      { id: 1, price: 10 },
+      { id: 2, price: 20 },
+      { id: 3, price: 30 },
+    ]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', t);
+
+    const sql = "SELECT s.x FROM (SELECT id AS x FROM t WHERE price >= 20) AS s WHERE s.x < 3 ORDER BY s.x DESC";
+    const r = executor.execute(new SQLParser().parse(sql)) as any;
+
+    expect(r.rowCount).toBe(1);
+    expect(r.rows[0].x).toBe(2);
+  });
+
+  it('should support IN subquery', () => {
+    const users = new ColumnarTable([
+      { name: 'id', type: 'int32' },
+      { name: 'name', type: 'string' as any },
+    ]);
+    users.appendBatch([
+      { id: 1, name: 'alice' },
+      { id: 2, name: 'bob' },
+      { id: 3, name: 'charlie' },
+    ] as any);
+
+    const orders = new ColumnarTable([
+      { name: 'user_id', type: 'int32' },
+      { name: 'amount', type: 'float64' },
+    ]);
+    orders.appendBatch([
+      { user_id: 1, amount: 10 },
+      { user_id: 1, amount: 20 },
+      { user_id: 3, amount: 999 },
+    ]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('users', users);
+    executor.registerTable('orders', orders);
+
+    const sql = "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY name ASC";
+    const r = executor.execute(new SQLParser().parse(sql)) as any;
+
+    expect(r.rowCount).toBe(2);
+    expect(r.rows[0].name).toBe('alice');
+    expect(r.rows[1].name).toBe('charlie');
+  });
+
+  it('should support IN subquery with empty result', () => {
+    const t = new ColumnarTable([
+      { name: 'id', type: 'int32' },
+    ]);
+    t.appendBatch([{ id: 1 }, { id: 2 }]);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', t);
+
+    const sql = "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE id > 100)";
+    const r = executor.execute(new SQLParser().parse(sql)) as any;
+
+    expect(r.rowCount).toBe(0);
+  });
 });
 
 // ─── Query Functions ──────────────────────────────

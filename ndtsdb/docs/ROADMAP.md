@@ -60,8 +60,8 @@
 | **复杂 WHERE 表达式** | ✅ 已实现 | 括号优先级 + `AND/OR/NOT`（WHERE AST + executor 评估；并保留 legacy where[] 兼容） | ✅ P0 |
 | **ORDER BY <expr>** | ✅ 已实现 | 支持 alias/ordinal（ORDER BY 1）/标量表达式 + 多 key（对齐 SQLite/DuckDB 常用子集） | ✅ P0 |
 | **HAVING** | ✅ 已实现 | GROUP BY 后过滤（支持 alias/标量表达式条件） | ✅ P1 |
-| **JOIN** | ❌ 缺失 | INNER/LEFT JOIN | 🟢 P2 |
-| **子查询** | ❌ 缺失 | `FROM (SELECT ...)` / `IN (SELECT ...)` | 🟢 P2 |
+| **JOIN** | ✅ 已实现（第一版） | INNER/LEFT JOIN（ON 仅等值 + AND 链） | 🟡 P1 |
+| **子查询** | ✅ 已实现 | ✅ `FROM (SELECT ...)`（派生表，内部以隐式 CTE 物化）；✅ `WHERE col IN (SELECT ...)` | ✅ P1 |
 
 ---
 
@@ -92,10 +92,10 @@ await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
 - ~~窗口函数~~ ✅ 已实现 ROW_NUMBER/STDDEV/AVG/SUM... OVER (...)
 - ~~GROUP BY~~ ✅ 已实现
 - ~~CTE (WITH 子句)~~ ✅ 已实现
-- JOIN 支持（至少 INNER JOIN）- 多表关联
-- 子查询（WHERE col IN (SELECT ...)）
+- ~~JOIN~~ ✅ 已实现（INNER/LEFT；ON=等值 + AND 链）
+- ~~子查询~~ ✅ 已实现（FROM 派生表 + WHERE IN 子查询）
 - ~~复杂 WHERE（嵌套括号优先级）~~ ✅ 已实现
-- HAVING 子句（GROUP BY 后过滤）
+- ~~HAVING~~ ✅ 已实现（GROUP BY 后过滤）
 
 ### 🟡 中优先级（提升易用性）
 
@@ -233,7 +233,7 @@ Chunk 级原子写入：
 | **v0.11.1** | ✅ **已完成** | **Inline Window + PARTITION BY fast-path 统一**（典型“每分区取最新一行”的窗口报表，避免全表物化） |
 | **v0.11.2** | ✅ **已完成** | **复杂 WHERE（括号优先级 / AND-OR-NOT）** ✅；**ORDER BY <expr>（alias/ordinal/expr）** ✅ |
 | **v0.12.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
-| **v0.13.0** | 🔴 高 | SQL JOIN + 子查询 + HAVING |
+| **v0.13.0** | ✅ **已完成** | SQL 子查询（FROM 派生表 + WHERE IN 子查询） |
 | **v0.14.0** | 🟡 中 | 自动二级索引（BTree） |
 | **v0.15.0** | 🟡 中 | 原生字符串类型（透明字典编码） |
 | **v1.0.0** | 🟢 低 | 事务支持（WAL + 原子写入）|

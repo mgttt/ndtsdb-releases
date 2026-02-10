@@ -9,7 +9,7 @@ export type SQLOperator = '=' | '!=' | '<>' | '<' | '>' | '<=' | '>=' | 'LIKE' |
 export interface SQLCondition {
   column: string | string[]; // 支持多列 IN: (a,b) IN ((1,2),(3,4))
   operator: SQLOperator;
-  value: SQLValue | SQLValue[] | SQLValue[][];
+  value: SQLValue | SQLValue[] | SQLValue[][] | { subquery: SQLSelect };
   logic?: 'AND' | 'OR';  // legacy: 与下一个条件的逻辑关系（无括号优先级）
 }
 
@@ -25,10 +25,25 @@ export interface SQLCTE {
   select: SQLSelect;
 }
 
+export interface SQLJoinOn {
+  left: string;
+  operator: '=';
+  right: string;
+}
+
+export interface SQLJoin {
+  type: 'INNER' | 'LEFT';
+  table: string;
+  alias?: string;
+  on: SQLJoinOn[];
+}
+
 export interface SQLSelect {
   with?: SQLCTE[];
   columns: Array<string | { expr: string; alias?: string }>;
   from: string;
+  fromAlias?: string;
+  joins?: SQLJoin[];
   // legacy: 线性条件数组（无括号优先级）；保留兼容
   where?: SQLCondition[];
   // new: WHERE AST（括号优先级 + AND/OR/NOT）
@@ -75,6 +90,7 @@ export class SQLParser {
   private pos: number = 0;
   private tokens: string[] = [];
   private tokenPos: number = 0;
+  private subqueryId: number = 0;
 
   parse(sql: string): SQLStatement {
     this.sql = sql.trim();
@@ -144,10 +160,10 @@ export class SQLParser {
         continue;
       }
       
-      // 标识符或关键字
+      // 标识符或关键字（支持 dotted ident: t.col）
       if (/[a-zA-Z_]/.test(char)) {
         let ident = '';
-        while (i < sql.length && /[a-zA-Z0-9_]/.test(sql[i])) {
+        while (i < sql.length && /[a-zA-Z0-9_.]/.test(sql[i])) {
           ident += sql[i];
           i++;
         }
@@ -192,6 +208,13 @@ export class SQLParser {
     return tokens;
   }
 
+  private parseSelectStatement(): SQLSelect {
+    const first = this.peek()?.toUpperCase();
+    if (first === 'WITH') return this.parseWithSelect();
+    if (first === 'SELECT') return this.parseSelect();
+    throw new Error(`Expected SELECT statement, got ${this.peek()}`);
+  }
+
   // 解析 WITH ... SELECT
   private parseWithSelect(): SQLSelect {
     this.consume('WITH');
@@ -223,7 +246,7 @@ export class SQLParser {
     }
 
     const main = this.parseSelect();
-    main.with = withCTEs;
+    main.with = [...withCTEs, ...(main.with || [])];
     return main;
   }
 
@@ -234,8 +257,73 @@ export class SQLParser {
     const columns = this.parseSelectColumns();
     
     this.consume('FROM');
-    const from = this.consumeIdentifier();
-    
+
+    let extraWith: SQLCTE[] | undefined;
+    let from: string;
+
+    // FROM <ident> | FROM (<select>)
+    if (this.peek() === '(') {
+      this.consume('(');
+      const sub = this.parseSelectStatement();
+      this.consume(')');
+
+      const name = `__subq${++this.subqueryId}`;
+      extraWith = [{ name, select: sub }];
+      from = name;
+    } else {
+      from = this.consumeIdentifier();
+    }
+
+    // optional FROM alias: FROM t AS x / FROM t x
+    let fromAlias: string | undefined;
+    const nextAfterFrom = this.peek()?.toUpperCase();
+    if (nextAfterFrom === 'AS') {
+      this.consume('AS');
+      fromAlias = this.consumeIdentifier();
+    } else if (this.peek() && this.isIdentifierToken(this.peek()!) && !['WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'JOIN', 'INNER', 'LEFT'].includes(nextAfterFrom || '')) {
+      fromAlias = this.consumeIdentifier();
+    }
+
+    // JOIN ... ON ... (only equality + AND chain for now)
+    const joins: SQLJoin[] = [];
+    while (true) {
+      const t = this.peek()?.toUpperCase();
+      if (!t) break;
+
+      let joinType: 'INNER' | 'LEFT' = 'INNER';
+      if (t === 'INNER') {
+        this.consume('INNER');
+        this.consume('JOIN');
+        joinType = 'INNER';
+      } else if (t === 'LEFT') {
+        this.consume('LEFT');
+        if (this.peek()?.toUpperCase() === 'OUTER') this.consume('OUTER');
+        this.consume('JOIN');
+        joinType = 'LEFT';
+      } else if (t === 'JOIN') {
+        this.consume('JOIN');
+        joinType = 'INNER';
+      } else {
+        break;
+      }
+
+      const table = this.consumeIdentifier();
+
+      let alias: string | undefined;
+      const next = this.peek()?.toUpperCase();
+      if (next === 'AS') {
+        this.consume('AS');
+        alias = this.consumeIdentifier();
+      } else if (this.peek() && this.isIdentifierToken(this.peek()!) && !['ON', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'JOIN', 'INNER', 'LEFT'].includes(next || '')) {
+        alias = this.consumeIdentifier();
+      }
+
+      this.consume('ON');
+      const on = this.parseJoinOn();
+
+      joins.push({ type: joinType, table, alias, on });
+    }
+
     let where: SQLCondition[] | undefined;
     let whereExpr: SQLWhereExpr | undefined;
     if (this.peek()?.toUpperCase() === 'WHERE') {
@@ -278,7 +366,20 @@ export class SQLParser {
       offset = parseInt(this.consume());
     }
     
-    return { columns, from, where, whereExpr, groupBy, havingExpr, orderBy, limit, offset };
+    return {
+      with: extraWith,
+      columns,
+      from,
+      fromAlias,
+      joins: joins.length > 0 ? joins : undefined,
+      where,
+      whereExpr,
+      groupBy,
+      havingExpr,
+      orderBy,
+      limit,
+      offset,
+    };
   }
 
   // 解析 SELECT 列
@@ -395,12 +496,12 @@ export class SQLParser {
     if (this.peek() !== '(') return false;
     const t1 = this.tokens[this.tokenPos + 1];
     const t2 = this.tokens[this.tokenPos + 2];
-    // (a,b) ...
+    // (a,b) ... (tuple columns themselves do not accept dotted names for now)
     return !!t1 && this.isIdentifierToken(t1) && t2 === ',';
   }
 
   private isIdentifierToken(t: string): boolean {
-    return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t);
+    return /^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$/.test(t);
   }
 
   private parsePredicate(allowExprLHS: boolean): Omit<SQLCondition, 'logic'> {
@@ -544,13 +645,40 @@ export class SQLParser {
   // 解析 IN (...) 右侧，支持：
   // - 单列 IN: (1,2,3)
   // - 多列 IN: ((1,2),(3,4))
-  private parseInValue(): SQLValue[] | SQLValue[][] {
+  private parseJoinOn(): SQLJoinOn[] {
+    const on: SQLJoinOn[] = [];
+
+    while (true) {
+      const left = this.consumeIdentifier();
+      this.consume('=');
+      const right = this.consumeIdentifier();
+      on.push({ left, operator: '=', right });
+
+      const next = this.peek()?.toUpperCase();
+      if (next === 'AND') {
+        this.consume('AND');
+        continue;
+      }
+      break;
+    }
+
+    return on;
+  }
+
+  private parseInValue(): SQLValue[] | SQLValue[][] | { subquery: SQLSelect } {
     if (this.peek() !== '(') {
       // 允许语法扩展：IN <ident>（未实现）
       return [this.parseSingleValue()];
     }
 
     this.consume('(');
+
+    // 子查询：IN (SELECT ...)
+    if (this.peek()?.toUpperCase() === 'SELECT' || this.peek()?.toUpperCase() === 'WITH') {
+      const subquery = this.parseSelectStatement();
+      this.consume(')');
+      return { subquery };
+    }
 
     // 多列：IN ( (..), (..) )
     if (this.peek() === '(') {
@@ -834,7 +962,8 @@ export class SQLParser {
 
   private consumeIdentifier(): string {
     const token = this.consume();
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(token)) {
+    // allow dotted identifier: a.b
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$/.test(token)) {
       throw new Error(`Expected identifier, got ${token}`);
     }
     return token;
