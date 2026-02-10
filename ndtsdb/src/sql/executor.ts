@@ -384,6 +384,11 @@ export class SQLExecutor {
   }
 
   private evaluateWhereExpr(table: ColumnarTable, expr: SQLWhereExpr): number[] {
+    // 索引优化：检测简单的范围查询（单列 + AND 链）
+    const indexResult = this.tryUseIndex(table, expr);
+    if (indexResult) return indexResult;
+
+    // 回退到全表扫描
     const matching: number[] = [];
     const rowCount = table.getRowCount();
 
@@ -409,6 +414,104 @@ export class SQLExecutor {
     }
 
     return matching;
+  }
+
+  /**
+   * 尝试使用索引优化查询
+   * 支持：col > val, col < val, col >= val, col <= val, col = val, col IN (...)
+   * 以及简单的 AND 组合（但不支持 OR）
+   */
+  private tryUseIndex(table: ColumnarTable, expr: SQLWhereExpr): number[] | null {
+    // 提取所有 AND 链接的 pred
+    const preds: Array<{ column: string; operator: string; value: any }> = [];
+    
+    const collectPreds = (n: SQLWhereExpr): boolean => {
+      if (n.type === 'pred') {
+        if (typeof n.pred.column !== 'string') return false; // 不支持 tuple
+        preds.push({
+          column: n.pred.column,
+          operator: n.pred.operator,
+          value: n.pred.value,
+        });
+        return true;
+      }
+      if (n.type === 'and') {
+        return collectPreds(n.left) && collectPreds(n.right);
+      }
+      return false; // OR / NOT 不支持索引优化
+    };
+
+    if (!collectPreds(expr)) return null;
+
+    // 找到第一个有索引且可用的列
+    for (const p of preds) {
+      if (!table.hasIndex(p.column)) continue;
+
+      const val = p.value;
+      if (typeof val !== 'number' && typeof val !== 'bigint') continue;
+
+      let candidates: number[] | null = null;
+
+      switch (p.operator) {
+        case '=':
+          candidates = table.queryIndexExact(p.column, val);
+          break;
+        case '>':
+          candidates = table.queryIndexGreaterThan(p.column, val);
+          break;
+        case '<':
+          candidates = table.queryIndexLessThan(p.column, val);
+          break;
+        case '>=': {
+          const gt = table.queryIndexGreaterThan(p.column, val);
+          const eq = table.queryIndexExact(p.column, val);
+          candidates = [...new Set([...gt, ...eq])].sort((a, b) => a - b);
+          break;
+        }
+        case '<=': {
+          const lt = table.queryIndexLessThan(p.column, val);
+          const eq = table.queryIndexExact(p.column, val);
+          candidates = [...new Set([...lt, ...eq])].sort((a, b) => a - b);
+          break;
+        }
+        default:
+          continue;
+      }
+
+      if (!candidates) continue;
+
+      // 在候选集上评估剩余条件
+      const result: number[] = [];
+      for (const rowIndex of candidates) {
+        if (this.evalWhereExprAt(table, expr, rowIndex)) {
+          result.push(rowIndex);
+        }
+      }
+
+      return result;
+    }
+
+    return null;
+  }
+
+  /**
+   * 在指定行评估 WHERE 表达式（用于索引后的二次过滤）
+   */
+  private evalWhereExprAt(table: ColumnarTable, expr: SQLWhereExpr, rowIndex: number): boolean {
+    switch (expr.type) {
+      case 'pred': {
+        const v = this.getConditionValue(table, expr.pred.column as any, rowIndex);
+        return this.evaluateCondition(v, expr.pred.operator as any, (expr.pred as any).value);
+      }
+      case 'and':
+        return this.evalWhereExprAt(table, expr.left, rowIndex) && this.evalWhereExprAt(table, expr.right, rowIndex);
+      case 'or':
+        return this.evalWhereExprAt(table, expr.left, rowIndex) || this.evalWhereExprAt(table, expr.right, rowIndex);
+      case 'not':
+        return !this.evalWhereExprAt(table, expr.expr, rowIndex);
+      default:
+        return false;
+    }
   }
 
   private sqlEquals(a: any, b: any): boolean {

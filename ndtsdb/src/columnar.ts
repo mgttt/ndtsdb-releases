@@ -5,6 +5,7 @@
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
+import { BTreeIndex } from './index/btree.js';
 
 export type ColumnarType = 'int64' | 'float64' | 'int32' | 'int16' | 'string';
 
@@ -23,6 +24,7 @@ export class ColumnarTable {
   private rowCount = 0;
   private capacity: number;
   private readonly growthFactor = 1.5;
+  private indexes: Map<string, BTreeIndex<number | bigint>> = new Map();
 
   /**
    * 从现有 TypedArray 直接创建表视图（零拷贝）。
@@ -124,7 +126,28 @@ export class ColumnarTable {
       }
     }
 
+    // 更新索引
+    const startRow = this.rowCount;
     this.rowCount += data.length;
+
+    for (const [colName, index] of this.indexes) {
+      const col = this.columns.get(colName);
+      if (!col) continue;
+
+      const def = this.columnDefs.find((d) => d.name === colName);
+      if (!def) continue;
+
+      // 只索引数值列
+      if (def.type === 'int64' || def.type === 'float64' || def.type === 'int32' || def.type === 'int16') {
+        for (let i = 0; i < data.length; i++) {
+          const rowIndex = startRow + i;
+          const val = (col as any)[rowIndex];
+          if (val != null) {
+            index.insert(val, rowIndex);
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -159,7 +182,25 @@ export class ColumnarTable {
       }
     }
 
+    const rowIndex = this.rowCount;
     this.rowCount++;
+
+    // 更新索引
+    for (const [colName, index] of this.indexes) {
+      const col = this.columns.get(colName);
+      if (!col) continue;
+
+      const def = this.columnDefs.find((d) => d.name === colName);
+      if (!def) continue;
+
+      // 只索引数值列
+      if (def.type === 'int64' || def.type === 'float64' || def.type === 'int32' || def.type === 'int16') {
+        const val = (col as any)[rowIndex];
+        if (val != null) {
+          index.insert(val, rowIndex);
+        }
+      }
+    }
   }
 
   /**
@@ -508,6 +549,96 @@ export class ColumnarTable {
       if (val > max) max = val;
     }
     return max;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 索引管理
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 创建列索引（BTree）
+   * 自动根据列类型选择索引类型
+   */
+  createIndex(columnName: string): void {
+    const def = this.columnDefs.find((d) => d.name === columnName);
+    if (!def) throw new Error(`Column not found: ${columnName}`);
+
+    // 只支持数值列索引
+    if (def.type !== 'int64' && def.type !== 'float64' && def.type !== 'int32' && def.type !== 'int16') {
+      throw new Error(`Index not supported for type: ${def.type}`);
+    }
+
+    // 创建索引
+    const index = new BTreeIndex<number | bigint>(32);
+    const col = this.columns.get(columnName);
+    if (!col) throw new Error(`Column not found: ${columnName}`);
+
+    // 批量插入现有数据
+    for (let i = 0; i < this.rowCount; i++) {
+      const val = (col as any)[i];
+      if (val != null) {
+        index.insert(val, i);
+      }
+    }
+
+    this.indexes.set(columnName, index);
+  }
+
+  /**
+   * 删除索引
+   */
+  dropIndex(columnName: string): void {
+    this.indexes.delete(columnName);
+  }
+
+  /**
+   * 查询索引（范围查询）
+   */
+  queryIndex(columnName: string, start: number | bigint, end: number | bigint): number[] {
+    const index = this.indexes.get(columnName);
+    if (!index) throw new Error(`No index on column: ${columnName}`);
+    return index.rangeQuery(start as any, end as any);
+  }
+
+  /**
+   * 查询索引（精确匹配）
+   */
+  queryIndexExact(columnName: string, value: number | bigint): number[] {
+    const index = this.indexes.get(columnName);
+    if (!index) throw new Error(`No index on column: ${columnName}`);
+    return index.query(value as any);
+  }
+
+  /**
+   * 查询索引（小于）
+   */
+  queryIndexLessThan(columnName: string, value: number | bigint): number[] {
+    const index = this.indexes.get(columnName);
+    if (!index) throw new Error(`No index on column: ${columnName}`);
+    return index.lessThan(value as any);
+  }
+
+  /**
+   * 查询索引（大于）
+   */
+  queryIndexGreaterThan(columnName: string, value: number | bigint): number[] {
+    const index = this.indexes.get(columnName);
+    if (!index) throw new Error(`No index on column: ${columnName}`);
+    return index.greaterThan(value as any);
+  }
+
+  /**
+   * 检查列是否有索引
+   */
+  hasIndex(columnName: string): boolean {
+    return this.indexes.has(columnName);
+  }
+
+  /**
+   * 获取所有索引列
+   */
+  getIndexedColumns(): string[] {
+    return Array.from(this.indexes.keys());
   }
 }
 

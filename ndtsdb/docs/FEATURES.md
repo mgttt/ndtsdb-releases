@@ -77,8 +77,15 @@
 
 ---
 
-## 5. Not Yet (Planned)
+## 5. Index（索引）
 
+- **BTree 索引**：数值列（timestamp/price 等）范围查询加速
+- **自动维护**：appendBatch / append 时自动更新索引
+- **SQL 自动优化**：WHERE 条件自动使用索引（> / < / >= / <= / =）
+- **API**：createIndex / dropIndex / queryIndex / hasIndex
+
+## 6. Not Yet (Planned)
+
+- 复合索引（多列组合，如 `(symbol, timestamp)`）
 - tombstone/增量 compact（避免全量重写；可选）
-- 二级索引（BTree 等）
 - string 持久化（透明字典编码/变长编码）

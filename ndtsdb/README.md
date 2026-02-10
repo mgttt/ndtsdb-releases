@@ -211,6 +211,10 @@ KEY (symbol, interval, timestamp);
 > 💎 支持赞助数字货币（金额随意）  
 > 🔗 这是 [TON 链](https://ton.foundation/) 的钱包地址
 
+**扫码支付** (Telegram 钱包可直接扫码):
+
+<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=ton://transfer/UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG" alt="TON Wallet QR Code" width="200" />
+
 ---
 
 MIT
