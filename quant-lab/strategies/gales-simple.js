@@ -129,6 +129,51 @@ function st_heartbeat(tick) {
 }
 
 /**
+ * 参数热更新（不重启沙箱）
+ */
+function st_onParamsUpdate(newParams) {
+  logInfo('[Gales] 参数热更新: ' + JSON.stringify(newParams));
+  
+  // 更新配置
+  if (newParams.gridCount !== undefined) {
+    CONFIG.gridCount = newParams.gridCount;
+    logInfo('[Gales] 网格数量: ' + CONFIG.gridCount);
+  }
+  if (newParams.gridSpacing !== undefined) {
+    CONFIG.gridSpacing = newParams.gridSpacing;
+    logInfo('[Gales] 网格间距: ' + CONFIG.gridSpacing);
+  }
+  if (newParams.magnetDistance !== undefined) {
+    CONFIG.magnetDistance = newParams.magnetDistance;
+    logInfo('[Gales] 磁铁距离: ' + CONFIG.magnetDistance);
+  }
+  if (newParams.cancelDistance !== undefined) {
+    CONFIG.cancelDistance = newParams.cancelDistance;
+    logInfo('[Gales] 取消距离: ' + CONFIG.cancelDistance);
+  }
+  
+  // 重新初始化网格（保持当前价格）
+  if (state.initialized) {
+    logInfo('[Gales] 重新初始化网格（中心价格: ' + state.lastPrice + '）');
+    state.centerPrice = state.lastPrice;
+    initializeGrids();
+  }
+  
+  // 可选：撤销旧订单
+  const cancelOldOrders = newParams.cancelOldOrders || false;
+  if (cancelOldOrders && state.openOrders.length > 0) {
+    logInfo('[Gales] 撤销旧订单: ' + state.openOrders.length + ' 个');
+    state.openOrders.forEach(function(order) {
+      bridge_cancelOrder(order.orderId);
+    });
+    state.openOrders = [];
+  }
+  
+  saveState();
+  logInfo('[Gales] 参数热更新完成');
+}
+
+/**
  * 停止
  */
 function st_stop() {

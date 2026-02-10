@@ -294,6 +294,42 @@ export class QuickJSStrategy {
   }
 
   /**
+   * 热更新参数（不重启沙箱）
+   */
+  async updateParams(newParams: Record<string, any>): Promise<void> {
+    if (!this.initialized || !this.ctx) {
+      throw new Error('策略未初始化，无法更新参数');
+    }
+
+    console.log(`[QuickJSStrategy] 热更新参数:`, newParams);
+
+    // 1. 更新内部参数存储
+    this.config.params = { ...this.config.params, ...newParams };
+
+    // 2. 更新 QuickJS 上下文中的 ctx.strategy.params
+    const ctxHandle = this.ctx.getProp(this.ctx.global, 'ctx');
+    const strategyHandle = this.ctx.getProp(ctxHandle, 'strategy');
+    const paramsHandle = this.ctx.newString(JSON.stringify(this.config.params));
+    
+    this.ctx.setProp(strategyHandle, 'params', paramsHandle);
+    
+    paramsHandle.dispose();
+    strategyHandle.dispose();
+    ctxHandle.dispose();
+
+    // 3. 调用策略的参数更新回调
+    try {
+      await this.callStrategyFunction('st_onParamsUpdate', this.config.params);
+      console.log(`[QuickJSStrategy] 参数更新完成`);
+    } catch (error: any) {
+      console.warn(`[QuickJSStrategy] 策略未实现 st_onParamsUpdate:`, error.message);
+    }
+
+    // 4. 保存状态
+    this.flushState();
+  }
+
+  /**
    * 停止
    */
   async onStop(ctx: StrategyContext): Promise<void> {
