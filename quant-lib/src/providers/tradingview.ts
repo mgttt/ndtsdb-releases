@@ -62,14 +62,6 @@ export class TradingViewProvider extends WebSocketDataProvider {
     interval: string;
   }> = new Map();
   
-  // 请求队列（避免并发导致 TradingView 断开连接）
-  private requestQueue: Array<{
-    query: KlineQuery;
-    resolve: (klines: Kline[]) => void;
-    reject: (error: Error) => void;
-  }> = [];
-  private isProcessingQueue = false;
-  
   constructor(config: TradingViewProviderConfig = {}) {
     super({
       name: 'TradingView',
@@ -166,64 +158,13 @@ export class TradingViewProvider extends WebSocketDataProvider {
   }
   
   /**
-   * 获取 K线数据（队列入口）
+   * 获取 K线数据
    */
   async getKlines(query: KlineQuery): Promise<Kline[]> {
     if (!this.isConnected) {
       await this.connect();
     }
     
-    // 将请求加入队列
-    return new Promise((resolve, reject) => {
-      this.requestQueue.push({ query, resolve, reject });
-      this.processQueue();
-    });
-  }
-  
-  /**
-   * 处理请求队列（顺序执行，避免并发）
-   */
-  private processQueue(): void {
-    if (this.isProcessingQueue || this.requestQueue.length === 0) {
-      return;
-    }
-    
-    this.isProcessingQueue = true;
-    this.processNextRequest();
-  }
-  
-  /**
-   * 处理下一个请求
-   */
-  private async processNextRequest(): Promise<void> {
-    const item = this.requestQueue.shift();
-    if (!item) {
-      this.isProcessingQueue = false;
-      return;
-    }
-    
-    const { query, resolve, reject } = item;
-    
-    try {
-      const klines = await this._executeKlineRequest(query);
-      resolve(klines);
-    } catch (error) {
-      reject(error);
-    } finally {
-      // 处理完成后，继续处理下一个请求
-      if (this.requestQueue.length > 0) {
-        // 添加 500ms 间隔，避免请求过快
-        setTimeout(() => this.processNextRequest(), 500);
-      } else {
-        this.isProcessingQueue = false;
-      }
-    }
-  }
-  
-  /**
-   * 执行单个 K线请求（内部实现）
-   */
-  private _executeKlineRequest(query: KlineQuery): Promise<Kline[]> {
     const { symbol, interval, limit = 300 } = query;
     
     return new Promise((resolve, reject) => {
