@@ -60,9 +60,11 @@ WITH periods AS (
 SELECT ... FROM periods WHERE rn = 1
 ```
 
-**当前状态**: ❌ 不支持
-**影响**: 无法编写复杂的多层查询，必须用临时表或多次查询替代
-**建议**: 添加 CTE 支持，或提供链式查询 API
+**当前状态**: ✅ 已支持
+**实现方式**: 执行器会将每个 CTE 查询结果 materialize 成临时表，再执行主查询。
+- 支持 CTE 引用前面定义的 CTE
+- 临时表支持 string 列（用于 `||`、多列 IN 等）
+- 但二进制持久化 `saveToFile/loadFromFile` 暂不支持 string（CTE 场景不需要）
 
 ---
 
@@ -96,10 +98,8 @@ STDDEV(close) OVER (
 WHERE (base_currency, quote_currency) IN (('AAPL', 'USD'), ('TSLA', 'USD'))
 ```
 
-**当前状态**: ❌ 不支持
-**当前实现**: 仅支持单列 `WHERE col IN (v1, v2, v3)`
-**影响**: 多条件匹配需要展开为多个 OR 条件
-**建议**: 扩展 IN 子句支持元组比较
+**当前状态**: ✅ 已支持
+**说明**: 已支持元组 IN：`(a,b) IN ((1,2),(3,4))`（字符串/数字均可，取决于列类型）
 
 ---
 
@@ -113,8 +113,7 @@ WHERE (base_currency, quote_currency) IN (('AAPL', 'USD'), ('TSLA', 'USD'))
 SELECT base_currency || '/' || quote_currency as symbol
 ```
 
-**当前状态**: ❌ 不支持 `||` 运算符
-**Workaround**: 应用层处理字符串拼接
+**当前状态**: ✅ 已支持 `||` 运算符（SQLite 风格）
 
 ---
 
@@ -126,8 +125,7 @@ SELECT base_currency || '/' || quote_currency as symbol
 ROUND(vol_1d / price * 100, 2) as vol_1d_pct
 ```
 
-**当前状态**: ❌ 不支持
-**Workaround**: 应用层四舍五入
+**当前状态**: ✅ 已支持
 
 ---
 
@@ -139,8 +137,7 @@ ROUND(vol_1d / price * 100, 2) as vol_1d_pct
 STDDEV(close) OVER (...) / SQRT(1)
 ```
 
-**当前状态**: ❌ SQL 层不支持，但常量可预计算
-**Workaround**: 应用层计算 SQRT
+**当前状态**: ✅ 已支持
 
 ---
 
@@ -193,11 +190,11 @@ LIMIT 1`;
 
 | 特性 | 状态 | 影响 |
 |------|------|------|
-| CTE (WITH) | ❌ | 需改写为多次查询或临时表 |
+| CTE (WITH) | ✅ | 可直接按 DuckDB 风格写分层查询 |
 | PARTITION BY | ⚠️ | 行为不一致，需验证 |
-| 多列 IN | ❌ | 需展开为 OR 条件 |
-| 字符串拼接 || | ❌ | 应用层处理 |
-| ROUND | ❌ | 应用层处理 |
+| 多列 IN | ✅ | 支持 (a,b) IN ((..),(..)) |
+| 字符串拼接 || | ✅ | 已支持 |
+| ROUND | ✅ | 已支持 |
 
 ---
 
@@ -216,7 +213,7 @@ const query = `
 
 // 新方案（ndtsdb 兼容）
 // 1. 逐个 symbol 查询（避免 PARTITION BY）
-// 2. 应用层计算 ROUND/SQRT/字符串拼接
+// 2. 仍可使用 ROUND/SQRT/字符串拼接（SQL 层已支持）
 // 3. 应用层过滤 rn = 1（取最后一条）
 
 for (const symbol of symbols) {
@@ -240,12 +237,12 @@ for (const symbol of symbols) {
 
 | 优先级 | 功能 | 工作量 | 指派 |
 |--------|------|--------|------|
-| 🔴 高 | CTE (WITH) | 2-3天 | bot-00X |
-| 🔴 高 | 多列 IN | 半天 | bot-00X |
+| 🔴 高 | ~~CTE (WITH)~~ ✅ | 已完成 | bot-001 |
+| 🔴 高 | ~~多列 IN~~ ✅ | 已完成 | bot-001 |
 | 🔴 高 | PARTITION BY 统一 | 1天 | bot-007 |
-| 🟡 中 | ROUND 函数 | 半天 | bot-00X |
-| 🟡 中 | 字符串拼接 || | 半天 | bot-00X |
-| 🟢 低 | SQRT 函数 | 半天 | bot-00X |
+| 🟡 中 | ~~ROUND~~ ✅ | 已完成 | bot-001 |
+| 🟡 中 | ~~字符串拼接 \|\|~~ ✅ | 已完成 | bot-001 |
+| 🟢 低 | ~~SQRT~~ ✅ | 已完成 | bot-001 |
 | 🟢 低 | JOIN | 3-5天 | 待定 |
 
 ---
@@ -272,7 +269,7 @@ for (const symbol of symbols) {
 ### 5.3 最终建议
 
 1. **短期**: 改写 `futu-positions-volatility.ts` 为 ndtsdb 兼容 SQL（逐个 symbol 查询）
-2. **中期**: 实现 CTE、多列 IN、常用函数（ROUND/SQRT）
+2. **中期**: 统一/优化 PARTITION BY（尤其是与 fast-path 的一致性）
 3. **长期**: 根据实际需求决定是否实现 JOIN/子查询
 
 ndtsdb SQL 当前能力**基本满足**简单时序分析场景，但**不足以支持**复杂的多表/多层分析查询。

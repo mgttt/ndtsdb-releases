@@ -5,7 +5,7 @@
 // ============================================================
 
 import { ColumnarTable, type ColumnarType } from '../columnar.js';
-import type { SQLStatement, SQLSelect, SQLCondition, SQLOperator, SQLUpsert, SQLCreateTable } from './parser.js';
+import type { SQLStatement, SQLSelect, SQLCTE, SQLCondition, SQLOperator, SQLUpsert, SQLCreateTable } from './parser.js';
 
 type RollingStdFn = (src: Float64Array, window: number) => Float64Array;
 
@@ -49,6 +49,64 @@ export class SQLExecutor {
     return this.tables.get(name.toLowerCase());
   }
 
+  // ---------------------------------------------------------------------------
+  // CTE (WITH)
+  // ---------------------------------------------------------------------------
+
+  private installCTEs(ctes: SQLCTE[]): (() => void) {
+    const saved = new Map<string, ColumnarTable | undefined>();
+
+    for (const cte of ctes) {
+      const key = cte.name.toLowerCase();
+      if (!saved.has(key)) {
+        saved.set(key, this.tables.get(key));
+      }
+
+      const res = this.executeSelect(cte.select);
+      const table = this.materializeResultAsTable(res);
+      this.tables.set(key, table);
+    }
+
+    return () => {
+      for (const [key, prev] of saved.entries()) {
+        if (prev) this.tables.set(key, prev);
+        else this.tables.delete(key);
+      }
+    };
+  }
+
+  private materializeResultAsTable(res: SQLQueryResult): ColumnarTable {
+    const cols = res.columns;
+    const rows = res.rows;
+
+    // 推断列类型（小型结果集场景，够用；后续可按 column stats 优化）
+    const defs = cols.map((name) => ({ name, type: this.inferColumnType(rows, name) } as any));
+
+    const t = new ColumnarTable(defs, Math.max(1, rows.length));
+    if (rows.length > 0) {
+      t.appendBatch(rows as any);
+    }
+    return t;
+  }
+
+  private inferColumnType(rows: Array<Record<string, any>>, col: string): import('../columnar.js').ColumnarType {
+    // 推断列类型（CTE/materialize 小结果集用；足够用即可）
+    // 优先级：string > bigint(int64) > float64 > int32
+
+    let sawFloat = false;
+    for (let i = 0; i < rows.length && i < 200; i++) {
+      const v = rows[i][col];
+      if (typeof v === 'string') return 'string';
+      if (typeof v === 'bigint') return 'int64';
+      if (typeof v === 'number') {
+        if (!Number.isInteger(v)) sawFloat = true;
+      }
+    }
+
+    if (sawFloat) return 'float64';
+    return 'int32';
+  }
+
   // 执行 SQL
   execute(statement: SQLStatement): SQLQueryResult | number {
     switch (statement.type) {
@@ -67,14 +125,17 @@ export class SQLExecutor {
 
   // 执行 SELECT
   private executeSelect(select: SQLSelect): SQLQueryResult {
-    const table = this.getTable(select.from);
-    if (!table) throw new Error(`Table not found: ${select.from}`);
+    const restore = select.with && select.with.length > 0 ? this.installCTEs(select.with) : null;
 
-    // Fast path: tail window query (典型用于波动率脚本：ORDER BY ts DESC LIMIT 1 + 多个 STDDEV(...) OVER (...))
-    const tail = this.tryExecuteTailWindow(select, table);
-    if (tail) return tail;
+    try {
+      const table = this.getTable(select.from);
+      if (!table) throw new Error(`Table not found: ${select.from}`);
 
-    const allColumns = table.getColumnNames ? table.getColumnNames() : this.inferColumnNames(table);
+      // Fast path: tail window query (典型用于波动率脚本：ORDER BY ts DESC LIMIT 1 + 多个 STDDEV(...) OVER (...))
+      const tail = this.tryExecuteTailWindow(select, table);
+      if (tail) return tail;
+
+      const allColumns = table.getColumnNames ? table.getColumnNames() : this.inferColumnNames(table);
 
     // WHERE 过滤
     let rowIndices: number[] | undefined;
@@ -130,6 +191,9 @@ export class SQLExecutor {
       rows,
       rowCount: rows.length,
     };
+    } finally {
+      if (restore) restore();
+    }
   }
 
   private projectRow(row: Record<string, any>, selections: SelectItem[]): Record<string, any> {
@@ -168,7 +232,7 @@ export class SQLExecutor {
 
       for (let j = 0; j < conditions.length; j++) {
         const cond = conditions[j];
-        const value = this.getColumnValue(table, cond.column, i);
+        const value = this.getConditionValue(table, cond.column, i);
         const condMatch = this.evaluateCondition(value, cond.operator, cond.value);
 
         if (j === 0) {
@@ -187,6 +251,12 @@ export class SQLExecutor {
 
   private sqlEquals(a: any, b: any): boolean {
     if (a === b) return true;
+
+    // string
+    if (typeof a === 'string' && typeof b === 'string') return a === b;
+
+    // null
+    if (a == null || b == null) return false;
 
     // bigint ↔ number (only safe for finite integers)
     if (typeof a === 'bigint' && typeof b === 'number' && Number.isFinite(b) && Number.isInteger(b)) {
@@ -208,6 +278,14 @@ export class SQLExecutor {
       } catch {}
     }
 
+    // number ↔ numeric string
+    if (typeof a === 'number' && typeof b === 'string' && b.trim() !== '' && Number.isFinite(Number(b))) {
+      return a === Number(b);
+    }
+    if (typeof a === 'string' && typeof b === 'number' && a.trim() !== '' && Number.isFinite(Number(a))) {
+      return Number(a) === b;
+    }
+
     return false;
   }
 
@@ -226,8 +304,24 @@ export class SQLExecutor {
         return value <= compareValue;
       case '>=':
         return value >= compareValue;
-      case 'IN':
-        return Array.isArray(compareValue) && compareValue.some((v) => this.sqlEquals(value, v));
+      case 'IN': {
+        if (!Array.isArray(compareValue)) return false;
+
+        // 多列 IN: value=[a,b], compareValue=[[a1,b1],[a2,b2]]
+        if (Array.isArray(value)) {
+          return (compareValue as any[]).some((tuple) => {
+            if (!Array.isArray(tuple)) return false;
+            if (tuple.length !== value.length) return false;
+            for (let i = 0; i < value.length; i++) {
+              if (!this.sqlEquals(value[i], tuple[i])) return false;
+            }
+            return true;
+          });
+        }
+
+        // 单列 IN
+        return (compareValue as any[]).some((v) => this.sqlEquals(value, v));
+      }
       case 'LIKE':
         return this.likeMatch(String(value), String(compareValue));
       default:
@@ -270,17 +364,23 @@ export class SQLExecutor {
       return { expr: c.expr, name: c.alias || c.expr };
     });
 
-    // 只允许：纯列名（可 alias） + window expr
+    // 允许：纯列名（可 alias） + window expr + 标量表达式（会在单行上求值）
     const windowItems: Array<{ spec: WindowSpec; name: string; rawExpr: string }> = [];
+    const scalarExprItems: Array<{ expr: string; name: string }> = [];
+
     for (const s of selections) {
       const expr = this.normalizeExpr(s.expr);
 
-      // 纯列名 or *
+      // 纯列名
       const isIdent = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr);
-      if (expr === '*' || isIdent) continue;
+      if (expr === '*' ) return null; // fast-path 不处理 *
+      if (isIdent) continue;
 
       const spec = this.parseWindowExpr(expr);
-      if (!spec) return null;
+      if (!spec) {
+        scalarExprItems.push({ expr, name: s.name });
+        continue;
+      }
 
       // 仅支持无 partition 的 tail 计算（每个 symbol 文件本身就是单分区）
       if (spec.partitionBy && spec.partitionBy.length > 0) return null;
@@ -296,7 +396,7 @@ export class SQLExecutor {
       windowItems.push({ spec, name: s.name, rawExpr: expr });
     }
 
-    // 至少要有一个 window expr，否则没必要
+    // 至少要有一个 window expr（否则这个 fast-path 价值不大）
     if (windowItems.length === 0) return null;
 
     const outRow: Record<string, any> = {};
@@ -314,6 +414,11 @@ export class SQLExecutor {
     for (const item of windowItems) {
       const val = this.computeWindowTail(table, lastIdx, item.spec);
       outRow[item.name] = val;
+    }
+
+    // 标量表达式（可引用上面的 alias/window 结果）
+    for (const it of scalarExprItems) {
+      outRow[it.name] = this.evalScalarExpr(it.expr, outRow);
     }
 
     return {
@@ -388,8 +493,15 @@ export class SQLExecutor {
     }
   }
 
+  private getConditionValue(table: ColumnarTable, column: string | string[], rowIndex: number): any {
+    if (Array.isArray(column)) {
+      return column.map((c) => this.getColumnValue(table, c, rowIndex));
+    }
+    return this.getColumnValue(table, column, rowIndex);
+  }
+
   private getColumnValue(table: ColumnarTable, column: string, rowIndex: number): any {
-    const col = table.getColumn(column);
+    const col: any = table.getColumn(column);
     if (!col) return undefined;
     return col[rowIndex];
   }
@@ -782,6 +894,291 @@ export class SQLExecutor {
 
   private normalizeExpr(expr: string): string {
     return String(expr).replace(/\s+/g, ' ').trim();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Scalar expressions (DuckDB/SQLite style subset)
+  // ---------------------------------------------------------------------------
+
+  private evalScalarExpr(expr: string, row: Record<string, any>): any {
+    const tokens = this.tokenizeExpr(expr);
+    let pos = 0;
+
+    const peek = () => tokens[pos];
+    const consume = (expected?: string) => {
+      const t = tokens[pos];
+      if (!t) throw new Error(`Unexpected end of expression: ${expr}`);
+      if (expected && t.value.toUpperCase() !== expected.toUpperCase()) {
+        throw new Error(`Expected ${expected}, got ${t.value} in expr: ${expr}`);
+      }
+      pos++;
+      return t;
+    };
+
+    const parseExpression = (): any => parseConcat();
+
+    // string concat operator (SQLite): a || b
+    const parseConcat = (): any => {
+      let node = parseAddSub();
+      while (true) {
+        const t = peek();
+        if (!t) break;
+        if (t.value === '||') {
+          consume();
+          const right = parseAddSub();
+          node = { type: 'bin', op: '||', left: node, right };
+          continue;
+        }
+        break;
+      }
+      return node;
+    };
+
+    const parseAddSub = (): any => {
+      let node = parseMulDiv();
+      while (true) {
+        const t = peek();
+        if (!t) break;
+        if (t.value === '+' || t.value === '-') {
+          consume();
+          const right = parseMulDiv();
+          node = { type: 'bin', op: t.value, left: node, right };
+          continue;
+        }
+        break;
+      }
+      return node;
+    };
+
+    const parseMulDiv = (): any => {
+      let node = parseUnary();
+      while (true) {
+        const t = peek();
+        if (!t) break;
+        if (t.value === '*' || t.value === '/' || t.value === '%') {
+          consume();
+          const right = parseUnary();
+          node = { type: 'bin', op: t.value, left: node, right };
+          continue;
+        }
+        break;
+      }
+      return node;
+    };
+
+    const parseUnary = (): any => {
+      const t = peek();
+      if (t && (t.value === '+' || t.value === '-')) {
+        consume();
+        const inner = parseUnary();
+        return { type: 'unary', op: t.value, inner };
+      }
+      return parsePrimary();
+    };
+
+    const parsePrimary = (): any => {
+      const t = peek();
+      if (!t) throw new Error(`Unexpected end of expression: ${expr}`);
+
+      if (t.kind === 'number') {
+        consume();
+        return { type: 'number', value: Number(t.value) };
+      }
+
+      if (t.kind === 'string') {
+        consume();
+        return { type: 'string', value: t.value };
+      }
+
+      if (t.value === '(') {
+        consume('(');
+        const inner = parseExpression();
+        consume(')');
+        return inner;
+      }
+
+      if (t.kind === 'ident') {
+        const name = consume().value;
+
+        // function call
+        if (peek()?.value === '(') {
+          consume('(');
+          const args: any[] = [];
+          if (peek()?.value !== ')') {
+            while (true) {
+              args.push(parseExpression());
+              if (peek()?.value === ',') {
+                consume(',');
+                continue;
+              }
+              break;
+            }
+          }
+          consume(')');
+          return { type: 'call', name, args };
+        }
+
+        return { type: 'ident', name };
+      }
+
+      throw new Error(`Unexpected token ${t.value} in expr: ${expr}`);
+    };
+
+    const ast = parseExpression();
+    if (pos < tokens.length) {
+      // allow trailing whitespace already removed; any leftover token is an error
+      throw new Error(`Unexpected token ${tokens[pos].value} in expr: ${expr}`);
+    }
+
+    const evalNode = (n: any): any => {
+      switch (n.type) {
+        case 'number':
+          return n.value;
+        case 'string':
+          return n.value;
+        case 'ident': {
+          const v = row[n.name];
+          return typeof v === 'bigint' ? Number(v) : v;
+        }
+        case 'unary': {
+          const v = Number(evalNode(n.inner));
+          return n.op === '-' ? -v : +v;
+        }
+        case 'bin': {
+          if (n.op === '||') {
+            const a = evalNode(n.left);
+            const b = evalNode(n.right);
+            return String(a ?? '') + String(b ?? '');
+          }
+
+          const a = Number(evalNode(n.left));
+          const b = Number(evalNode(n.right));
+          switch (n.op) {
+            case '+':
+              return a + b;
+            case '-':
+              return a - b;
+            case '*':
+              return a * b;
+            case '/':
+              return a / b;
+            case '%':
+              return a % b;
+            default:
+              return NaN;
+          }
+        }
+        case 'call': {
+          const fname = String(n.name).toUpperCase();
+          const args = (n.args || []).map((x: any) => evalNode(x));
+
+          // 常用数学函数（足够覆盖波动率/指标场景）
+          switch (fname) {
+            case 'SQRT':
+              return Math.sqrt(Number(args[0]));
+            case 'ABS':
+              return Math.abs(Number(args[0]));
+            case 'LN':
+              return Math.log(Number(args[0]));
+            case 'LOG':
+              return Math.log(Number(args[0]));
+            case 'EXP':
+              return Math.exp(Number(args[0]));
+            case 'POW':
+            case 'POWER':
+              return Math.pow(Number(args[0]), Number(args[1]));
+            case 'ROUND': {
+              const x = Number(args[0]);
+              const nDigits = args.length >= 2 ? Number(args[1]) : 0;
+              const f = Math.pow(10, nDigits);
+              return Math.round(x * f) / f;
+            }
+            case 'MIN':
+              return Math.min(...args.map((x: any) => Number(x)));
+            case 'MAX':
+              return Math.max(...args.map((x: any) => Number(x)));
+            default:
+              throw new Error(`Unsupported function: ${n.name}`);
+          }
+        }
+        default:
+          return NaN;
+      }
+    };
+
+    return evalNode(ast);
+  }
+
+  private tokenizeExpr(expr: string): Array<{ kind: 'number' | 'ident' | 'string' | 'op'; value: string }> {
+    const s = String(expr);
+    const out: Array<{ kind: any; value: string }> = [];
+    let i = 0;
+
+    while (i < s.length) {
+      const ch = s[i];
+      if (/\s/.test(ch)) {
+        i++;
+        continue;
+      }
+
+      // string literal
+      if (ch === '\'' || ch === '"') {
+        const quote = ch;
+        i++;
+        let buf = '';
+        while (i < s.length && s[i] !== quote) {
+          if (s[i] === '\\' && i + 1 < s.length) {
+            buf += s[i + 1];
+            i += 2;
+          } else {
+            buf += s[i];
+            i++;
+          }
+        }
+        i++; // closing quote
+        out.push({ kind: 'string', value: buf });
+        continue;
+      }
+
+      // number
+      if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(s[i + 1]))) {
+        let num = '';
+        while (i < s.length && /[0-9eE+\-\.]/.test(s[i])) {
+          num += s[i];
+          i++;
+        }
+        out.push({ kind: 'number', value: num });
+        continue;
+      }
+
+      // identifier
+      if (/[a-zA-Z_]/.test(ch)) {
+        let id = '';
+        while (i < s.length && /[a-zA-Z0-9_]/.test(s[i])) {
+          id += s[i];
+          i++;
+        }
+        out.push({ kind: 'ident', value: id });
+        continue;
+      }
+
+      // operators / punctuation
+      if (ch === '|' && s[i + 1] === '|') {
+        out.push({ kind: 'op', value: '||' });
+        i += 2;
+        continue;
+      }
+
+      if ('()+-*/%,'.includes(ch)) {
+        out.push({ kind: 'op', value: ch });
+        i++;
+        continue;
+      }
+
+      throw new Error(`Unexpected char '${ch}' in expr: ${expr}`);
+    }
+
+    return out;
   }
 
   // ---------------------------------------------------------------------------

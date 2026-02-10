@@ -19,6 +19,11 @@ const testQueries = [
   'SELECT * FROM trades ORDER BY price DESC LIMIT 10',
   'SELECT * FROM trades WHERE symbol = \'AAPL\' AND price > 100',
   'INSERT INTO trades (symbol, price) VALUES (\'AAPL\', 150.5)',
+  // advanced
+  "WITH t AS (SELECT price AS a FROM trades) SELECT a FROM t ORDER BY a DESC LIMIT 1",
+  "SELECT 'A' || 'B' as s FROM trades LIMIT 1",
+  "SELECT ROUND(price, 2) as r, SQRT(4) as s FROM trades LIMIT 1",
+  "SELECT * FROM trades WHERE (symbol, volume) IN ((0,1000),(1,2000))",
 ];
 
 for (const sql of testQueries) {
@@ -93,6 +98,45 @@ const executeQuery = (sql: string) => {
 executeQuery('SELECT * FROM trades');
 executeQuery('SELECT symbol, price FROM trades WHERE price > 100');
 executeQuery('SELECT * FROM trades ORDER BY price DESC LIMIT 3');
+
+// 测试 2.1: CTE + 多列 IN + 字符串拼接
+console.log('\n🧩 测试 2.1: CTE + 多列 IN + 字符串拼接\n');
+
+const klines = new ColumnarTable([
+  { name: 'base_currency', type: 'string' },
+  { name: 'quote_currency', type: 'string' },
+  { name: 'timestamp', type: 'int64' },
+  { name: 'close', type: 'float64' },
+]);
+
+klines.appendBatch([
+  { base_currency: 'AAPL', quote_currency: 'USD', timestamp: now + 0n, close: 100 },
+  { base_currency: 'AAPL', quote_currency: 'USD', timestamp: now + 1n, close: 101 },
+  { base_currency: 'TSLA', quote_currency: 'USD', timestamp: now + 0n, close: 200 },
+  { base_currency: 'TSLA', quote_currency: 'USD', timestamp: now + 1n, close: 220 },
+  { base_currency: 'MSFT', quote_currency: 'USD', timestamp: now + 1n, close: 300 },
+]);
+
+executor.registerTable('klines', klines);
+
+executeQuery(`
+WITH periods AS (
+  SELECT
+    base_currency,
+    quote_currency,
+    close AS price,
+    timestamp,
+    ROW_NUMBER() OVER (PARTITION BY base_currency, quote_currency ORDER BY timestamp DESC) AS rn
+  FROM klines
+  WHERE (base_currency, quote_currency) IN (('AAPL','USD'),('TSLA','USD'))
+)
+SELECT
+  base_currency || '/' || quote_currency AS symbol,
+  ROUND(price, 2) AS price2
+FROM periods
+WHERE rn = 1
+ORDER BY symbol ASC
+`);
 
 // 测试 3: 性能测试
 console.log('\n⚡ 测试 3: 性能测试 (10万行)\n');

@@ -48,7 +48,7 @@ export type { ReplayTick, ReplaySnapshot, ReplayConfig, ReplayStats } from './mm
 
 export { SQLParser, parseSQL } from './sql/parser.js';
 export { SQLExecutor } from './sql/executor.js';
-export type { SQLStatement, SQLSelect, SQLCondition, SQLUpsert } from './sql/parser.js';
+export type { SQLStatement, SQLSelect, SQLCTE, SQLCondition, SQLUpsert } from './sql/parser.js';
 export type { SQLQueryResult } from './sql/executor.js';
 
 // ─── 索引 ────────────────────────────────────────────

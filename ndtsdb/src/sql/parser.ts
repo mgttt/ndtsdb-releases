@@ -7,13 +7,19 @@ export type SQLValue = string | number | boolean | null;
 export type SQLOperator = '=' | '!=' | '<>' | '<' | '>' | '<=' | '>=' | 'LIKE' | 'IN';
 
 export interface SQLCondition {
-  column: string;
+  column: string | string[]; // 支持多列 IN: (a,b) IN ((1,2),(3,4))
   operator: SQLOperator;
-  value: SQLValue | SQLValue[];
+  value: SQLValue | SQLValue[] | SQLValue[][];
   logic?: 'AND' | 'OR';  // 与下一个条件的逻辑关系
 }
 
+export interface SQLCTE {
+  name: string;
+  select: SQLSelect;
+}
+
 export interface SQLSelect {
+  with?: SQLCTE[];
   columns: Array<string | { expr: string; alias?: string }>;
   from: string;
   where?: SQLCondition[];
@@ -67,6 +73,8 @@ export class SQLParser {
     const firstToken = this.peek()?.toUpperCase();
     
     switch (firstToken) {
+      case 'WITH':
+        return { type: 'SELECT', data: this.parseWithSelect() };
       case 'SELECT':
         return { type: 'SELECT', data: this.parseSelect() };
       case 'INSERT':
@@ -156,6 +164,13 @@ export class SQLParser {
         i += 2;
         continue;
       }
+
+      // 字符串拼接操作符 ||
+      if (char === '|' && sql[i + 1] === '|') {
+        tokens.push('||');
+        i += 2;
+        continue;
+      }
       
       // 单字符 token
       tokens.push(char);
@@ -163,6 +178,41 @@ export class SQLParser {
     }
     
     return tokens;
+  }
+
+  // 解析 WITH ... SELECT
+  private parseWithSelect(): SQLSelect {
+    this.consume('WITH');
+
+    const withCTEs: SQLCTE[] = [];
+
+    while (true) {
+      const name = this.consumeIdentifier();
+
+      // 可选：WITH t(col1,col2) AS (...) —— 先忽略列名声明
+      if (this.peek() === '(') {
+        this.consume('(');
+        this.parseIdentifierList();
+        this.consume(')');
+      }
+
+      this.consume('AS');
+      this.consume('(');
+      const select = this.parseSelect();
+      this.consume(')');
+
+      withCTEs.push({ name, select });
+
+      if (this.peek() === ',') {
+        this.consume(',');
+        continue;
+      }
+      break;
+    }
+
+    const main = this.parseSelect();
+    main.with = withCTEs;
+    return main;
   }
 
   // 解析 SELECT
@@ -276,9 +326,19 @@ export class SQLParser {
     const conditions: SQLCondition[] = [];
     
     while (true) {
-      const column = this.consumeIdentifier();
+      // 支持多列条件：(a,b) IN ((1,2),(3,4))
+      let column: string | string[];
+      if (this.peek() === '(') {
+        this.consume('(');
+        column = this.parseIdentifierList();
+        this.consume(')');
+      } else {
+        column = this.consumeIdentifier();
+      }
+
       const operator = this.parseOperator();
-      const value = this.parseValue();
+
+      const value = operator === 'IN' ? this.parseInValue() : this.parseValue();
       
       conditions.push({ column, operator, value });
       
@@ -317,7 +377,7 @@ export class SQLParser {
     }
     
     if (token === '(') {
-      // IN (list)
+      // (list)
       this.consume('(');
       const values: SQLValue[] = [];
       while (this.peek() !== ')') {
@@ -329,6 +389,51 @@ export class SQLParser {
     }
     
     return this.parseSingleValue();
+  }
+
+  // 解析 IN (...) 右侧，支持：
+  // - 单列 IN: (1,2,3)
+  // - 多列 IN: ((1,2),(3,4))
+  private parseInValue(): SQLValue[] | SQLValue[][] {
+    if (this.peek() !== '(') {
+      // 允许语法扩展：IN <ident>（未实现）
+      return [this.parseSingleValue()];
+    }
+
+    this.consume('(');
+
+    // 多列：IN ( (..), (..) )
+    if (this.peek() === '(') {
+      const tuples: SQLValue[][] = [];
+      while (true) {
+        this.consume('(');
+        const row: SQLValue[] = [];
+        while (this.peek() !== ')') {
+          row.push(this.parseSingleValue());
+          if (this.peek() === ',') this.consume(',');
+        }
+        this.consume(')');
+        tuples.push(row);
+
+        if (this.peek() === ',') {
+          this.consume(',');
+          continue;
+        }
+        break;
+      }
+
+      this.consume(')');
+      return tuples;
+    }
+
+    // 单列：IN (1,2,3)
+    const values: SQLValue[] = [];
+    while (this.peek() !== ')') {
+      values.push(this.parseSingleValue());
+      if (this.peek() === ',') this.consume(',');
+    }
+    this.consume(')');
+    return values;
   }
 
   private parseSingleValue(): SQLValue {

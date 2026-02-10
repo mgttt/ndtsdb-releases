@@ -6,15 +6,19 @@
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 
-export type ColumnarType = 'int64' | 'float64' | 'int32' | 'int16';
+export type ColumnarType = 'int64' | 'float64' | 'int32' | 'int16' | 'string';
 
 interface ColumnDef {
   name: string;
   type: ColumnarType;
 }
 
+type ColumnArray = BigInt64Array | Float64Array | Int32Array | Int16Array | string[];
+
+type TypedNumericArray = BigInt64Array | Float64Array | Int32Array | Int16Array;
+
 export class ColumnarTable {
-  private columns: Map<string, TypedArray> = new Map();
+  private columns: Map<string, ColumnArray> = new Map();
   private columnDefs: ColumnDef[];
   private rowCount = 0;
   private capacity: number;
@@ -26,7 +30,7 @@ export class ColumnarTable {
    */
   static fromColumns(
     columnDefs: ColumnDef[],
-    columns: Map<string, TypedArray>,
+    columns: Map<string, ColumnArray>,
     rowCount?: number,
   ): ColumnarTable {
     const first = columnDefs[0];
@@ -56,7 +60,7 @@ export class ColumnarTable {
    * 批量追加行（最高性能路径）
    * 直接写入 TypedArray，零对象创建
    */
-  appendBatch(data: Record<string, number | bigint>[]): void {
+  appendBatch(data: Record<string, number | bigint | string | null>[]): void {
     const requiredCapacity = this.rowCount + data.length;
     if (requiredCapacity > this.capacity) {
       this.growTo(requiredCapacity);
@@ -64,21 +68,59 @@ export class ColumnarTable {
 
     for (const def of this.columnDefs) {
       const col = this.columns.get(def.name)!;
-      const values = data.map(row => row[def.name] ?? 0);
-      
+
       switch (def.type) {
-        case 'int64':
-          (col as BigInt64Array).set(values as bigint[], this.rowCount);
+        case 'string': {
+          const out = col as string[];
+          for (let i = 0; i < data.length; i++) {
+            const v = data[i][def.name];
+            out[this.rowCount + i] = v == null ? '' : String(v);
+          }
           break;
-        case 'float64':
-          (col as Float64Array).set(values as number[], this.rowCount);
+        }
+        case 'int64': {
+          const out = col as BigInt64Array;
+          const vals = new BigInt64Array(data.length);
+          for (let i = 0; i < data.length; i++) {
+            const v = data[i][def.name];
+            if (typeof v === 'bigint') vals[i] = v;
+            else if (typeof v === 'number') vals[i] = BigInt(Math.trunc(v));
+            else if (typeof v === 'string' && v.length > 0 && /^-?\d+$/.test(v)) vals[i] = BigInt(v);
+            else vals[i] = 0n;
+          }
+          out.set(vals, this.rowCount);
           break;
-        case 'int32':
-          (col as Int32Array).set(values as number[], this.rowCount);
+        }
+        case 'float64': {
+          const out = col as Float64Array;
+          const vals = new Float64Array(data.length);
+          for (let i = 0; i < data.length; i++) {
+            const v = data[i][def.name];
+            vals[i] = v == null ? 0 : Number(v);
+          }
+          out.set(vals, this.rowCount);
           break;
-        case 'int16':
-          (col as Int16Array).set(values as number[], this.rowCount);
+        }
+        case 'int32': {
+          const out = col as Int32Array;
+          const vals = new Int32Array(data.length);
+          for (let i = 0; i < data.length; i++) {
+            const v = data[i][def.name];
+            vals[i] = v == null ? 0 : (Number(v) | 0);
+          }
+          out.set(vals, this.rowCount);
           break;
+        }
+        case 'int16': {
+          const out = col as Int16Array;
+          const vals = new Int16Array(data.length);
+          for (let i = 0; i < data.length; i++) {
+            const v = data[i][def.name];
+            vals[i] = v == null ? 0 : (Number(v) | 0);
+          }
+          out.set(vals, this.rowCount);
+          break;
+        }
       }
     }
 
@@ -88,7 +130,7 @@ export class ColumnarTable {
   /**
    * 追加单行
    */
-  append(row: Record<string, number | bigint>): void {
+  append(row: Record<string, number | bigint | string | null>): void {
     if (this.rowCount >= this.capacity) {
       this.grow();
     }
@@ -98,18 +140,21 @@ export class ColumnarTable {
       const value = row[def.name] ?? 0;
       
       switch (def.type) {
+        case 'string':
+          (col as string[])[this.rowCount] = value == null ? '' : String(value);
+          break;
         case 'int64':
           // 自动转换 number → bigint
-          (col as BigInt64Array)[this.rowCount] = typeof value === 'bigint' ? value : BigInt(value as number);
+          (col as BigInt64Array)[this.rowCount] = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value)));
           break;
         case 'float64':
           (col as Float64Array)[this.rowCount] = Number(value);
           break;
         case 'int32':
-          (col as Int32Array)[this.rowCount] = Number(value);
+          (col as Int32Array)[this.rowCount] = Number(value) | 0;
           break;
         case 'int16':
-          (col as Int16Array)[this.rowCount] = Number(value);
+          (col as Int16Array)[this.rowCount] = Number(value) | 0;
           break;
       }
     }
@@ -120,7 +165,7 @@ export class ColumnarTable {
   /**
    * 更新指定行
    */
-  updateRow(index: number, row: Record<string, number | bigint>): void {
+  updateRow(index: number, row: Record<string, number | bigint | string | null>): void {
     if (index < 0 || index >= this.rowCount) {
       throw new Error(`Row index out of bounds: ${index}`);
     }
@@ -133,18 +178,21 @@ export class ColumnarTable {
       if (!def) continue;
       
       switch (def.type) {
+        case 'string':
+          (col as string[])[index] = value == null ? '' : String(value);
+          break;
         case 'int64':
           // 自动转换 number → bigint
-          (col as BigInt64Array)[index] = typeof value === 'bigint' ? value : BigInt(value as number);
+          (col as BigInt64Array)[index] = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value)));
           break;
         case 'float64':
           (col as Float64Array)[index] = Number(value);
           break;
         case 'int32':
-          (col as Int32Array)[index] = Number(value);
+          (col as Int32Array)[index] = Number(value) | 0;
           break;
         case 'int16':
-          (col as Int16Array)[index] = Number(value);
+          (col as Int16Array)[index] = Number(value) | 0;
           break;
       }
     }
@@ -153,8 +201,8 @@ export class ColumnarTable {
   /**
    * 过滤查询（使用 TypedArray 直接访问）
    */
-  filter(predicate: (row: Record<string, number | bigint>, index: number) => boolean): Record<string, number | bigint>[] {
-    const results: Record<string, number | bigint>[] = [];
+  filter(predicate: (row: Record<string, any>, index: number) => boolean): Record<string, any>[] {
+    const results: Record<string, any>[] = [];
     
     for (let i = 0; i < this.rowCount; i++) {
       const row = this.getRow(i);
@@ -169,8 +217,8 @@ export class ColumnarTable {
   /**
    * 范围查询（利用连续内存优势）
    */
-  slice(start: number, end: number): Record<string, number | bigint>[] {
-    const results: Record<string, number | bigint>[] = [];
+  slice(start: number, end: number): Record<string, any>[] {
+    const results: Record<string, any>[] = [];
     const actualEnd = Math.min(end, this.rowCount);
     
     for (let i = start; i < actualEnd; i++) {
@@ -287,7 +335,10 @@ export class ColumnarTable {
     let totalSize = 0;
 
     for (const def of this.columnDefs) {
-      const col = this.columns.get(def.name)!;
+      if (def.type === 'string') {
+        throw new Error('ColumnarTable.saveToFile: string columns are not supported');
+      }
+      const col = this.columns.get(def.name)! as TypedNumericArray;
       const byteLength = this.getByteLength(def.type) * this.rowCount;
       const buf = Buffer.from(col.buffer, col.byteOffset, byteLength);
       columnBuffers.push(buf);
@@ -334,11 +385,15 @@ export class ColumnarTable {
     offset = Math.ceil(offset / 8) * 8; // 对齐到 8 字节边界
     
     for (const def of header.columns) {
+      if (def.type === 'string') {
+        throw new Error('ColumnarTable.loadFromFile: string columns are not supported');
+      }
+
       const byteLength = table.getByteLength(def.type) * header.rowCount;
       const colData = buffer.subarray(offset, offset + byteLength);
       
       // 复制到 TypedArray
-      const col = table.columns.get(def.name)!;
+      const col = table.columns.get(def.name)! as TypedNumericArray;
       const targetArray = new Uint8Array(col.buffer, col.byteOffset, byteLength);
       targetArray.set(colData);
       
@@ -352,7 +407,7 @@ export class ColumnarTable {
     return this.rowCount;
   }
 
-  getColumn(name: string): TypedArray | undefined {
+  getColumn(name: string): ColumnArray | undefined {
     return this.columns.get(name);
   }
 
@@ -360,8 +415,8 @@ export class ColumnarTable {
     return this.columnDefs.map(def => def.name);
   }
 
-  private getRow(index: number): Record<string, number | bigint> {
-    const row: Record<string, number | bigint> = {};
+  private getRow(index: number): Record<string, any> {
+    const row: Record<string, any> = {};
     
     for (const def of this.columnDefs) {
       const col = this.columns.get(def.name)!;
@@ -371,16 +426,18 @@ export class ColumnarTable {
     return row;
   }
 
-  private getTypedArrayValue(arr: TypedArray, index: number): number | bigint {
+  private getTypedArrayValue(arr: ColumnArray, index: number): number | bigint | string {
+    if (Array.isArray(arr)) return arr[index] ?? '';
     if (arr instanceof BigInt64Array) return arr[index];
     if (arr instanceof Float64Array) return arr[index];
     if (arr instanceof Int32Array) return arr[index];
     if (arr instanceof Int16Array) return arr[index];
-    return arr[index];
+    return (arr as any)[index];
   }
 
-  private createTypedArray(type: ColumnarType, size: number): TypedArray {
+  private createTypedArray(type: ColumnarType, size: number): ColumnArray {
     switch (type) {
+      case 'string': return new Array(size).fill('');
       case 'int64': return new BigInt64Array(size);
       case 'float64': return new Float64Array(size);
       case 'int32': return new Int32Array(size);
@@ -390,10 +447,16 @@ export class ColumnarTable {
 
   private getByteLength(type: ColumnarType): number {
     switch (type) {
-      case 'int64': return 8;
-      case 'float64': return 8;
-      case 'int32': return 4;
-      case 'int16': return 2;
+      case 'string':
+        throw new Error('ColumnarTable.saveToFile: string columns are not supported for binary persistence');
+      case 'int64':
+        return 8;
+      case 'float64':
+        return 8;
+      case 'int32':
+        return 4;
+      case 'int16':
+        return 2;
     }
   }
 
@@ -407,12 +470,20 @@ export class ColumnarTable {
     for (const def of this.columnDefs) {
       const oldCol = this.columns.get(def.name)!;
       const newCol = this.createTypedArray(def.type, this.capacity);
-      newCol.set(oldCol.subarray(0, this.rowCount));
+
+      if (def.type === 'string') {
+        const oldArr = oldCol as string[];
+        const newArr = newCol as string[];
+        for (let i = 0; i < this.rowCount; i++) newArr[i] = oldArr[i] ?? '';
+      } else {
+        (newCol as TypedNumericArray).set((oldCol as TypedNumericArray).subarray(0, this.rowCount));
+      }
+
       this.columns.set(def.name, newCol);
     }
   }
 
-  private sumTypedArray(arr: TypedArray): number {
+  private sumTypedArray(arr: TypedNumericArray): number {
     let sum = 0;
     for (let i = 0; i < arr.length; i++) {
       sum += Number(arr[i]);
@@ -420,7 +491,7 @@ export class ColumnarTable {
     return sum;
   }
 
-  private minTypedArray(arr: TypedArray): number {
+  private minTypedArray(arr: TypedNumericArray): number {
     let min = Infinity;
     for (let i = 0; i < arr.length; i++) {
       const val = Number(arr[i]);
@@ -429,7 +500,7 @@ export class ColumnarTable {
     return min;
   }
 
-  private maxTypedArray(arr: TypedArray): number {
+  private maxTypedArray(arr: TypedNumericArray): number {
     let max = -Infinity;
     for (let i = 0; i < arr.length; i++) {
       const val = Number(arr[i]);
@@ -439,4 +510,4 @@ export class ColumnarTable {
   }
 }
 
-type TypedArray = BigInt64Array | Float64Array | Int32Array | Int16Array;
+// (TypedArray alias removed; use ColumnArray / TypedNumericArray)

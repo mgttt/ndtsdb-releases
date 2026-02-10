@@ -381,6 +381,27 @@ await runTest('UPSERT', async () => {
   if (values[0] !== 999.0) throw new Error('Update failed');
 });
 
+await runTest('SELECT 表达式 + 函数 (SQRT/ROUND)', async () => {
+  const { SQLParser } = await import('../src/sql/parser.js');
+  const { SQLExecutor } = await import('../src/sql/executor.js');
+  const { ColumnarTable } = await import('../src/columnar.js');
+
+  const table = new ColumnarTable([
+    { name: 'x', type: 'float64' },
+  ]);
+  table.appendBatch([{ x: 9 }, { x: 16 }]);
+
+  const executor = new SQLExecutor();
+  executor.registerTable('t', table);
+  const parser = new SQLParser();
+
+  const r = executor.execute(parser.parse('SELECT ROUND(SQRT(x) * 10, 0) AS y FROM t ORDER BY x ASC'));
+  const rows = (r as any).rows;
+  if (rows.length !== 2) throw new Error('Expected 2 rows');
+  if (Number(rows[0].y) !== 30) throw new Error(`Expected 30, got ${rows[0].y}`);
+  if (Number(rows[1].y) !== 40) throw new Error(`Expected 40, got ${rows[1].y}`);
+});
+
 await runTest('CREATE TABLE + INSERT', async () => {
   const { SQLParser } = await import('../src/sql/parser.js');
   const { SQLExecutor } = await import('../src/sql/executor.js');

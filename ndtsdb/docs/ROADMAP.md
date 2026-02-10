@@ -1,6 +1,6 @@
 # ndtsdb Roadmap
 
-## 现状总结 (2026-02-09)
+## 现状总结 (2026-02-10)
 
 **核心已完成** — 从零到一个功能完整的嵌入式时序数据库。
 
@@ -85,63 +85,20 @@
 
 ---
 
-**P0: SQL 功能补全（quant-lib 迁移剩余需求）** ⭐⭐⭐⭐⭐
+**P0: SQL（迁移还剩的“真阻塞项”）** ⭐⭐⭐⭐⭐
 
-**状态**: 窗口函数 + GROUP BY ✅ **已实现**（executor.ts 已支持）
+> 已完成（已挪到文末“✅ 已完成（SQL 扩展）”）：窗口函数、GROUP BY、CTE (WITH)、多列 IN、字符串拼接 `||`、ROUND/SQRT。
 
-**仍需补充的 SQL 功能**:
+**仍需补齐 / 优化的 SQL 能力（按迁移阻塞程度排序）**：
 
-| 功能 | 状态 | 需求来源 | 优先级 |
-|------|------|----------|--------|
-| **窗口函数 OVER** | ✅ 已实现 | `calculate-volatility.ts` | ✅ 可用 |
-| **GROUP BY 聚合** | ✅ 已实现 | 通用分析 | ✅ 可用 |
-| **STDDEV/VARIANCE** | ✅ 已实现 | 波动率计算 | ✅ 可用 |
-| **PARTITION BY** | ⚠️ 部分可用 | 多币种并行 | 🟡 需验证 |
-| **CTE (WITH)** | ❌ 缺失 | `futu-positions-volatility.ts` | 🔴 高 |
-| **多列 IN** | ❌ 缺失 | 多条件匹配 | 🔴 高 |
-| **字符串拼接 `\|\|`** | ❌ 缺失 | 生成 symbol 标识 | 🟡 中 |
-| **ROUND/SQRT** | ❌ 缺失 | 数值格式化 | 🟡 中 |
-| **JOIN** | ❌ 缺失 | 多表关联 | 🟢 低 |
-| **子查询** | ❌ 缺失 | 复杂过滤 | 🟢 低 |
-
-**具体需求详情**:
-
-1. **CTE (WITH 子句)** 🔴 高
-   ```sql
-   -- 当前不支持
-   WITH periods AS (
-     SELECT ... FROM klines
-   )
-   SELECT * FROM periods WHERE rn = 1;
-   ```
-   **Workaround**: 应用层分步查询，或拆分为临时表
-
-2. **多列 IN 子句** 🔴 高
-   ```sql
-   -- 当前不支持
-   WHERE (base_currency, quote_currency) IN (('AAPL','USD'), ('TSLA','USD'))
-   ```
-   **Workaround**: 展开为 `WHERE (a='AAPL' AND b='USD') OR (a='TSLA' AND b='USD')`
-
-3. **PARTITION BY 修复** 🟡 中
-   - 代码已存在但快速路径 `tryExecuteTailWindow` 会拒绝带 PARTITION BY 的查询
-   - 需统一处理逻辑，确保 PARTITION BY 在所有场景可用
-
-4. **内置函数扩展** 🟡 中
-   ```sql
-   -- 字符串拼接
-   SELECT base_currency || '/' || quote_currency AS symbol
-   
-   -- 数学函数
-   SELECT ROUND(vol / price * 100, 2) AS vol_pct,
-          STDDEV(close) / SQRT(days) AS normalized_vol
-   ```
-
-**已实现验证**:
-- ✅ `calculate-volatility.ts` 已使用 ndtsdb SQL 成功运行
-- ✅ `STDDEV(close) OVER (ORDER BY timestamp ROWS BETWEEN N PRECEDING AND CURRENT ROW)` 可用
-- ✅ `ROW_NUMBER() OVER (...)` 可用
-- ✅ `GROUP BY symbol + AVG/MIN/MAX/COUNT/STDDEV` 可用
+| 功能 | 状态 | 说明 | 优先级 |
+|------|------|------|--------|
+| **PARTITION BY 性能/一致性** | ⚠️ 部分可用 | 通用路径可用；但 `tryExecuteTailWindow` 快速路径会拒绝带 PARTITION BY，导致“多标的取每分区最后一行”场景会退化成全量 row object 化 | 🔴 P0 |
+| **复杂 WHERE 表达式** | ❌ 缺失 | 括号优先级 + `AND/OR/NOT`（现在还是线性 conditions），为 HAVING/子查询/CASE 打基础 | 🟡 P1 |
+| **ORDER BY <expr>** | ❌ 缺失 | 目前仅支持列名（对齐 SQLite/DuckDB：支持表达式排序） | 🟡 P1 |
+| **HAVING** | ❌ 缺失 | GROUP BY 后过滤 | 🟢 P2 |
+| **JOIN** | ❌ 缺失 | INNER/LEFT JOIN | 🟢 P2 |
+| **子查询** | ❌ 缺失 | `FROM (SELECT ...)` / `IN (SELECT ...)` | 🟢 P2 |
 
 ---
 
@@ -166,7 +123,7 @@ await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
 - ~~基础聚合~~ ✅ 已实现 COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE
 - ~~窗口函数~~ ✅ 已实现 ROW_NUMBER/STDDEV/AVG/SUM... OVER (...)
 - ~~GROUP BY~~ ✅ 已实现
-- CTE (WITH 子句) - 用于复杂查询分层
+- ~~CTE (WITH 子句)~~ ✅ 已实现
 - JOIN 支持（至少 INNER JOIN）- 多表关联
 - 子查询（WHERE col IN (SELECT ...)）
 - 复杂 WHERE（嵌套括号优先级）
@@ -190,8 +147,14 @@ const table = new IndexedTable([
 
 **4. 字符串原生支持**
 
-当前需手动用 SymbolTable。目标：
-- ColumnarTable 直接支持 `string` 类型
+当前需手动用 SymbolTable。
+
+现状（2026-02-10）：
+- ColumnarTable 已支持 **内存 string 列**（用于 SQL/CTE/materialize）
+- 但二进制持久化 `saveToFile/loadFromFile` **暂不支持 string**（会直接 throw）
+
+目标：
+- ColumnarTable string 列可持久化
 - 内部自动字典编码（对用户透明）
 - 可变长字符串存储（当前固定字典）
 
@@ -270,6 +233,23 @@ Chunk 级原子写入：
 
 ---
 
+## ✅ 已完成（SQL 扩展，已移到后方）
+
+这些能力已经实现，保留在 roadmap 里但不再阻塞迁移：
+
+- ✅ 窗口函数：`STDDEV/VARIANCE/ROW_NUMBER/... OVER (ORDER BY ... ROWS BETWEEN ...)`
+- ✅ GROUP BY 聚合：`COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/FIRST/LAST`
+- ✅ CTE：`WITH t AS (SELECT ...) SELECT ... FROM t`
+- ✅ 多列 IN：`WHERE (a,b) IN ((1,2),(3,4))`（含 string）
+- ✅ 字符串拼接：`a || '/' || b`
+- ✅ 标量函数：`ROUND/SQRT/ABS/LN/LOG/EXP/POW/MIN/MAX`
+
+已验证脚本：
+- `quant-lib/scripts/calculate-volatility.ts`
+- `quant-lib/scripts/futu-positions-volatility.ts`（SQL 语法层已迁移；性能优化与依赖收尾见上方 P0/P1）
+
+---
+
 ## 里程碑
 
 ### 已完成
@@ -292,8 +272,8 @@ Chunk 级原子写入：
 
 | 版本 | 优先级 | 目标 |
 |------|--------|------|
-| ~~v0.11.0~~ | ✅ **已完成** | ~~窗口聚合函数（STDDEV OVER + GROUP BY）~~ |
-| **v0.11.0** | 🔴 **P0** | **SQL CTE (WITH 子句) + 多列 IN** ← 阻塞 `futu-positions-volatility.ts` |
+| **v0.11.0** | ✅ **已完成** | **SQL CTE (WITH) + 多列 IN + `||` + ROUND/SQRT**（已可支撑 `futu-positions-volatility.ts` 的 SQL 写法） |
+| **v0.11.1** | 🔴 **P0** | **PARTITION BY fast-path 统一 + 复杂 WHERE（括号优先级 / AND-OR-NOT）** |
 | **v0.12.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
 | **v0.13.0** | 🔴 高 | SQL JOIN + 子查询 + HAVING |
 | **v0.14.0** | 🟡 中 | 自动二级索引（BTree） |
