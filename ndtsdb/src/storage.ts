@@ -5,7 +5,7 @@
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { PartitionManager } from './partition.js';
+import { PartitionedTable } from './partition.js';
 import { SymbolTable } from './symbol.js';
 import { WAL } from './wal.js';
 import type { TSDBOptions, Row, QueryOptions, ColumnDef } from './types.js';
@@ -20,7 +20,7 @@ interface TableSchema {
 export class TSDB {
   private readonly options: Required<TSDBOptions>;
   private readonly tables: Map<string, TableSchema> = new Map();
-  private readonly partitions: Map<string, PartitionManager> = new Map();
+  private readonly partitions: Map<string, PartitionedTable> = new Map();
   private readonly symbols: Map<string, SymbolTable> = new Map();
   private readonly wal: WAL;
   private readonly schemaPath: string;
@@ -85,7 +85,7 @@ export class TSDB {
 
     // 初始化分区管理器
     const tableDir = join(this.options.dataDir, name);
-    this.partitions.set(name, new PartitionManager(tableDir, this.options.partitionBy, {
+    this.partitions.set(name, new PartitionedTable(tableDir, this.options.partitionBy, {
       maxRowsInMemory: this.options.cacheSize
     }));
 

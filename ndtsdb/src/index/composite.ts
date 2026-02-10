@@ -148,37 +148,30 @@ export class CompositeIndex {
     if (typeof filter === 'object' && (filter as any) && ('gte' in (filter as any) || 'lte' in (filter as any) || 'gt' in (filter as any) || 'lt' in (filter as any))) {
       const { gte, lte, gt, lt } = filter as RangeFilter<number | bigint>;
 
+      // 组合范围：用集合求交（宁可返回略多候选，再由 WHERE 二次过滤）
       if (gte !== undefined && lte !== undefined) {
+        // [gte, lte]
         return tree.rangeQuery(gte as any, lte as any);
       }
 
-      if (gt !== undefined && lt !== undefined) {
-        // (gt, lt)
-        const allGt = tree.greaterThan(gt as any);
-        const allLt = tree.lessThan(lt as any);
-        const gtSet = new Set(allGt);
-        return allLt.filter((r) => gtSet.has(r));
-      }
+      const lower =
+        gte !== undefined
+          ? tree.greaterThanOrEqual(gte as any)
+          : gt !== undefined
+            ? tree.greaterThan(gt as any)
+            : tree.getAllRows();
 
-      if (gte !== undefined) {
-        return tree.greaterThanOrEqual(gte as any);
-      }
-
-      if (gt !== undefined) {
-        return tree.greaterThan(gt as any);
-      }
-
+      let upper: number[] | null = null;
       if (lte !== undefined) {
-        const ltRows = tree.lessThan(lte as any);
-        const eqRows = tree.query(lte as any);
-        return [...ltRows, ...eqRows];
+        upper = [...tree.lessThan(lte as any), ...tree.query(lte as any)];
+      } else if (lt !== undefined) {
+        upper = tree.lessThan(lt as any);
       }
 
-      if (lt !== undefined) {
-        return tree.lessThan(lt as any);
-      }
+      if (!upper) return lower;
 
-      return tree.getAllRows();
+      const upperSet = new Set(upper);
+      return lower.filter((r) => upperSet.has(r));
     }
 
     // exact

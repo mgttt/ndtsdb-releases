@@ -59,6 +59,10 @@ export interface AppendFileHeader {
   totalRows: number;    // 所有 chunk 的总行数
   chunkCount: number;   // chunk 数量
   stringDicts?: { [columnName: string]: string[] }; // string 列字典（v2.1+）
+  compression?: {
+    enabled: boolean;
+    algorithms: { [columnName: string]: 'delta' | 'rle' | 'gorilla' | 'none' };
+  };
 }
 
 export type AppendRewriteResult = {
@@ -93,6 +97,45 @@ export interface AppendWriterOptions {
    * 避免小表频繁 compact
    */
   compactMinRows?: number;
+
+  /**
+   * 最大未 compact 时间（毫秒）（默认 24 小时）
+   * 自上次 compact 后经过此时间将触发 compact
+   */
+  compactMaxAgeMs?: number;
+
+  /**
+   * 最大文件大小（字节）（默认 100MB）
+   * 文件大小超过此值将触发 compact
+   */
+  compactMaxFileSize?: number;
+
+  /**
+   * 最大 chunk 数量（默认 1000）
+   * chunk 过多表示碎片化严重，触发 compact
+   */
+  compactMaxChunks?: number;
+
+  /**
+   * 自上次 compact 累计写入行数（默认 100k）
+   * 累计写入超过此值将触发 compact
+   */
+  compactMaxWrites?: number;
+
+  /**
+   * 压缩配置（默认不启用）
+   */
+  compression?: {
+    enabled: boolean;
+    /**
+     * 各列压缩算法（可选，默认根据类型自动选择）
+     * - int64: 'delta' (单调递增) | 'none'
+     * - int32: 'delta' | 'rle' (重复值多) | 'none'
+     * - float64: 'gorilla' | 'none'
+     * - string: 已字典编码，无需额外压缩
+     */
+    algorithms?: { [columnName: string]: 'delta' | 'rle' | 'gorilla' | 'none' };
+  };
 }
 
 /**
@@ -108,6 +151,8 @@ export class AppendWriter {
   private stringDicts: Map<string, Map<string, number>> = new Map(); // columnName → (value → id)
   private stringDictsReverse: Map<string, Map<number, string>> = new Map(); // columnName → (id → value)
   private options: AppendWriterOptions;
+  private lastCompactTime: number = Date.now();
+  private writesSinceCompact: number = 0;
 
   constructor(path: string, columns: Array<{ name: string; type: string }>, options: AppendWriterOptions = {}) {
     this.path = path;
@@ -117,6 +162,11 @@ export class AppendWriter {
       autoCompact: options.autoCompact ?? false,
       compactThreshold: options.compactThreshold ?? 0.2,
       compactMinRows: options.compactMinRows ?? 1000,
+      compactMaxAgeMs: options.compactMaxAgeMs ?? 24 * 60 * 60 * 1000, // 24h
+      compactMaxFileSize: options.compactMaxFileSize ?? 100 * 1024 * 1024, // 100MB
+      compactMaxChunks: options.compactMaxChunks ?? 1000,
+      compactMaxWrites: options.compactMaxWrites ?? 100_000,
+      compression: options.compression ?? { enabled: false },
     };
 
     // 初始化 string 列字典
@@ -239,6 +289,7 @@ export class AppendWriter {
     // 更新 header
     this.totalRows += rowCount;
     this.chunkCount++;
+    this.writesSinceCompact += rowCount; // 跟踪写入量
 
     // 字典更新时需要重写 header
     if (dictDirty) {
@@ -320,19 +371,61 @@ export class AppendWriter {
     const deletedCount = this.tombstone.getDeletedCount();
     const totalRows = this.totalRows; // 当前文件中的总行数（包含已删除的）
 
-    // 检查触发条件
+    // 最小行数检查（避免小表频繁 compact）
     if (totalRows < this.options.compactMinRows!) {
-      return; // 表太小，不 compact
+      return;
     }
 
+    // 收集触发原因
+    const reasons: string[] = [];
+
+    // 1. Tombstone 比例
     const deletedRatio = deletedCount / totalRows;
     if (deletedRatio >= this.options.compactThreshold!) {
-      console.log(`[AutoCompact] Triggering compact: ${deletedCount}/${totalRows} deleted (${(deletedRatio * 100).toFixed(1)}%)`);
+      reasons.push(`tombstone ${(deletedRatio * 100).toFixed(1)}% (${deletedCount}/${totalRows})`);
+    }
+
+    // 2. 时间触发
+    const ageMs = Date.now() - this.lastCompactTime;
+    if (ageMs >= this.options.compactMaxAgeMs!) {
+      reasons.push(`age ${(ageMs / 3600000).toFixed(1)}h`);
+    }
+
+    // 3. 文件大小触发
+    if (existsSync(this.path)) {
+      const tmpFd = openSync(this.path, 'r');
+      try {
+        const stat = fstatSync(tmpFd);
+        const fileSizeMB = stat.size / (1024 * 1024);
+        if (stat.size >= this.options.compactMaxFileSize!) {
+          reasons.push(`size ${fileSizeMB.toFixed(1)}MB`);
+        }
+      } finally {
+        closeSync(tmpFd);
+      }
+    }
+
+    // 4. Chunk 碎片化
+    if (this.chunkCount >= this.options.compactMaxChunks!) {
+      reasons.push(`chunks ${this.chunkCount}`);
+    }
+
+    // 5. 写入量
+    if (this.writesSinceCompact >= this.options.compactMaxWrites!) {
+      reasons.push(`writes ${this.writesSinceCompact}`);
+    }
+
+    // 任一条件满足即触发
+    if (reasons.length > 0) {
+      console.log(`[AutoCompact] Triggering compact (${reasons.join(', ')})`);
       
       // 重新打开文件
       this.open();
       try {
         await this.compact();
+        // 重置状态
+        this.lastCompactTime = Date.now();
+        this.writesSinceCompact = 0;
       } finally {
         if (this.fd !== -1) {
           closeSync(this.fd);
@@ -481,11 +574,18 @@ export class AppendWriter {
   }
 
   /**
-   * Compact：清理 tombstone + 重写文件
+   * Compact：清理 tombstone + 合并 chunk
+   * 
+   * 触发场景：
+   * 1. 有 tombstone（删除行） → 过滤 + 重写
+   * 2. chunk 碎片化（即使无 tombstone）→ 合并 chunk
    */
   async compact(options: AppendRewriteOptions = {}): Promise<AppendRewriteResult> {
     const deletedCount = this.tombstone.getDeletedCount();
-    if (deletedCount === 0) {
+    const shouldCompact = deletedCount > 0 || this.chunkCount > 1;
+
+    if (!shouldCompact) {
+      // 只有 1 个 chunk 且无 tombstone → 无需 compact
       return { beforeRows: this.totalRows, afterRows: this.totalRows, deletedRows: 0, chunksWritten: 0 };
     }
 
@@ -541,6 +641,10 @@ export class AppendWriter {
     }
     this.open();
 
+    // 重置 auto compact 状态
+    this.lastCompactTime = Date.now();
+    this.writesSinceCompact = 0;
+
     return {
       beforeRows: this.totalRows + deletedCount,
       afterRows: this.totalRows,
@@ -564,6 +668,20 @@ export class AppendWriter {
       for (const [colName] of this.stringDicts) {
         header.stringDicts[colName] = [];
       }
+    }
+
+    // 压缩配置
+    if (this.options.compression?.enabled) {
+      const algorithms: { [colName: string]: 'delta' | 'rle' | 'gorilla' | 'none' } = {};
+      for (const col of this.columns) {
+        // 自动选择算法（简化版：仅 int64 用 delta）
+        if (col.type === 'int64') {
+          algorithms[col.name] = this.options.compression.algorithms?.[col.name] ?? 'delta';
+        } else {
+          algorithms[col.name] = 'none';
+        }
+      }
+      header.compression = { enabled: true, algorithms };
     }
 
     this.writeHeaderData(header);

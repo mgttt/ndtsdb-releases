@@ -266,12 +266,153 @@ export class DeltaCompressor {
   }
 }
 
+/**
+ * Delta 编码器（int64/bigint）
+ * 适用于单调递增序列（如 ID、递增的 timestamp）
+ */
+export class DeltaEncoderInt64 {
+  compress(values: BigInt64Array): Uint8Array {
+    if (values.length === 0) return new Uint8Array(0);
+    if (values.length === 1) {
+      const buf = Buffer.allocUnsafe(8);
+      buf.writeBigInt64LE(values[0]);
+      return new Uint8Array(buf);
+    }
+
+    const writer = new VarintWriter();
+    writer.writeBigInt64(values[0]); // 第一个值完整存储
+
+    for (let i = 1; i < values.length; i++) {
+      const delta = Number(values[i] - values[i - 1]);
+      writer.writeVarint(delta);
+    }
+
+    return writer.finish();
+  }
+
+  decompress(buffer: Uint8Array, count: number): BigInt64Array {
+    if (buffer.length === 0) return new BigInt64Array(0);
+
+    const reader = new VarintReader(buffer);
+    const result = new BigInt64Array(count);
+
+    result[0] = reader.readBigInt64();
+
+    for (let i = 1; i < count; i++) {
+      const delta = BigInt(reader.readVarint());
+      result[i] = result[i - 1] + delta;
+    }
+
+    return result;
+  }
+}
+
+/**
+ * Delta 编码器（int32）
+ */
+export class DeltaEncoderInt32 {
+  compress(values: Int32Array): Uint8Array {
+    if (values.length === 0) return new Uint8Array(0);
+    if (values.length === 1) {
+      const buf = Buffer.allocUnsafe(4);
+      buf.writeInt32LE(values[0]);
+      return new Uint8Array(buf);
+    }
+
+    const writer = new VarintWriter();
+    writer.writeInt32(values[0]);
+
+    for (let i = 1; i < values.length; i++) {
+      const delta = values[i] - values[i - 1];
+      writer.writeVarint(delta);
+    }
+
+    return writer.finish();
+  }
+
+  decompress(buffer: Uint8Array, count: number): Int32Array {
+    if (buffer.length === 0) return new Int32Array(0);
+
+    const reader = new VarintReader(buffer);
+    const result = new Int32Array(count);
+
+    result[0] = reader.readInt32();
+
+    for (let i = 1; i < count; i++) {
+      const delta = reader.readVarint();
+      result[i] = result[i - 1] + delta;
+    }
+
+    return result;
+  }
+}
+
+/**
+ * RLE (Run-Length Encoding) 编码器
+ * 适用于有大量重复值的序列（如状态字段、symbol ID）
+ */
+export class RLEEncoder {
+  compress(values: Int32Array): Uint8Array {
+    if (values.length === 0) return new Uint8Array(0);
+
+    const writer = new VarintWriter();
+    let runValue = values[0];
+    let runLength = 1;
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i] === runValue) {
+        runLength++;
+      } else {
+        writer.writeInt32(runValue);
+        writer.writeVarint(runLength);
+        runValue = values[i];
+        runLength = 1;
+      }
+    }
+
+    // 写入最后一个 run
+    writer.writeInt32(runValue);
+    writer.writeVarint(runLength);
+
+    return writer.finish();
+  }
+
+  decompress(buffer: Uint8Array, count: number): Int32Array {
+    const reader = new VarintReader(buffer);
+    const result = new Int32Array(count);
+    let pos = 0;
+
+    while (reader.hasMore() && pos < count) {
+      const value = reader.readInt32();
+      const length = reader.readVarint();
+
+      for (let i = 0; i < length && pos < count; i++) {
+        result[pos++] = value;
+      }
+    }
+
+    return result;
+  }
+}
+
 // Varint 编码器 (简化版)
 class VarintWriter {
   private buffer: number[] = [];
 
   writeFloat64(value: number): void {
     const arr = new Float64Array([value]);
+    const bytes = new Uint8Array(arr.buffer);
+    this.buffer.push(...bytes);
+  }
+
+  writeBigInt64(value: bigint): void {
+    const arr = new BigInt64Array([value]);
+    const bytes = new Uint8Array(arr.buffer);
+    this.buffer.push(...bytes);
+  }
+
+  writeInt32(value: number): void {
+    const arr = new Int32Array([value]);
     const bytes = new Uint8Array(arr.buffer);
     this.buffer.push(...bytes);
   }
@@ -304,6 +445,18 @@ class VarintReader {
     const bytes = this.buffer.slice(this.pos, this.pos + 8);
     this.pos += 8;
     return new Float64Array(bytes.buffer)[0];
+  }
+
+  readBigInt64(): bigint {
+    const bytes = this.buffer.slice(this.pos, this.pos + 8);
+    this.pos += 8;
+    return new BigInt64Array(bytes.buffer)[0];
+  }
+
+  readInt32(): number {
+    const bytes = this.buffer.slice(this.pos, this.pos + 4);
+    this.pos += 4;
+    return new Int32Array(bytes.buffer)[0];
   }
 
   readVarint(): number {
@@ -414,4 +567,105 @@ export function testGorilla(): void {
   const tsDecompressed = deltaComp.decompress(tsCompressed);
   const tsMatch = timestamps.every((v, i) => v === tsDecompressed[i]);
   console.log(`Verification: ${tsMatch ? '✅ PASSED' : '❌ FAILED'}`);
+}
+
+/**
+ * 综合性能基准测试
+ */
+export function benchmarkCompression(): void {
+  console.log('📊 Compression Benchmark\n');
+  console.log('='.repeat(80));
+
+  // 测试 1: 单调递增 int64 (timestamp)
+  console.log('\n[1] Monotonic int64 (timestamps)');
+  const timestamps = new BigInt64Array(10000);
+  let ts = BigInt(Date.now());
+  for (let i = 0; i < timestamps.length; i++) {
+    timestamps[i] = ts;
+    ts += 1000n; // 每秒递增
+  }
+
+  const deltaInt64 = new DeltaEncoderInt64();
+  const t1Start = performance.now();
+  const t1Compressed = deltaInt64.compress(timestamps);
+  const t1CompressTime = performance.now() - t1Start;
+
+  const t1Original = timestamps.length * 8;
+  const t1Ratio = ((t1Original - t1Compressed.length) / t1Original * 100).toFixed(1);
+
+  console.log(`  Original: ${t1Original} bytes`);
+  console.log(`  Compressed: ${t1Compressed.length} bytes`);
+  console.log(`  Ratio: ${t1Ratio}%`);
+  console.log(`  Compress time: ${t1CompressTime.toFixed(2)}ms`);
+
+  const t1DecompStart = performance.now();
+  const t1Decompressed = deltaInt64.decompress(t1Compressed, timestamps.length);
+  const t1DecompressTime = performance.now() - t1DecompStart;
+  console.log(`  Decompress time: ${t1DecompressTime.toFixed(2)}ms`);
+
+  const t1Match = timestamps.every((v, i) => v === t1Decompressed[i]);
+  console.log(`  Verification: ${t1Match ? '✅' : '❌'}`);
+
+  // 测试 2: 随机 int32
+  console.log('\n[2] Random int32');
+  const randomInts = new Int32Array(10000);
+  for (let i = 0; i < randomInts.length; i++) {
+    randomInts[i] = Math.floor(Math.random() * 1000);
+  }
+
+  const deltaInt32 = new DeltaEncoderInt32();
+  const t2Start = performance.now();
+  const t2Compressed = deltaInt32.compress(randomInts);
+  const t2CompressTime = performance.now() - t2Start;
+
+  const t2Original = randomInts.length * 4;
+  const t2Ratio = ((t2Original - t2Compressed.length) / t2Original * 100).toFixed(1);
+
+  console.log(`  Original: ${t2Original} bytes`);
+  console.log(`  Compressed: ${t2Compressed.length} bytes`);
+  console.log(`  Ratio: ${t2Ratio}% ${parseInt(t2Ratio) < 0 ? '(worse!)' : ''}`);
+  console.log(`  Compress time: ${t2CompressTime.toFixed(2)}ms`);
+
+  const t2DecompStart = performance.now();
+  const t2Decompressed = deltaInt32.decompress(t2Compressed, randomInts.length);
+  const t2DecompressTime = performance.now() - t2DecompStart;
+  console.log(`  Decompress time: ${t2DecompressTime.toFixed(2)}ms`);
+
+  const t2Match = randomInts.every((v, i) => v === t2Decompressed[i]);
+  console.log(`  Verification: ${t2Match ? '✅' : '❌'}`);
+
+  // 测试 3: 重复值 (RLE)
+  console.log('\n[3] Repeated values (RLE)');
+  const repeated = new Int32Array(10000);
+  for (let i = 0; i < repeated.length; i++) {
+    repeated[i] = Math.floor(i / 100); // 每 100 个值重复
+  }
+
+  const rle = new RLEEncoder();
+  const t3Start = performance.now();
+  const t3Compressed = rle.compress(repeated);
+  const t3CompressTime = performance.now() - t3Start;
+
+  const t3Original = repeated.length * 4;
+  const t3Ratio = ((t3Original - t3Compressed.length) / t3Original * 100).toFixed(1);
+
+  console.log(`  Original: ${t3Original} bytes`);
+  console.log(`  Compressed: ${t3Compressed.length} bytes`);
+  console.log(`  Ratio: ${t3Ratio}%`);
+  console.log(`  Compress time: ${t3CompressTime.toFixed(2)}ms`);
+
+  const t3DecompStart = performance.now();
+  const t3Decompressed = rle.decompress(t3Compressed, repeated.length);
+  const t3DecompressTime = performance.now() - t3DecompStart;
+  console.log(`  Decompress time: ${t3DecompressTime.toFixed(2)}ms`);
+
+  const t3Match = repeated.every((v, i) => v === t3Decompressed[i]);
+  console.log(`  Verification: ${t3Match ? '✅' : '❌'}`);
+
+  console.log('\n' + '='.repeat(80));
+  console.log('Summary:');
+  console.log('  Delta (int64):  Best for monotonic sequences (timestamps)');
+  console.log('  Delta (int32):  May expand random data (use with care)');
+  console.log('  RLE:            Excellent for repeated values (>90% compression)');
+  console.log('='.repeat(80) + '\n');
 }

@@ -1,101 +1,226 @@
 // ============================================================
-// 分区管理器
-// 借鉴 QuestDB 三层存储架构：
-// - 热数据：内存中的当前分区
-// - 温数据：磁盘上的近期分区
-// - 冷数据：可归档到 Parquet/S3
+// 分区表管理 - 按时间/symbol 自动分区
 // ============================================================
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync } from 'fs';
+import { AppendWriter, AppendFileHeader } from './append.js';
+import { existsSync, mkdirSync, readdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
-import type { PartitionConfig, PartitionInfo, Row, ColumnDef } from './types.js';
 
-interface Partition {
-  name: string;
-  startTime: Date;
-  endTime: Date;
-  rows: Row[];
-  dirty: boolean;
-  filePath: string;
+/**
+ * 分区策略
+ */
+export type PartitionStrategy =
+  | { type: 'time'; column: string; interval: 'day' | 'month' | 'year' }
+  | { type: 'range'; column: string; ranges: Array<{ min: number; max: number; label: string }> }
+  | { type: 'hash'; column: string; buckets: number };
+
+/**
+ * 分区元数据
+ */
+export interface PartitionMeta {
+  label: string; // 分区标识（如 "2024-01"）
+  path: string; // 分区文件路径
+  minValue?: bigint | number; // 分区最小值（时间/范围分区）
+  maxValue?: bigint | number; // 分区最大值
+  rows: number; // 分区行数
+  createdAt: number; // 创建时间
 }
 
-export class PartitionManager {
-  private readonly dataDir: string;
-  private readonly config: PartitionConfig;
-  private currentPartition: Partition | null = null;
-  private readonly maxRowsInMemory: number;
+/**
+ * 分区表管理器
+ */
+export class PartitionedTable {
+  private basePath: string;
+  private columns: Array<{ name: string; type: string }>;
+  private strategy: PartitionStrategy;
+  private partitions: Map<string, PartitionMeta> = new Map();
+  private writers: Map<string, AppendWriter> = new Map();
 
-  constructor(dataDir: string, config: PartitionConfig, options: { maxRowsInMemory?: number } = {}) {
-    this.dataDir = dataDir;
-    this.config = config;
-    this.maxRowsInMemory = options.maxRowsInMemory || 100000;
+  constructor(
+    basePath: string,
+    columns: Array<{ name: string; type: string }>,
+    strategy: PartitionStrategy
+  ) {
+    this.basePath = basePath;
+    this.columns = columns;
+    this.strategy = strategy;
 
-    if (!existsSync(dataDir)) {
-      mkdirSync(dataDir, { recursive: true });
+    // 确保基础目录存在
+    if (!existsSync(basePath)) {
+      mkdirSync(basePath, { recursive: true });
     }
+
+    // 加载已有分区
+    this.loadPartitions();
   }
 
   /**
-   * 获取行所属的分区名称
+   * 加载已有分区元数据
    */
-  getPartitionName(timestamp: Date): string {
-    const ts = timestamp.getTime();
-    
-    switch (this.config.granularity) {
-      case 'hour':
-        return `${timestamp.getUTCFullYear()}-${String(timestamp.getUTCMonth() + 1).padStart(2, '0')}-${String(timestamp.getUTCDate()).padStart(2, '0')}-${String(timestamp.getUTCHours()).padStart(2, '0')}`;
-      case 'day':
-        return `${timestamp.getUTCFullYear()}-${String(timestamp.getUTCMonth() + 1).padStart(2, '0')}-${String(timestamp.getUTCDate()).padStart(2, '0')}`;
-      case 'month':
-        return `${timestamp.getUTCFullYear()}-${String(timestamp.getUTCMonth() + 1).padStart(2, '0')}`;
-      default:
-        throw new Error(`Unknown granularity: ${this.config.granularity}`);
+  private loadPartitions(): void {
+    if (!existsSync(this.basePath)) return;
+
+    const files = readdirSync(this.basePath).filter(f => f.endsWith('.ndts'));
+
+    for (const file of files) {
+      const path = join(this.basePath, file);
+      const label = file.replace('.ndts', '');
+
+      try {
+        const header = AppendWriter.readHeader(path);
+        const stat = statSync(path);
+
+        this.partitions.set(label, {
+          label,
+          path,
+          rows: header.totalRows,
+          createdAt: stat.birthtimeMs,
+        });
+      } catch (e) {
+        console.warn(`Failed to load partition ${label}:`, e);
+      }
     }
+
+    console.log(`[PartitionedTable] Loaded ${this.partitions.size} partitions`);
   }
 
   /**
-   * 写入行到对应分区
+   * 根据策略确定分区标签
    */
-  writeRow(row: Row, timestamp: Date): void {
-    const partitionName = this.getPartitionName(timestamp);
-    
-    if (!this.currentPartition || this.currentPartition.name !== partitionName) {
-      this.switchPartition(partitionName, timestamp);
-    }
+  private getPartitionLabel(row: Record<string, any>): string {
+    switch (this.strategy.type) {
+      case 'time': {
+        const colValue = row[this.strategy.column];
+        const timestamp = typeof colValue === 'bigint' ? Number(colValue) : colValue;
+        const date = new Date(timestamp);
 
-    this.currentPartition.rows.push(row);
-    this.currentPartition.dirty = true;
+        switch (this.strategy.interval) {
+          case 'day':
+            return date.toISOString().slice(0, 10); // YYYY-MM-DD
+          case 'month':
+            return date.toISOString().slice(0, 7); // YYYY-MM
+          case 'year':
+            return date.toISOString().slice(0, 4); // YYYY
+        }
+        break;
+      }
 
-    // 内存分区满了，刷盘
-    if (this.currentPartition.rows.length >= this.maxRowsInMemory) {
-      this.flushCurrent();
-    }
-  }
-
-  /**
-   * 批量写入
-   */
-  writeRows(rows: Row[], timestamps: Date[]): void {
-    for (let i = 0; i < rows.length; i++) {
-      this.writeRow(rows[i], timestamps[i]);
-    }
-  }
-
-  /**
-   * 查询分区数据
-   */
-  query(start: Date, end: Date, filter?: (row: Row) => boolean): Row[] {
-    const results: Row[] = [];
-    const partitions = this.getPartitionsInRange(start, end);
-
-    for (const partition of partitions) {
-      const rows = this.readPartition(partition);
-      for (const row of rows) {
-        const ts = new Date(row[this.config.column] as string | number);
-        if (ts >= start && ts <= end) {
-          if (!filter || filter(row)) {
-            results.push(row);
+      case 'range': {
+        const colValue = Number(row[this.strategy.column]);
+        for (const range of this.strategy.ranges) {
+          if (colValue >= range.min && colValue < range.max) {
+            return range.label;
           }
+        }
+        return 'default';
+      }
+
+      case 'hash': {
+        const colValue = String(row[this.strategy.column]);
+        const hash = this.simpleHash(colValue);
+        const bucket = hash % this.strategy.buckets;
+        return `bucket-${bucket}`;
+      }
+    }
+
+    return 'default';
+  }
+
+  /**
+   * 简单哈希函数
+   */
+  private simpleHash(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = (hash << 5) - hash + str.charCodeAt(i);
+      hash |= 0; // Convert to 32bit integer
+    }
+    return Math.abs(hash);
+  }
+
+  /**
+   * 获取分区的 AppendWriter（自动创建）
+   */
+  private getWriter(label: string): AppendWriter {
+    if (this.writers.has(label)) {
+      return this.writers.get(label)!;
+    }
+
+    const path = join(this.basePath, `${label}.ndts`);
+    const writer = new AppendWriter(path, this.columns);
+
+    const isNew = !existsSync(path);
+    writer.open(); // open() 会自动创建文件如果不存在
+
+    if (isNew) {
+      this.partitions.set(label, {
+        label,
+        path,
+        rows: 0,
+        createdAt: Date.now(),
+      });
+    }
+
+    this.writers.set(label, writer);
+    return writer;
+  }
+
+  /**
+   * 写入数据（自动分区）
+   */
+  append(rows: Record<string, any>[]): void {
+    // 按分区分组
+    const groups = new Map<string, Record<string, any>[]>();
+
+    for (const row of rows) {
+      const label = this.getPartitionLabel(row);
+      if (!groups.has(label)) {
+        groups.set(label, []);
+      }
+      groups.get(label)!.push(row);
+    }
+
+    // 写入各分区
+    for (const [label, partitionRows] of groups) {
+      const writer = this.getWriter(label);
+      writer.append(partitionRows);
+
+      // 更新元数据
+      const meta = this.partitions.get(label)!;
+      meta.rows += partitionRows.length;
+    }
+  }
+
+  /**
+   * 查询（跨分区）
+   * @param filter 行过滤函数
+   * @param timeRange 时间范围过滤（可选，用于优化分区扫描）
+   */
+  query(
+    filter?: (row: Record<string, any>) => boolean,
+    timeRange?: { min?: number | bigint; max?: number | bigint }
+  ): Array<Record<string, any>> {
+    const results: Array<Record<string, any>> = [];
+
+    // 智能分区过滤（仅扫描时间范围内的分区）
+    let partitionsToScan = Array.from(this.partitions.values());
+
+    if (timeRange && this.strategy.type === 'time') {
+      partitionsToScan = this.filterPartitionsByTimeRange(timeRange);
+    }
+
+    // 扫描分区
+    for (const meta of partitionsToScan) {
+      const { header, data } = AppendWriter.readAll(meta.path);
+
+      for (let i = 0; i < header.totalRows; i++) {
+        const row: Record<string, any> = {};
+        for (const [colName, colData] of data) {
+          row[colName] = (colData as any)[i];
+        }
+
+        if (!filter || filter(row)) {
+          results.push(row);
         }
       }
     }
@@ -104,146 +229,79 @@ export class PartitionManager {
   }
 
   /**
-   * 获取分区列表
+   * 根据时间范围过滤分区
    */
-  listPartitions(): PartitionInfo[] {
-    const partitions: PartitionInfo[] = [];
-    
-    try {
-      const entries = readdirSync(this.dataDir);
-      for (const entry of entries) {
-        if (entry.endsWith('.jsonl')) {
-          const filePath = join(this.dataDir, entry);
-          const stats = statSync(filePath);
-          const name = entry.replace('.jsonl', '');
-          
-          partitions.push({
-            name,
-            startTime: this.parsePartitionTime(name),
-            endTime: this.getPartitionEnd(name),
-            rowCount: this.countRows(filePath),
-            fileSize: stats.size
-          });
-        }
-      }
-    } catch {}
+  private filterPartitionsByTimeRange(timeRange: { min?: number | bigint; max?: number | bigint }): PartitionMeta[] {
+    if (this.strategy.type !== 'time') {
+      return Array.from(this.partitions.values());
+    }
 
-    return partitions.sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
+    const min = timeRange.min ? Number(timeRange.min) : -Infinity;
+    const max = timeRange.max ? Number(timeRange.max) : Infinity;
+
+    return Array.from(this.partitions.values()).filter((meta) => {
+      // 从分区标签推断时间范围
+      const partitionTime = this.getPartitionTimeRange(meta.label);
+      if (!partitionTime) return true; // 无法推断，保留
+
+      // 检查分区时间范围是否与查询范围重叠
+      return !(partitionTime.max < min || partitionTime.min > max);
+    });
   }
 
   /**
-   * 强制刷盘当前分区
+   * 从分区标签推断时间范围
    */
-  flush(): void {
-    this.flushCurrent();
-  }
+  private getPartitionTimeRange(label: string): { min: number; max: number } | null {
+    if (this.strategy.type !== 'time') return null;
 
-  private switchPartition(name: string, timestamp: Date): void {
-    // 先刷盘旧分区
-    if (this.currentPartition && this.currentPartition.dirty) {
-      this.flushCurrent();
-    }
-
-    // 加载或创建新分区
-    const filePath = join(this.dataDir, `${name}.jsonl`);
-    let rows: Row[] = [];
-
-    if (existsSync(filePath)) {
-      rows = this.loadPartition(filePath);
-    }
-
-    this.currentPartition = {
-      name,
-      startTime: timestamp,
-      endTime: this.getPartitionEnd(name),
-      rows,
-      dirty: false,
-      filePath
-    };
-  }
-
-  private flushCurrent(): void {
-    if (!this.currentPartition || !this.currentPartition.dirty) return;
-
-    const { filePath, rows } = this.currentPartition;
-    
-    // 确保目录存在
-    const dir = dirname(filePath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-
-    // 追加写入（JSON Lines 格式）
-    const lines = rows.map(r => JSON.stringify(r)).join('\n') + '\n';
-    writeFileSync(filePath, lines);
-    
-    this.currentPartition.dirty = false;
-    this.currentPartition.rows = []; // 清空内存
-  }
-
-  private loadPartition(filePath: string): Row[] {
     try {
-      const content = readFileSync(filePath, 'utf-8');
-      return content
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map(line => JSON.parse(line));
+      switch (this.strategy.interval) {
+        case 'day': {
+          // label 格式: YYYY-MM-DD
+          const date = new Date(label);
+          const min = date.getTime();
+          const max = min + 24 * 60 * 60 * 1000 - 1;
+          return { min, max };
+        }
+
+        case 'month': {
+          // label 格式: YYYY-MM
+          const [year, month] = label.split('-').map(Number);
+          const min = new Date(year, month - 1, 1).getTime();
+          const max = new Date(year, month, 0, 23, 59, 59, 999).getTime();
+          return { min, max };
+        }
+
+        case 'year': {
+          // label 格式: YYYY
+          const year = parseInt(label);
+          const min = new Date(year, 0, 1).getTime();
+          const max = new Date(year, 11, 31, 23, 59, 59, 999).getTime();
+          return { min, max };
+        }
+      }
     } catch {
-      return [];
-    }
-  }
-
-  private readPartition(name: string): Row[] {
-    // 如果是当前分区，直接返回
-    if (this.currentPartition?.name === name) {
-      return this.currentPartition.rows;
+      return null;
     }
 
-    // 从磁盘读取
-    const filePath = join(this.dataDir, `${name}.jsonl`);
-    return this.loadPartition(filePath);
+    return null;
   }
 
-  private getPartitionsInRange(start: Date, end: Date): string[] {
-    const partitions = this.listPartitions();
-    return partitions
-      .filter(p => p.startTime <= end && p.endTime >= start)
-      .map(p => p.name);
+  /**
+   * 获取所有分区元数据
+   */
+  getPartitions(): PartitionMeta[] {
+    return Array.from(this.partitions.values());
   }
 
-  private parsePartitionTime(name: string): Date {
-    const parts = name.split('-').map(Number);
-    if (parts.length === 4) { // hour
-      return new Date(Date.UTC(parts[0], parts[1] - 1, parts[2], parts[3]));
-    } else if (parts.length === 3) { // day
-      return new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
-    } else { // month
-      return new Date(Date.UTC(parts[0], parts[1] - 1, 1));
+  /**
+   * 关闭所有打开的 writer
+   */
+  async closeAll(): Promise<void> {
+    for (const writer of this.writers.values()) {
+      await writer.close();
     }
-  }
-
-  private getPartitionEnd(name: string): Date {
-    const start = this.parsePartitionTime(name);
-    
-    switch (this.config.granularity) {
-      case 'hour':
-        return new Date(start.getTime() + 60 * 60 * 1000);
-      case 'day':
-        return new Date(start.getTime() + 24 * 60 * 60 * 1000);
-      case 'month':
-        return new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1));
-      default:
-        return new Date(start.getTime() + 24 * 60 * 60 * 1000);
-    }
-  }
-
-  private countRows(filePath: string): number {
-    try {
-      const content = readFileSync(filePath, 'utf-8');
-      return content.trim().split('\n').filter(Boolean).length;
-    } catch {
-      return 0;
-    }
+    this.writers.clear();
   }
 }

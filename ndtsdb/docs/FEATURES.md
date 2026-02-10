@@ -6,7 +6,127 @@
 
 ---
 
-## 1. Storage Engine
+## 1. Compression Algorithms
+
+ndtsdb 提供多种压缩算法，适用于不同数据类型和模式：
+
+### Gorilla Compression
+- **用途**：浮点数时序数据（价格、指标等）
+- **算法**：Delta-of-Delta + XOR（Facebook 开源）
+- **压缩率**：70-90%（浮点数），90-95%（时间戳）
+- **实现**：C FFI（libndts）+ JavaScript fallback
+
+### Delta Encoding
+- **用途**：单调递增序列（timestamp, ID）
+- **算法**：存储相邻值差值（Varint 编码）
+- **压缩率**：75%（等间隔序列）
+- **类型**：int64, int32
+
+### Delta-of-Delta
+- **用途**：等间隔时间序列（固定周期采样）
+- **算法**：存储差值的差值
+- **压缩率**：>90%（等间隔）
+
+### RLE (Run-Length Encoding)
+- **用途**：重复值多的序列（状态、symbol ID）
+- **算法**：游程编码（value + count）
+- **压缩率**：>95%（高重复率数据）
+
+**当前集成状态**：
+- ✅ 压缩算法已实现（compression.ts）
+- ✅ 性能基准测试（benchmarkCompression）
+- ⏳ 存储引擎集成（计划中，可选开关）
+
+---
+
+## 2. Partitioned Tables
+
+**自动分区**：按时间/symbol/hash 自动分区，提升大表查询性能。
+
+### 分区策略
+- **时间分区**：按 day/month/year 自动分区（如 K线数据按日分区）
+- **范围分区**：按数值范围分区
+- **哈希分区**：按列值哈希分桶（均匀分布）
+
+### 使用示例
+```typescript
+const table = new PartitionedTable(
+  '/data/klines',
+  [{ name: 'timestamp', type: 'int64' }, { name: 'price', type: 'float64' }],
+  { type: 'time', column: 'timestamp', interval: 'day' } // 按天分区
+);
+
+// 写入自动分区
+table.append([
+  { timestamp: 1704153600000n, price: 100.5 },
+  { timestamp: 1704240000000n, price: 101.2 },
+]);
+
+// 跨分区查询
+const results = table.query(row => row.price > 100);
+```
+
+### 特性
+- ✅ 自动分区文件管理（写入时选择/创建分区）
+- ✅ 跨分区查询合并
+- ✅ 分区元数据（行数、边界信息）
+- ✅ WHERE 时间范围优化 v1：`query(filter, {min,max})` 提前过滤分区扫描（按分区 label 推断范围）
+- ✅ **SQL 集成**：`queryPartitionedTableToColumnar()`自动提取 WHERE 时间范围并转换为内存表供 SQL 执行
+
+### SQL 集成示例
+```typescript
+const partitionedTable = new PartitionedTable(...);
+const sql = "SELECT * FROM t WHERE timestamp >= 1000";
+const parsed = new SQLParser().parse(sql);
+
+// 自动提取时间范围 + 优化分区扫描 + 转换为 ColumnarTable
+const table = queryPartitionedTableToColumnar(partitionedTable, parsed.data.whereExpr);
+
+// 注册并执行 SQL
+executor.registerTable('t', table);
+const result = executor.execute(parsed);
+```
+
+---
+
+## 3. Streaming Aggregation
+
+**增量窗口计算**：实时指标计算，无需全量重算。
+
+### 支持的聚合器
+- **StreamingSMA**：滑动平均
+- **StreamingEMA**：指数移动平均
+- **StreamingStdDev**：滑动标准差
+- **StreamingMin/Max**：滑动最小/最大值
+- **StreamingAggregator**：多指标组合计算
+
+### 使用示例
+```typescript
+const sma = new StreamingSMA(20); // 20-period SMA
+
+// 实时添加新数据
+const avgPrice1 = sma.add(100.5);
+const avgPrice2 = sma.add(101.2);
+// ...
+
+// 多指标计算
+const agg = new StreamingAggregator();
+agg.addAggregator('sma', new StreamingSMA(20));
+agg.addAggregator('ema', new StreamingEMA(12));
+agg.addAggregator('stddev', new StreamingStdDev(20));
+
+const metrics = agg.add(100.5); // { sma: ..., ema: ..., stddev: ... }
+```
+
+### 应用场景
+- 实时监控仪表盘
+- 在线交易系统指标
+- 动态警报触发
+- 流式数据处理
+
+---
+
+## 4. Storage Engine
 
 ### AppendWriter (DLv2)
 - chunked append-only
@@ -17,10 +137,15 @@
   - 独立 .tomb 文件（RoaringBitmap 压缩存储已删除行号）
   - `compact()` 清理 tombstone + 重写文件
   - `readAllFiltered()` 自动过滤已删除行
-- **自动 compact**：可配置 tombstone 比例阈值，close 时自动清理
+- **自动 compact**：多触发条件，close 时自动清理 + 合并 chunk
   - `autoCompact`: true/false（默认 false）
-  - `compactThreshold`: 0.2 = 20%（默认）
-  - `compactMinRows`: 1000（最小行数阈值）
+  - 触发条件（任一满足即触发）：
+    - `compactThreshold`: tombstone 比例（默认 0.2 = 20%）
+    - `compactMaxAgeMs`: 最大未 compact 时间（默认 24h）
+    - `compactMaxFileSize`: 最大文件大小（默认 100MB）
+    - `compactMaxChunks`: 最大 chunk 数量（默认 1000）
+    - `compactMaxWrites`: 累计写入行数（默认 100k）
+  - `compactMinRows`: 1000（最小行数阈值，避免小表频繁 compact）
 - **rewrite/compact**：`rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换，向后兼容）
 
 ### ColumnarTable
@@ -89,11 +214,13 @@
 ## 5. Index（索引）
 
 - **BTree 索引**：数值列（timestamp/price 等）范围查询加速
-- **复合索引**：多列组合查询加速（如 (symbol, timestamp)）
-  - 嵌套 Map + BTree 结构
+- **复合索引**：多列组合查询加速（如 (symbol, timestamp) 或 (region, city, timestamp)）
+  - 嵌套 Map + BTree 结构（支持 N 列）
   - 支持前缀精确匹配 + 最后一列范围查询
   - 自动维护（appendBatch 时更新）
 - **SQL 自动优化**：WHERE 条件自动使用索引（> / < / >= / <= / =）
+  - N 列复合索引前缀匹配（如 WHERE a='x' AND b='y' AND c>=100 自动使用 (a,b,c) 索引）
+  - 最优索引选择（多个索引可用时，选择匹配列数最多的）
 - **API**：
   - 单列：createIndex / dropIndex / queryIndex / hasIndex
   - 复合：createCompositeIndex / dropCompositeIndex / queryCompositeIndex / hasCompositeIndex

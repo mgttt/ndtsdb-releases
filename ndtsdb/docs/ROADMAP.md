@@ -69,13 +69,14 @@
 
 Append-only 是最大限制。
 
-现状（已落地，够用版）：
+现状（已落地，优化版完成 ✅）：
 - ✅ `AppendWriter.rewrite/deleteWhere/updateWhere`：读取旧文件 → 写 tmp → 原子替换（适合小文件/每 symbol 文件场景）
-
-下一步（优化版）：
 - ✅ `AppendWriter.rewriteStreaming`：按 chunk 流式重写（避免 readAll 全量展开），并在重写时自然合并/compact chunk
-- 支持 tombstone 标记（软删除，定期 compact）
-- 参考 LSM-Tree 的合并策略
+- ✅ **Tombstone 软删除**：独立 .tomb 文件（RoaringBitmap 压缩）+ `compact()` 延迟清理
+- ✅ **自动 compact 策略**：多触发条件（tombstone 比例/时间/文件大小/chunk 数量/写入量），close 时自动执行
+
+后续可能扩展（低优先级）：
+- LSM-Tree 式分层合并（目前单文件 compact 已够用）
 
 ```typescript
 // 目标 API
@@ -99,19 +100,18 @@ await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
 
 ### 🟡 中优先级（提升易用性）
 
-**3. 自动二级索引**
+**3. 二级索引** ✅ 已完成
 
-当前 SymbolTable 只支持 symbol → id 映射。需支持：
-- 范围查询索引（BTree on timestamp）
-- 多列复合索引
-- 自动维护（写入时更新索引）
+- ✅ **BTree 索引**：数值列范围查询（timestamp/price 等）
+- ✅ **复合索引**：多列组合查询（如 (symbol, timestamp)）
+  - 嵌套 Map + BTree 结构（前缀精确匹配 + 最后一列范围）
+  - 自动维护（appendBatch 时更新）
+  - SQL planner 自动使用（WHERE symbol='BTC' AND timestamp>=... 等）
+- ✅ **SQL 自动优化**：tryUseIndex 识别 AND 链并选择最优索引
 
-```typescript
-const table = new IndexedTable([
-  { name: 'timestamp', type: 'int64', index: 'btree' },
-  { name: 'price', type: 'float64', index: 'bitmap' },
-]);
-```
+后续可能扩展：
+- 声明式索引创建（CREATE INDEX 语法）
+- Bitmap 索引（低基数列）
 
 **4. 字符串原生支持**
 
@@ -224,6 +224,14 @@ Chunk 级原子写入：
 | **v0.10.1** | 02-09 22:15 | **下游脚本修复**：接口/路径收敛（connect/init、旧路径迁移） |
 | **v0.10.2** | 02-09 23:00 | **SQL 窗口函数**: 已实现 STDDEV/ROW_NUMBER/AVG... OVER (ORDER BY ... ROWS BETWEEN) |
 | **v0.10.2** | 02-09 23:00 | **SQL GROUP BY**: 已实现 COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/FIRST/LAST |
+| **v0.9.3.0** | 02-10 15:56 | **复合索引 + 自动 compact**（SQL 侧复合索引支持；tombstone 比例触发） |
+| **v0.9.3.1** | 02-10 16:05 | **Auto compact 扩展**（时间/大小/chunk/写入量触发） |
+| **v0.9.3.2** | 02-10 16:08 | **N 列复合索引 SQL 优化**（前缀匹配 + 最优索引选择） |
+| **v0.9.3.3** | 02-10 16:15 | **压缩算法实现**（Delta/Delta-of-Delta/RLE；基准测试；未集成存储） |
+| **v0.9.3.4** | 02-10 16:20 | **分区表 v1**（时间/范围/哈希分区；自动分区文件管理；跨分区查询） |
+| **v0.9.3.5** | 02-10 16:25 | **流式聚合 v1**（SMA/EMA/StdDev/Min/Max；滑动窗口；多指标组合） |
+| **v0.9.3.6** | 02-10 16:30 | **分区查询优化 v1**（timeRange 提前过滤分区扫描） |
+| **v0.9.3.7** | 02-10 16:45 | **压缩工具导出** + **PartitionedTable 与 SQL 集成**（extractTimeRange + queryPartitionedTableToColumnar） |
 
 ### 后续计划（按优先级）
 
@@ -240,9 +248,12 @@ Chunk 级原子写入：
 - ✅ **自动 compact 策略**（tombstone 比例触发，可配置阈值）
 
 **🟡 中优先级**：
-- 列式压缩（Gorilla/delta 编码，减少磁盘占用）
-- 分区表（按时间/symbol 自动分区）
-- 流式聚合（增量计算）
+- ~~列式压缩（Gorilla/delta 编码）~~ ✅ 算法已实现 + 导出为公共 API（未集成到 AppendWriter 文件格式）
+- ~~分区表（按时间/symbol 自动分区）~~ ✅ v1 已完成
+- ~~流式聚合（增量计算）~~ ✅ v1 已完成
+- ~~分区查询优化（WHERE 时间范围提前过滤分区）~~ ✅ v1 已完成（timeRange 参数 + 分区范围推断）
+- ~~PartitionedTable 与 SQL 打通~~ ✅ v1 已完成（extractTimeRange + queryPartitionedTableToColumnar）
+- 压缩透明集成到 AppendWriter 文件格式（可选开关 + 向后兼容）
 
 **🟢 低优先级**：
 - 事务支持（WAL + 原子写入）

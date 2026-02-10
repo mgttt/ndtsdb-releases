@@ -7,13 +7,6 @@
 ```bash
 bun add github:mgttt/ndtsdb-releases
 ```
-
-或指定版本：
-
-```bash
-bun add github:mgttt/ndtsdb-releases#v0.9.2.6
-```
-
 ---
 
 ## 项目结构
@@ -24,5 +17,8 @@ bun add github:mgttt/ndtsdb-releases#v0.9.2.6
 
 ---
 
-⚠️ **注意**: 此仓库为自动发布仓库，不接受 PR。有问题发issues
+⚠️ **注意**: 此仓库为自动发布仓库，不接受 PR。有需求提issues。
+
+---
+
 MIT License

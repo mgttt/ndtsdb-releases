@@ -803,6 +803,41 @@ describe('Index', () => {
     expect(rows3).toEqual([0]);
   });
 
+  it('should use composite index in SQL WHERE planning (AND chain)', () => {
+    const table = new ColumnarTable([
+      { name: 'symbol', type: 'string' },
+      { name: 'timestamp', type: 'int64' },
+      { name: 'price', type: 'float64' },
+    ]);
+
+    table.appendBatch([
+      { symbol: 'BTC', timestamp: 1000n, price: 50000 },
+      { symbol: 'BTC', timestamp: 2000n, price: 51000 },
+      { symbol: 'ETH', timestamp: 1000n, price: 3000 },
+      { symbol: 'ETH', timestamp: 2000n, price: 3100 },
+      { symbol: 'BTC', timestamp: 3000n, price: 52000 },
+    ]);
+
+    table.createCompositeIndex(['symbol', 'timestamp']);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', table);
+
+    const parsed = new SQLParser().parse(
+      "SELECT price FROM t WHERE symbol = 'BTC' AND timestamp >= 2000 AND timestamp < 4000 ORDER BY timestamp ASC"
+    );
+
+    const whereExpr = (parsed as any).data.whereExpr;
+    const candidates = (executor as any).tryUseIndex(table, whereExpr);
+    expect(candidates).toBeDefined();
+    expect((candidates as number[]).sort()).toEqual([1, 4]);
+
+    const r = executor.execute(parsed) as any;
+    expect(r.rowCount).toBe(2);
+    expect(Number(r.rows[0].price)).toBe(51000);
+    expect(Number(r.rows[1].price)).toBe(52000);
+  });
+
   it('should update composite index on new inserts', () => {
     const table = new ColumnarTable([
       { name: 'category', type: 'string' },
@@ -886,6 +921,151 @@ describe('Index', () => {
     rmSync(path + '.tomb', { force: true });
   });
 
+  it('should auto-compact by chunk count threshold', async () => {
+    const path = '/tmp/test-autocompact-chunks-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'id', type: 'int32' }],
+      { autoCompact: true, compactMaxChunks: 5, compactMinRows: 1 }
+    );
+
+    writer.open();
+    // 写入 10 个小 chunk（每次 1 行）
+    for (let i = 0; i < 10; i++) {
+      writer.append([{ id: i }]);
+    }
+
+    // Close 时应触发 compact（chunk 数量 = 10 > 5）
+    await writer.close();
+
+    // 验证 compact 后 chunk 被合并
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(10);
+    expect(result.header.chunkCount).toBeLessThan(10); // compact 后应合并为更少 chunk
+
+    rmSync(path);
+  });
+
+  it('should auto-compact by write count threshold', async () => {
+    const path = '/tmp/test-autocompact-writes-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'id', type: 'int32' }],
+      { autoCompact: true, compactMaxWrites: 100, compactMinRows: 1 }
+    );
+
+    writer.open();
+    // 写入 150 行（超过 compactMaxWrites = 100）
+    const rows = Array.from({ length: 150 }, (_, i) => ({ id: i }));
+    writer.append(rows);
+
+    // Close 时应触发 compact（writesSinceCompact = 150 > 100）
+    await writer.close();
+
+    // 验证仍可正常读取
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(150);
+
+    rmSync(path);
+  });
+
+  it('should use N-column composite index in SQL (prefix matching)', () => {
+    const table = new ColumnarTable([
+      { name: 'region', type: 'string' },
+      { name: 'city', type: 'string' },
+      { name: 'timestamp', type: 'int64' },
+      { name: 'value', type: 'float64' },
+    ]);
+
+    table.appendBatch([
+      { region: 'US', city: 'NYC', timestamp: 1000n, value: 10 },
+      { region: 'US', city: 'NYC', timestamp: 2000n, value: 20 },
+      { region: 'US', city: 'LA', timestamp: 1000n, value: 30 },
+      { region: 'EU', city: 'London', timestamp: 1000n, value: 40 },
+      { region: 'US', city: 'NYC', timestamp: 3000n, value: 50 },
+    ]);
+
+    // 创建 3 列复合索引
+    table.createCompositeIndex(['region', 'city', 'timestamp']);
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', table);
+
+    // SQL 查询：前 2 列精确匹配 + 最后一列范围
+    const parsed = new SQLParser().parse(
+      "SELECT value FROM t WHERE region = 'US' AND city = 'NYC' AND timestamp >= 2000 ORDER BY timestamp ASC"
+    );
+
+    const whereExpr = (parsed as any).data.whereExpr;
+    const candidates = (executor as any).tryUseIndex(table, whereExpr);
+    expect(candidates).toBeDefined();
+    expect((candidates as number[]).sort()).toEqual([1, 4]);
+
+    const r = executor.execute(parsed) as any;
+    expect(r.rowCount).toBe(2);
+    expect(Number(r.rows[0].value)).toBe(20);
+    expect(Number(r.rows[1].value)).toBe(50);
+  });
+
+  it('should choose best composite index (most columns matched)', () => {
+    const table = new ColumnarTable([
+      { name: 'a', type: 'string' },
+      { name: 'b', type: 'string' },
+      { name: 'c', type: 'int64' },
+    ]);
+
+    table.appendBatch([
+      { a: 'x', b: 'y', c: 1000n },
+      { a: 'x', b: 'y', c: 2000n },
+      { a: 'x', b: 'z', c: 1000n },
+    ]);
+
+    // 创建两个复合索引
+    table.createCompositeIndex(['a', 'c']);        // 2 列
+    table.createCompositeIndex(['a', 'b', 'c']);   // 3 列
+
+    const executor = new SQLExecutor();
+    executor.registerTable('t', table);
+
+    // WHERE a='x' AND b='y' AND c>=1500
+    // 应优先选择 3 列索引（匹配 3 列）而非 2 列索引（匹配 2 列）
+    const parsed = new SQLParser().parse(
+      "SELECT c FROM t WHERE a = 'x' AND b = 'y' AND c >= 1500"
+    );
+
+    const whereExpr = (parsed as any).data.whereExpr;
+    const candidates = (executor as any).tryUseIndex(table, whereExpr);
+    expect(candidates).toBeDefined();
+    expect((candidates as number[]).sort()).toEqual([1]);
+
+    const r = executor.execute(parsed) as any;
+    expect(r.rowCount).toBe(1);
+    expect(Number(r.rows[0].c)).toBe(2000);
+  });
+
+  it('should auto-compact by file size threshold', async () => {
+    const path = '/tmp/test-autocompact-size-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'id', type: 'int32' }, { name: 'data', type: 'int64' }],
+      { autoCompact: true, compactMaxFileSize: 1024, compactMinRows: 1 } // 1KB
+    );
+
+    writer.open();
+    // 写入足够数据使文件 > 1KB
+    const rows = Array.from({ length: 200 }, (_, i) => ({ id: i, data: BigInt(i * 1000) }));
+    writer.append(rows);
+
+    // Close 时应触发 compact（文件大小 > 1KB）
+    await writer.close();
+
+    // 验证仍可正常读取
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(200);
+
+    rmSync(path);
+  });
+
   it('should add and check RoaringBitmap', () => {
     const bitmap = new RoaringBitmap();
     bitmap.add(1);
@@ -894,5 +1074,325 @@ describe('Index', () => {
     
     expect(bitmap.contains(100)).toBe(true);
     expect(bitmap.contains(999)).toBe(false);
+  });
+});
+
+describe('Partitioned Table', () => {
+  it('should partition by time (day)', async () => {
+    const { PartitionedTable } = require('../src/partition.js');
+    const { rmSync } = require('fs');
+
+    const basePath = '/tmp/test-partition-' + Date.now();
+    const table = new PartitionedTable(
+      basePath,
+      [{ name: 'timestamp', type: 'int64' }, { name: 'value', type: 'float64' }],
+      { type: 'time', column: 'timestamp', interval: 'day' }
+    );
+
+    // 插入跨两天的数据
+    const day1 = new Date('2024-01-15').getTime();
+    const day2 = new Date('2024-01-16').getTime();
+
+    table.append([
+      { timestamp: BigInt(day1), value: 1.0 },
+      { timestamp: BigInt(day1 + 1000), value: 2.0 },
+      { timestamp: BigInt(day2), value: 3.0 },
+      { timestamp: BigInt(day2 + 1000), value: 4.0 },
+    ]);
+
+    await table.closeAll();
+
+    // 验证分区数量
+    const partitions = table.getPartitions();
+    expect(partitions.length).toBe(2);
+    expect(partitions.find(p => p.label === '2024-01-15')?.rows).toBe(2);
+    expect(partitions.find(p => p.label === '2024-01-16')?.rows).toBe(2);
+
+    // 清理
+    rmSync(basePath, { recursive: true, force: true });
+  });
+
+  it('should partition by hash', async () => {
+    const { PartitionedTable } = require('../src/partition.js');
+    const { rmSync } = require('fs');
+
+    const basePath = '/tmp/test-partition-hash-' + Date.now();
+    const table = new PartitionedTable(
+      basePath,
+      [{ name: 'symbol', type: 'string' }, { name: 'value', type: 'float64' }],
+      { type: 'hash', column: 'symbol', buckets: 4 }
+    );
+
+    table.append([
+      { symbol: 'AAPL', value: 100 },
+      { symbol: 'GOOGL', value: 200 },
+      { symbol: 'MSFT', value: 300 },
+      { symbol: 'AMZN', value: 400 },
+    ]);
+
+    await table.closeAll();
+
+    // 验证至少有分区（具体数量取决于哈希分布）
+    const partitions = table.getPartitions();
+    expect(partitions.length).toBeGreaterThan(0);
+    expect(partitions.length).toBeLessThanOrEqual(4);
+
+    // 清理
+    rmSync(basePath, { recursive: true, force: true });
+  });
+
+  it('should query across partitions', async () => {
+    const { PartitionedTable } = require('../src/partition.js');
+    const { rmSync } = require('fs');
+
+    const basePath = '/tmp/test-partition-query-' + Date.now();
+    const table = new PartitionedTable(
+      basePath,
+      [{ name: 'timestamp', type: 'int64' }, { name: 'value', type: 'float64' }],
+      { type: 'time', column: 'timestamp', interval: 'day' }
+    );
+
+    const day1 = new Date('2024-01-15').getTime();
+    const day2 = new Date('2024-01-16').getTime();
+
+    table.append([
+      { timestamp: BigInt(day1), value: 1.0 },
+      { timestamp: BigInt(day2), value: 2.0 },
+    ]);
+
+    await table.closeAll();
+
+    // 跨分区查询
+    const results = table.query((row) => Number(row.value) >= 1.5);
+    expect(results.length).toBe(1);
+    expect(Number(results[0].value)).toBe(2.0);
+
+    // 清理
+    rmSync(basePath, { recursive: true, force: true });
+  });
+
+  it('should optimize partition scan with time range filter', async () => {
+    const { PartitionedTable } = require('../src/partition.js');
+    const { rmSync } = require('fs');
+
+    const basePath = '/tmp/test-partition-optimize-' + Date.now();
+    const table = new PartitionedTable(
+      basePath,
+      [{ name: 'timestamp', type: 'int64' }, { name: 'value', type: 'float64' }],
+      { type: 'time', column: 'timestamp', interval: 'day' }
+    );
+
+    const day1 = new Date('2024-01-15').getTime();
+    const day2 = new Date('2024-01-16').getTime();
+    const day3 = new Date('2024-01-17').getTime();
+
+    table.append([
+      { timestamp: BigInt(day1), value: 1.0 },
+      { timestamp: BigInt(day2), value: 2.0 },
+      { timestamp: BigInt(day3), value: 3.0 },
+    ]);
+
+    await table.closeAll();
+
+    // 验证有 3 个分区
+    expect(table.getPartitions().length).toBe(3);
+
+    // 只查询 day2 的数据（应该只扫描 1 个分区）
+    const results = table.query(
+      undefined,
+      { min: day2, max: day2 + 24 * 60 * 60 * 1000 - 1 }
+    );
+
+    expect(results.length).toBe(1);
+    expect(Number(results[0].value)).toBe(2.0);
+
+    // 清理
+    rmSync(basePath, { recursive: true, force: true });
+  });
+});
+
+describe('Streaming Aggregation', () => {
+  it('should compute streaming SMA', () => {
+    const { StreamingSMA } = require('../src/stream.js');
+    const sma = new StreamingSMA(3); // 3-period SMA
+
+    expect(sma.add(10)).toBeCloseTo(10); // [10]
+    expect(sma.add(20)).toBeCloseTo(15); // [10, 20]
+    expect(sma.add(30)).toBeCloseTo(20); // [10, 20, 30]
+    expect(sma.add(40)).toBeCloseTo(30); // [20, 30, 40]
+  });
+
+  it('should compute streaming EMA', () => {
+    const { StreamingEMA } = require('../src/stream.js');
+    const ema = new StreamingEMA(3); // 3-period EMA
+
+    const r1 = ema.add(10);
+    const r2 = ema.add(20);
+    const r3 = ema.add(30);
+
+    expect(r1).toBeCloseTo(10);
+    expect(r2).toBeGreaterThan(r1);
+    expect(r3).toBeGreaterThan(r2);
+    expect(ema.getValue()).toBeCloseTo(r3);
+  });
+
+  it('should compute streaming StdDev', () => {
+    const { StreamingStdDev } = require('../src/stream.js');
+    const stddev = new StreamingStdDev(3);
+
+    stddev.add(10);
+    stddev.add(10);
+    const r = stddev.add(10); // 全相同，标准差应为 0
+    expect(r).toBeCloseTo(0);
+
+    stddev.add(20); // [10, 10, 20]
+    const r2 = stddev.add(30); // [10, 20, 30]
+    expect(r2).toBeGreaterThan(0);
+  });
+
+  it('should compute multiple aggregators', () => {
+    const { StreamingAggregator, StreamingSMA, StreamingEMA, StreamingMin, StreamingMax } = require('../src/stream.js');
+
+    const agg = new StreamingAggregator();
+    agg.addAggregator('sma', new StreamingSMA(3));
+    agg.addAggregator('ema', new StreamingEMA(3));
+    agg.addAggregator('min', new StreamingMin(3));
+    agg.addAggregator('max', new StreamingMax(3));
+
+    const r1 = agg.add(10);
+    expect(r1.sma).toBeCloseTo(10);
+    expect(r1.min).toBe(10);
+    expect(r1.max).toBe(10);
+
+    const r2 = agg.add(20);
+    expect(r2.sma).toBeCloseTo(15);
+    expect(r2.min).toBe(10);
+    expect(r2.max).toBe(20);
+
+    const r3 = agg.add(30);
+    expect(r3.sma).toBeCloseTo(20);
+    expect(r3.min).toBe(10);
+    expect(r3.max).toBe(30);
+  });
+});
+
+describe('Partitioned Table + SQL Integration', () => {
+  it('should extract time range from SQL WHERE expression', () => {
+    const { extractTimeRange } = require('../src/partition-sql.js');
+    const { SQLParser } = require('../src/sql/parser.js');
+
+    const sql = "SELECT * FROM t WHERE timestamp >= 1000 AND timestamp < 2000";
+    const parsed = new SQLParser().parse(sql);
+    const whereExpr = (parsed as any).data.whereExpr;
+
+    const timeRange = extractTimeRange(whereExpr, 'timestamp');
+    expect(timeRange).toBeDefined();
+    expect(timeRange!.min).toBe(1000);
+    expect(timeRange!.max).toBe(2000);
+  });
+
+  it('should query partitioned table and convert to ColumnarTable for SQL', async () => {
+    const { PartitionedTable } = require('../src/partition.js');
+    const { queryPartitionedTableToColumnar } = require('../src/partition-sql.js');
+    const { SQLExecutor } = require('../src/sql/executor.js');
+    const { SQLParser } = require('../src/sql/parser.js');
+    const { rmSync } = require('fs');
+
+    const basePath = '/tmp/test-partition-sql-' + Date.now();
+    const partitionedTable = new PartitionedTable(
+      basePath,
+      [{ name: 'timestamp', type: 'int64' }, { name: 'value', type: 'float64' }],
+      { type: 'time', column: 'timestamp', interval: 'day' }
+    );
+
+    const day1 = new Date('2024-01-15').getTime();
+    const day2 = new Date('2024-01-16').getTime();
+
+    partitionedTable.append([
+      { timestamp: BigInt(day1), value: 10.0 },
+      { timestamp: BigInt(day1 + 1000), value: 20.0 },
+      { timestamp: BigInt(day2), value: 30.0 },
+      { timestamp: BigInt(day2 + 1000), value: 40.0 },
+    ]);
+
+    await partitionedTable.closeAll();
+
+    // SQL 查询
+    const sql = `SELECT value FROM t WHERE timestamp >= ${day2} ORDER BY value ASC`;
+    const parsed = new SQLParser().parse(sql);
+    const whereExpr = (parsed as any).data.whereExpr;
+
+    // 转换为 ColumnarTable（自动提取时间范围并优化分区扫描）
+    const table = queryPartitionedTableToColumnar(partitionedTable, whereExpr);
+
+    // 注册到 SQLExecutor
+    const executor = new SQLExecutor();
+    executor.registerTable('t', table);
+
+    // 执行 SQL
+    const result = executor.execute(parsed) as any;
+    expect(result.rowCount).toBe(2);
+    expect(Number(result.rows[0].value)).toBe(30.0);
+    expect(Number(result.rows[1].value)).toBe(40.0);
+
+    // 清理
+    rmSync(basePath, { recursive: true, force: true });
+  });
+});
+
+describe('Compression', () => {
+  it('should compress and decompress int64 with Delta encoding', () => {
+    const { DeltaEncoderInt64 } = require('../src/compression.js');
+    const encoder = new DeltaEncoderInt64();
+
+    // 单调递增序列
+    const original = new BigInt64Array([1000n, 1001n, 1002n, 1003n, 1004n]);
+    const compressed = encoder.compress(original);
+    const decompressed = encoder.decompress(compressed, original.length);
+
+    expect(decompressed.length).toBe(original.length);
+    for (let i = 0; i < original.length; i++) {
+      expect(decompressed[i]).toBe(original[i]);
+    }
+
+    // 压缩率应该不错（delta 都是 1）
+    const originalSize = original.length * 8;
+    const compressedSize = compressed.length;
+    expect(compressedSize).toBeLessThan(originalSize);
+  });
+
+  it('should compress and decompress int32 with Delta encoding', () => {
+    const { DeltaEncoderInt32 } = require('../src/compression.js');
+    const encoder = new DeltaEncoderInt32();
+
+    const original = new Int32Array([100, 105, 110, 115, 120]);
+    const compressed = encoder.compress(original);
+    const decompressed = encoder.decompress(compressed, original.length);
+
+    expect(decompressed.length).toBe(original.length);
+    for (let i = 0; i < original.length; i++) {
+      expect(decompressed[i]).toBe(original[i]);
+    }
+  });
+
+  it('should compress repeated values with RLE', () => {
+    const { RLEEncoder } = require('../src/compression.js');
+    const encoder = new RLEEncoder();
+
+    // 大量重复值
+    const original = new Int32Array([1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3]);
+    const compressed = encoder.compress(original);
+    const decompressed = encoder.decompress(compressed, original.length);
+
+    expect(decompressed.length).toBe(original.length);
+    for (let i = 0; i < original.length; i++) {
+      expect(decompressed[i]).toBe(original[i]);
+    }
+
+    // RLE 应该大幅压缩
+    const originalSize = original.length * 4;
+    const compressedSize = compressed.length;
+    const ratio = (originalSize - compressedSize) / originalSize;
+    expect(ratio).toBeGreaterThan(0.5); // 至少 50% 压缩率
   });
 });

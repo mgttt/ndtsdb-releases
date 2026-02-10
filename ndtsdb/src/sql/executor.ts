@@ -443,12 +443,140 @@ export class SQLExecutor {
 
     if (!collectPreds(expr)) return null;
 
-    // 找到第一个有索引且可用的列
+    const normalizeIndexValue = (column: string, v: any): number | bigint | null => {
+      const colArr = table.getColumn(column);
+
+      // bigint column (int64)
+      if (colArr instanceof BigInt64Array) {
+        if (typeof v === 'bigint') return v;
+        if (typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)) return BigInt(v);
+        if (typeof v === 'string' && /^[+-]?\d+$/.test(v)) {
+          try {
+            return BigInt(v);
+          } catch {}
+        }
+        return null;
+      }
+
+      // numeric columns
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+      if (typeof v === 'bigint') {
+        const n = Number(v);
+        if (Number.isFinite(n) && Number.isSafeInteger(n)) return n;
+      }
+      if (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v)) {
+        const n = Number(v);
+        if (Number.isFinite(n)) return n;
+      }
+      return null;
+    };
+
+    // 1) 复合索引（N 列：前缀精确 + 最后一列 '='|range）
+    if (typeof (table as any).getCompositeIndexes === 'function') {
+      const compositeDefs: string[][] = (table as any).getCompositeIndexes();
+
+      // 评估每个索引的匹配度，选择最优的
+      let bestIndex: string[] | null = null;
+      let bestMatchedCols = 0;
+      let bestFilters: any = null;
+
+      for (const cols of compositeDefs) {
+        if (cols.length < 2) continue;
+
+        const filters: any = {};
+        let matchedCols = 0;
+
+        // 检查前 N-1 列（前缀）：必须精确匹配（=）
+        let allPrefixMatched = true;
+        for (let i = 0; i < cols.length - 1; i++) {
+          const col = cols[i];
+          const pred = preds.find((p) => p.column === col && p.operator === '=');
+          if (!pred) {
+            allPrefixMatched = false;
+            break;
+          }
+          filters[col] = pred.value;
+          matchedCols++;
+        }
+
+        if (!allPrefixMatched) continue;
+
+        // 检查最后一列：'=' 或范围
+        const lastCol = cols[cols.length - 1];
+        const lastEq = preds.find((p) => p.column === lastCol && p.operator === '=');
+        const lastGt = preds.find((p) => p.column === lastCol && p.operator === '>');
+        const lastGte = preds.find((p) => p.column === lastCol && p.operator === '>=');
+        const lastLt = preds.find((p) => p.column === lastCol && p.operator === '<');
+        const lastLte = preds.find((p) => p.column === lastCol && p.operator === '<=');
+
+        if (lastEq) {
+          const v = normalizeIndexValue(lastCol, lastEq.value);
+          if (v == null) continue;
+          filters[lastCol] = v;
+          matchedCols++;
+        } else if (lastGte || lastGt || lastLt || lastLte) {
+          const range: any = {};
+
+          if (lastGte) {
+            const v = normalizeIndexValue(lastCol, lastGte.value);
+            if (v == null) continue;
+            range.gte = v;
+          } else if (lastGt) {
+            const v = normalizeIndexValue(lastCol, lastGt.value);
+            if (v == null) continue;
+            range.gt = v;
+          }
+
+          if (lastLt) {
+            const v = normalizeIndexValue(lastCol, lastLt.value);
+            if (v == null) continue;
+            range.lt = v;
+          } else if (lastLte) {
+            const v = normalizeIndexValue(lastCol, lastLte.value);
+            if (v == null) continue;
+            range.lte = v;
+          }
+
+          if (Object.keys(range).length === 0) continue;
+          filters[lastCol] = range;
+          matchedCols++;
+        }
+        // 如果最后一列没有条件，也可以用索引（只匹配前缀）
+
+        // 选择匹配列数最多的索引
+        if (matchedCols > bestMatchedCols) {
+          bestIndex = cols;
+          bestMatchedCols = matchedCols;
+          bestFilters = filters;
+        }
+      }
+
+      if (bestIndex && bestFilters) {
+        let candidates: number[] | null = null;
+        try {
+          candidates = (table as any).queryCompositeIndex(bestIndex, bestFilters);
+        } catch {
+          candidates = null;
+        }
+
+        if (candidates && candidates.length > 0) {
+          const result: number[] = [];
+          for (const rowIndex of candidates) {
+            if (this.evalWhereExprAt(table, expr, rowIndex)) {
+              result.push(rowIndex);
+            }
+          }
+          return result;
+        }
+      }
+    }
+
+    // 2) 单列索引
     for (const p of preds) {
       if (!table.hasIndex(p.column)) continue;
 
-      const val = p.value;
-      if (typeof val !== 'number' && typeof val !== 'bigint') continue;
+      const val = normalizeIndexValue(p.column, p.value);
+      if (val == null) continue;
 
       let candidates: number[] | null = null;
 

@@ -72,7 +72,17 @@ export { TieredStorageManager } from './cloud.js';
 // ─── 行式存储 (兼容) ─────────────────────────────────
 
 export { TSDB } from './storage.js';
-export { PartitionManager } from './partition.js';
+export { PartitionedTable, type PartitionStrategy, type PartitionMeta } from './partition.js';
+export { extractTimeRange, extractTimeRangeLegacy, queryPartitionedTableToColumnar } from './partition-sql.js';
+export {
+  SlidingWindowAggregator,
+  StreamingSMA,
+  StreamingEMA,
+  StreamingStdDev,
+  StreamingMin,
+  StreamingMax,
+  StreamingAggregator,
+} from './stream.js';
 export { SymbolTable } from './symbol.js';
 export { WAL } from './wal.js';
 
