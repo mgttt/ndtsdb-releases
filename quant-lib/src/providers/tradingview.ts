@@ -62,6 +62,11 @@ export class TradingViewProvider extends WebSocketDataProvider {
     interval: string;
   }> = new Map();
   
+  // 请求计数（用于主动重建连接，避免被 TradingView 踢）
+  private requestCount = 0;
+  private readonly REQUEST_LIMIT = 4; // 每4个请求重建（TradingView 限制约5个）
+  private isRebuilding = false;
+  
   constructor(config: TradingViewProviderConfig = {}) {
     super({
       name: 'TradingView',
@@ -128,6 +133,7 @@ export class TradingViewProvider extends WebSocketDataProvider {
       this.ws.on('open', () => {
         console.log(`✅ 已连接到 TradingView WebSocket (${this.isAnonymous ? '匿名' : '登录'}模式)`);
         this.reconnectAttempts = 0;
+        this.shouldReconnect = true;  // 重置重连标志（修复主动重建后无法自动重连的问题）
         this.startHeartbeat();
         this.isConnected = true;
         this.emit('connected');
@@ -143,6 +149,10 @@ export class TradingViewProvider extends WebSocketDataProvider {
         this.stopHeartbeat();
         this.isConnected = false;
         this.emit('disconnected');
+        
+        // 立即失败所有 pending requests（避免每个请求等待 30 秒超时）
+        this.rejectAllPending(new Error('WebSocket 连接关闭'));
+        
         this.attemptReconnect();
       });
       
@@ -156,14 +166,52 @@ export class TradingViewProvider extends WebSocketDataProvider {
       });
     });
   }
+
+  /**
+   * 立即 reject 所有 pending 请求（连接断开时使用）
+   */
+  private rejectAllPending(error: Error): void {
+    for (const [chartSession, req] of this.pendingRequests.entries()) {
+      this.pendingRequests.delete(chartSession);
+      try {
+        req.reject(error);
+      } catch {
+        // ignore
+      }
+    }
+    this.chartSessions.clear();
+  }
+
+  /**
+   * 发送消息；若连接已断开则立即 reject 对应请求
+   */
+  private sendOrReject(chartSession: string, message: any, reject: (e: Error) => void): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      reject(new Error('WebSocket 未连接'));
+      return false;
+    }
+    this.send(message);
+    return true;
+  }
   
   /**
    * 获取 K线数据
    */
   async getKlines(query: KlineQuery): Promise<Kline[]> {
-    if (!this.isConnected) {
+    // 主动重建连接（避免被 TradingView 踢）
+    if (this.requestCount > 0 && this.requestCount % this.REQUEST_LIMIT === 0) {
+      console.log(`🔄 主动重建连接（已完成 ${this.requestCount} 个请求）`);
+      // 先标记为不自动重连，防止 disconnect 触发的 attemptReconnect 和我们的 connect 竞争
+      this.shouldReconnect = false;
+      await this.disconnect();
+      await this.delay(500);  // 等待连接完全关闭
+      await this.connect();
+      this.requestCount = 0; // 重置计数
+    } else if (!this.isConnected) {
       await this.connect();
     }
+    
+    this.requestCount++; // 请求计数+1
     
     const { symbol, interval, limit = 300 } = query;
     
@@ -180,27 +228,36 @@ export class TradingViewProvider extends WebSocketDataProvider {
         interval
       });
       
+      const fail = (e: Error) => {
+        this.pendingRequests.delete(chartSession);
+        this.chartSessions.delete(symbol);
+        reject(e);
+      };
+
       // 匿名模式需要先发送认证 token
       if (this.isAnonymous) {
-        this.send({ m: 'set_auth_token', p: ['unauthorized_user_token'] });
+        if (!this.sendOrReject(chartSession, { m: 'set_auth_token', p: ['unauthorized_user_token'] }, fail)) return;
       }
-      
+
       // 创建图表会话
-      this.send({ m: 'chart_create_session', p: [chartSession, ''] });
-      
+      if (!this.sendOrReject(chartSession, { m: 'chart_create_session', p: [chartSession, ''] }, fail)) return;
+
       // 解析 symbol
       const symbolDef = this.isAnonymous
         ? `={"symbol":"${symbol}","adjustment":"none"}`
         : `={"symbol":"${symbol}","adjustment":"splits"}`;
-      
-      this.send({ m: 'resolve_symbol', p: [chartSession, 'symbol_1', symbolDef] });
-      
+
+      if (!this.sendOrReject(chartSession, { m: 'resolve_symbol', p: [chartSession, 'symbol_1', symbolDef] }, fail)) return;
+
       // 延迟发送 create_series（确保 symbol resolve 完成）
       setTimeout(() => {
-        this.send({
+        // 如果请求已经被 close/timeout 清理，则跳过
+        if (!this.pendingRequests.has(chartSession)) return;
+
+        this.sendOrReject(chartSession, {
           m: 'create_series',
           p: [chartSession, 's1', 's1', 'symbol_1', interval, limit, '']
-        });
+        }, fail);
       }, 100);
       
       // 超时处理

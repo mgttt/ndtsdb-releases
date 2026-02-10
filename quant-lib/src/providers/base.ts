@@ -261,6 +261,11 @@ export abstract class WebSocketDataProvider extends DataProvider {
       const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
       console.log(`⏳ ${delay/1000}秒后重连 (尝试 ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
       await this.delay(delay);
+      // delay 期间可能发生了手动 disconnect；这里必须再次检查
+      if (!this.shouldReconnect) {
+        console.log('⏹️  已手动断开连接，停止重连');
+        return;
+      }
       await this.connect();
     } else {
       console.error('❌ 达到最大重连次数，停止重连');
