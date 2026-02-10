@@ -1,0 +1,48 @@
+{
+  "name": "quant-lib",
+  "version": "0.1.0",
+  "description": "统一的量化数据采集、存储和分析工具库",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types/index.ts",
+    "./exchange": "./src/exchange/index.ts",
+    "./providers": "./src/providers/index.ts",
+    "./storage": "./src/storage/index.ts",
+    "./utils": "./src/utils/index.ts",
+    "./analytics": "./src/analytics/index.ts",
+    "./scheduling": "./src/scheduling/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "build": "bun build src/index.ts --outdir dist",
+    "dev": "bun run --watch examples/basic.ts",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write src/**/*.ts"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "undici": "^6.20.1",
+    "ndtsdb": "file:../ndtsdb",
+    "@moltbaby/workpool-lib": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.10",
+    "bun-types": "latest"
+  },
+  "keywords": [
+    "quant",
+    "trading",
+    "crypto",
+    "stock",
+    "market-data",
+    "kline",
+    "candlestick",
+    "binance",
+    "tradingview",
+    "investing"
+  ],
+  "author": "OpenClaw",
+  "license": "MIT"
+}

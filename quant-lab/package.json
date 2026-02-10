@@ -1,0 +1,45 @@
+{
+  "name": "quant-lab",
+  "version": "0.1.0",
+  "description": "轻量级量化策略执行引擎（QuickJS Sandbox）",
+  "type": "module",
+  "main": "./dist/engine/index.js",
+  "exports": {
+    ".": "./dist/engine/index.js",
+    "./engine": "./dist/engine/index.js",
+    "./pool": "./dist/pool/index.js",
+    "./scheduler": "./dist/scheduler/index.js",
+    "./state": "./dist/state/index.js",
+    "./types": "./dist/types.js"
+  },
+  "bin": {
+    "lab": "./scripts/lab.ts",
+    "qlab": "./src/cli.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/**/*.test.js",
+    "dev": "npm run build && node dist/scripts/run-strategy.js",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write src/**/*.ts"
+  },
+  "dependencies": {
+    "quant-lib": "file:../quant-lib",
+    "quickjs-emscripten": "^0.29.0",
+    "undici": "^6.20.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  },
+  "keywords": [
+    "quant",
+    "trading",
+    "strategy",
+    "quickjs",
+    "sandbox",
+    "bybit"
+  ],
+  "author": "OpenClaw",
+  "license": "MIT"
+}
