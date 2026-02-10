@@ -12,6 +12,9 @@
 | **策略接口** | ✅ 100% | Strategy / StrategyContext |
 | **回测引擎** | ✅ 100% | BacktestEngine（事件驱动 + 完整指标） |
 | **实盘引擎** | ✅ 100% | LiveEngine（WebSocket + Provider + 风控） |
+| **QuickJS 沙箱** | ✅ 100% | 策略代码/参数热更新 + 错误隔离 **← P0 完成** |
+| **策略池化** | ⏳ 0% | workerpool-lib 集成 **← P1 进行中** |
+| **参数优化器** | ⏳ 0% | 网格搜索/遗传算法 **← P2 计划中** |
 | **Provider 生态** | ⏳ 40% | Paper ✅ / Binance 📝 / Bybit 📝 |
 | **测试覆盖** | ⏳ 30% | 基础测试已有，待完善 |
 | **文档** | ✅ 80% | README + Provider 指南已有 |
@@ -53,30 +56,33 @@
 
 ### 最高优先级（本周）⭐
 
-#### 1. QuickJS 沙箱策略运行器
+#### 1. QuickJS 沙箱策略运行器 ✅ **100% 完成**
 **目标**：支持 `.js` 策略文件，提升迭代速度
 
 **核心优势**：
-- ✅ 热重载（无需重启引擎）
-- ✅ 安全隔离（沙箱运行）
+- ✅ 策略代码热重载（文件变化自动重启，保持状态）
+- ✅ **参数热更新**（无需重启沙箱，零停机调参）**← P0 关键利器**
+- ✅ 安全隔离（沙箱运行 + 错误隔离）
 - ✅ 纯 JS（无需编译 TypeScript）
-- ✅ 快速迭代（修改策略立即生效）
+- ✅ 快速迭代（修改策略/参数立即生效）
 
 **实现任务**：
-- [x] QuickJS 沙箱初始化（基于 v2.0 架构）✅
-- [x] 策略 API 注入（bridge: log/state）✅
-- [x] 生命周期适配（onInit/onBar/onTick → st_init/st_heartbeat）✅
-- [x] 状态持久化（bridge_stateGet/Set）✅
-- [x] 示例策略迁移（Gales.js）✅
-- [ ] **完善 bridge_placeOrder**（连接 StrategyContext 真实下单）🔥 进行中
-- [ ] **完善 bridge_cancelOrder**（连接真实撤单 API）🔥 进行中
-- [ ] **添加 bridge_getPrice**（获取最新价格）🔥 进行中
-- [ ] **添加 bridge_getPosition**（获取持仓）🔥 进行中
-- [ ] **添加 bridge_getAccount**（获取账户）🔥 进行中
-- [ ] 错误隔离与重启（异常捕获 + 自动恢复）
+- [x] QuickJS 沙箱初始化 ✅
+- [x] 策略 API 注入（bridge: log/state/price/account/order）✅
+- [x] 生命周期适配（st_init/st_heartbeat/st_stop/st_onParamsUpdate）✅
+- [x] 状态持久化（bridge_stateGet/Set + JSON 文件）✅
+- [x] **策略代码热重载**（hotReload: watchFile + 自动重启）✅
+- [x] **参数热更新**（updateParams: 无需重启沙箱）✅ **P0 完成**
+- [x] **bridge_placeOrder**（连接 StrategyContext + 队列化异步）✅
+- [x] **bridge_cancelOrder**（连接真实撤单 API）✅
+- [x] **bridge_getPrice**（缓存 + 实时更新）✅
+- [x] **bridge_getPosition**（缓存 + 定期刷新）✅
+- [x] **bridge_getAccount**（缓存 + 定期刷新）✅
+- [x] **错误隔离与自动恢复**（try-catch + 错误计数 + 自动重启）✅
 
-**预估工期**：1-2 天  
-**当前进度**：60% → 完善 Bridge API
+**完成时间**：2026-02-10  
+**提交**: `654b0a69f` (P0 参数热更新) + `89c64b25f` (完整版)  
+**测试**: `tests/test-param-hot-update.ts` 全部通过 ✅
 
 **参考**：
 - `archived/v2.0-director-worker/worker/strategy-loader.ts` - v2.0 实现
@@ -84,7 +90,66 @@
 
 ---
 
-#### 2. ndtsdb 数据持久化 ⏸️ 延后
+#### 2. 策略池化（workerpool-lib 集成）🔥 **P1 - 最高优先级**
+**目标**：并行运行多策略实例，支持参数网格搜索
+
+**核心价值**：
+- 🚀 **并行回测**（100 组参数同时跑 → 8x 加速）
+- 🎯 **参数优化**（网格搜索/遗传算法自动寻优）
+- 🔧 **资源隔离**（每个策略独立 Worker）
+- 📊 **结果聚合**（自动找最优参数 + 排行榜）
+
+**实现任务**：
+- [ ] BacktestWorker（执行单次回测任务）
+  - [ ] Task 定义（strategyId + params + dataRange）
+  - [ ] execute() 实现（加载数据 + 运行回测 + 返回指标）
+- [ ] StrategyScheduler（基于 workerpool-lib Pool）
+  - [ ] runParallelBacktests()（并行提交任务）
+  - [ ] 结果收集与排序
+- [ ] ParamOptimizer（参数优化器）
+  - [ ] gridSearch()（网格搜索）
+  - [ ] generateCombinations()（笛卡尔积）
+  - [ ] 指标选择（sharpe/sortino/calmar）
+- [ ] LiveSwitcher（自动切换实盘参数）
+  - [ ] switchParams()（撤单 + 暂停 + 更新 + 恢复）
+  - [ ] autoSwitch()（定期优化 + 阈值触发）
+
+**预估工期**：2-3 天  
+**依赖**：workerpool-lib 集成  
+**参考**：`docs/ARCHITECTURE-ASSESSMENT-HOT-UPDATE.md`
+
+---
+
+#### 3. 参数优化器 🔥 **P2 - 高优先级**
+**目标**：自动寻找最优策略参数
+
+**使用场景**：
+```typescript
+// 网格搜索
+const optimizer = new ParamOptimizer({ strategy: 'gales' });
+const result = await optimizer.gridSearch({
+  gridCount: [5, 10, 15, 20],
+  gridSpacing: [0.005, 0.01, 0.015],
+  magnetDistance: [0.001, 0.002, 0.003]
+});
+// 4×3×3 = 36 组参数，并行回测
+
+// 自动切换实盘参数（P0 已支持）
+await liveEngine.strategy.updateParams(result.bestParams);
+```
+
+**算法支持**：
+- [ ] 网格搜索（Grid Search）
+- [ ] 随机搜索（Random Search）
+- [ ] 遗传算法（Genetic Algorithm）
+- [ ] 贝叶斯优化（Bayesian Optimization）
+
+**预估工期**：2-3 天  
+**依赖**：策略池化（P1）
+
+---
+
+#### 4. ndtsdb 数据持久化 ⏸️ 延后
 **目标**：订单事件 + 盈亏分析 + 回测验证
 
 **实现任务**：
@@ -252,14 +317,16 @@
 ## 🚀 下一步行动
 
 ### 本周（2026-02-10 ~ 2026-02-16）
-1. 实现 BinanceProvider / BybitProvider
-2. 补充 GridStrategy 示例
-3. 完善测试覆盖
+1. ✅ **QuickJS 沙箱完成**（100%，含参数热更新）
+2. 🔥 **策略池化（P1）**（workerpool-lib 集成 + BacktestWorker）
+3. 🔥 **参数优化器（P2）**（网格搜索 + 自动切换）
+4. ⏳ 完善 Provider（Binance/Bybit WebSocket + REST）
 
 ### 下周（2026-02-17 ~ 2026-02-23）
-4. 回测结果可视化
-5. 策略参数优化
-6. 风控增强
+5. 回测结果可视化
+6. 补充 GridStrategy 示例
+7. 完善测试覆盖
+8. 风控增强（实盘监控 + 告警）
 
 ---
 
@@ -304,9 +371,10 @@
 | v1.0 | 独立实现 | ✅ 已弃用 |
 | v2.0 | workpool-lib 集成 | ✅ 已归档（2026-02-10） |
 | v3.0 | Strategy Engine | ✅ 2026-02-10 |
-| v3.1 | Provider 生态完善 | ⏳ 2026-02-16 |
-| v3.2 | 可视化 + 优化 | ⏳ 2026-02-23 |
-| v3.3 | 多账户 + 监控 | ⏳ 2026-03-xx |
+| **v3.1** | **QuickJS 沙箱完整版** | ✅ **2026-02-10** |
+| v3.2 | 策略池化 + 参数优化 | ⏳ 2026-02-16 |
+| v3.3 | 可视化 + Provider 完善 | ⏳ 2026-02-23 |
+| v3.4 | 多账户 + 监控 | ⏳ 2026-03-xx |
 
 ---
 
