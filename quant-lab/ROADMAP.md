@@ -318,15 +318,22 @@ await liveEngine.strategy.updateParams(result.bestParams);
 
 ### 本周（2026-02-10 ~ 2026-02-16）
 1. ✅ **QuickJS 沙箱完成**（100%，含参数热更新）
-2. 🔥 **策略池化（P1）**（workerpool-lib 集成 + BacktestWorker）
-3. 🔥 **参数优化器（P2）**（网格搜索 + 自动切换）
-4. ⏳ 完善 Provider（Binance/Bybit WebSocket + REST）
+2. 🔥 **回测数据源稳定**（P0 - 最高优先级）⭐
+   - 多数据源 fallback（Binance → CoinGecko）
+   - 数据预填充包（Top 20 币种 2020-2025）
+   - 数据下载脚本
+   - 数据覆盖率检查
+3. 🔥 **策略池化（P1）**（workerpool-lib 集成 + BacktestWorker）
+4. 🔥 **参数优化器（P2）**（网格搜索 + 自动切换）
+5. ⏳ 完善 Provider（Binance/Bybit WebSocket + REST）
 
 ### 下周（2026-02-17 ~ 2026-02-23）
-5. 回测结果可视化
-6. 补充 GridStrategy 示例
-7. 完善测试覆盖
-8. 风控增强（实盘监控 + 告警）
+6. 数据质量检查
+7. CSV 导出 + Python 可视化
+8. 回测结果可视化
+9. 补充 GridStrategy 示例
+10. 完善测试覆盖
+11. 风控增强（实盘监控 + 告警）
 
 ---
 
