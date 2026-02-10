@@ -342,6 +342,127 @@ export class AppendWriter {
   }
 
   /**
+   * 只读取 header（不读取 chunk）
+   */
+  static readHeaderOnly(path: string): AppendFileHeader {
+    const fd = openSync(path, 'r');
+    try {
+      const magicBuf = Buffer.allocUnsafe(4);
+      readSync(fd, magicBuf, 0, 4, 0);
+      if (!magicBuf.equals(MAGIC)) {
+        throw new Error('Invalid file magic');
+      }
+
+      const lenBuf = Buffer.allocUnsafe(4);
+      readSync(fd, lenBuf, 0, 4, 4);
+      const headerLen = lenBuf.readUInt32LE();
+
+      const headerBuf = Buffer.allocUnsafe(headerLen);
+      readSync(fd, headerBuf, 0, headerLen, 8);
+      return JSON.parse(headerBuf.toString());
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /**
+   * 读取最后一行（不展开全表；按 chunk 跳转到最后一个 chunk）
+   */
+  static readLastRow(path: string): Record<string, any> | null {
+    const fd = openSync(path, 'r');
+
+    const getByteLen = (t: string) => {
+      switch (t) {
+        case 'int64':
+        case 'float64':
+          return 8;
+        case 'int32':
+          return 4;
+        case 'int16':
+          return 2;
+        default:
+          return 8;
+      }
+    };
+
+    try {
+      // header
+      const magicBuf = Buffer.allocUnsafe(4);
+      readSync(fd, magicBuf, 0, 4, 0);
+      if (!magicBuf.equals(MAGIC)) throw new Error('Invalid file magic');
+
+      const lenBuf = Buffer.allocUnsafe(4);
+      readSync(fd, lenBuf, 0, 4, 4);
+      const headerLen = lenBuf.readUInt32LE();
+
+      const headerBuf = Buffer.allocUnsafe(headerLen);
+      readSync(fd, headerBuf, 0, headerLen, 8);
+      const header: AppendFileHeader = JSON.parse(headerBuf.toString());
+
+      if (header.totalRows === 0 || header.chunkCount === 0) return null;
+
+      // 跳过 header + padding + CRC
+      const headerEndOffset = 4 + 4 + headerLen;
+      const paddingSize = (8 - (headerEndOffset % 8)) % 8;
+      let offset = headerEndOffset + paddingSize + 4; // +4 for header CRC
+
+      // 走到最后一个 chunk
+      for (let c = 0; c < header.chunkCount; c++) {
+        const rcBuf = Buffer.allocUnsafe(4);
+        readSync(fd, rcBuf, 0, 4, offset);
+        const chunkRows = rcBuf.readUInt32LE();
+
+        // 最后一个 chunk
+        if (c === header.chunkCount - 1) {
+          offset += 4;
+          const out: Record<string, any> = {};
+
+          for (const col of header.columns) {
+            const byteLen = getByteLen(col.type);
+            const lastPos = offset + (chunkRows - 1) * byteLen;
+            const buf = Buffer.allocUnsafe(byteLen);
+            readSync(fd, buf, 0, byteLen, lastPos);
+
+            switch (col.type) {
+              case 'int64':
+                out[col.name] = buf.readBigInt64LE(0);
+                break;
+              case 'float64':
+                out[col.name] = buf.readDoubleLE(0);
+                break;
+              case 'int32':
+                out[col.name] = buf.readInt32LE(0);
+                break;
+              case 'int16':
+                out[col.name] = buf.readInt16LE(0);
+                break;
+              default:
+                out[col.name] = buf.readDoubleLE(0);
+            }
+
+            offset += byteLen * chunkRows;
+          }
+
+          return out;
+        }
+
+        // 跳过当前 chunk：rowCount(4) + 每列数据 + CRC(4)
+        offset += 4;
+        let chunkDataBytes = 0;
+        for (const col of header.columns) {
+          chunkDataBytes += getByteLen(col.type) * chunkRows;
+        }
+        offset += chunkDataBytes;
+        offset += 4; // chunk CRC
+      }
+
+      return null;
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /**
    * 验证文件完整性 (所有 CRC32)
    */
   static verify(path: string): { ok: boolean; errors: string[] } {

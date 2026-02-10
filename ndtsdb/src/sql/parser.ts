@@ -10,8 +10,15 @@ export interface SQLCondition {
   column: string | string[]; // 支持多列 IN: (a,b) IN ((1,2),(3,4))
   operator: SQLOperator;
   value: SQLValue | SQLValue[] | SQLValue[][];
-  logic?: 'AND' | 'OR';  // 与下一个条件的逻辑关系
+  logic?: 'AND' | 'OR';  // legacy: 与下一个条件的逻辑关系（无括号优先级）
 }
+
+// WHERE AST（支持括号优先级 + AND/OR/NOT）
+export type SQLWhereExpr =
+  | { type: 'pred'; pred: Omit<SQLCondition, 'logic'> }
+  | { type: 'and'; left: SQLWhereExpr; right: SQLWhereExpr }
+  | { type: 'or'; left: SQLWhereExpr; right: SQLWhereExpr }
+  | { type: 'not'; expr: SQLWhereExpr };
 
 export interface SQLCTE {
   name: string;
@@ -22,9 +29,12 @@ export interface SQLSelect {
   with?: SQLCTE[];
   columns: Array<string | { expr: string; alias?: string }>;
   from: string;
+  // legacy: 线性条件数组（无括号优先级）；保留兼容
   where?: SQLCondition[];
+  // new: WHERE AST（括号优先级 + AND/OR/NOT）
+  whereExpr?: SQLWhereExpr;
   groupBy?: string[];
-  orderBy?: { column: string; direction: 'ASC' | 'DESC' }[];
+  orderBy?: { expr: string; direction: 'ASC' | 'DESC' }[];
   limit?: number;
   offset?: number;
 }
@@ -225,9 +235,12 @@ export class SQLParser {
     const from = this.consumeIdentifier();
     
     let where: SQLCondition[] | undefined;
+    let whereExpr: SQLWhereExpr | undefined;
     if (this.peek()?.toUpperCase() === 'WHERE') {
       this.consume('WHERE');
-      where = this.parseWhere();
+      whereExpr = this.parseWhereExpr();
+      // 兼容：仅当可线性化时填充 legacy where[]（便于旧测试/调用方）
+      where = this.linearizeWhereExpr(whereExpr) || undefined;
     }
     
     let groupBy: string[] | undefined;
@@ -237,7 +250,7 @@ export class SQLParser {
       groupBy = this.parseIdentifierList();
     }
     
-    let orderBy: { column: string; direction: 'ASC' | 'DESC' }[] | undefined;
+    let orderBy: { expr: string; direction: 'ASC' | 'DESC' }[] | undefined;
     if (this.peek()?.toUpperCase() === 'ORDER') {
       this.consume('ORDER');
       this.consume('BY');
@@ -256,7 +269,7 @@ export class SQLParser {
       offset = parseInt(this.consume());
     }
     
-    return { columns, from, where, groupBy, orderBy, limit, offset };
+    return { columns, from, where, whereExpr, groupBy, orderBy, limit, offset };
   }
 
   // 解析 SELECT 列
@@ -321,10 +334,111 @@ export class SQLParser {
     return expr.trim();
   }
 
-  // 解析 WHERE 条件
+  // ---------------------------------------------------------------------------
+  // WHERE (AST)
+  // ---------------------------------------------------------------------------
+
+  private parseWhereExpr(): SQLWhereExpr {
+    const parseOr = (): SQLWhereExpr => {
+      let node = parseAnd();
+      while (this.peek()?.toUpperCase() === 'OR') {
+        this.consume('OR');
+        const right = parseAnd();
+        node = { type: 'or', left: node, right };
+      }
+      return node;
+    };
+
+    const parseAnd = (): SQLWhereExpr => {
+      let node = parseNot();
+      while (this.peek()?.toUpperCase() === 'AND') {
+        this.consume('AND');
+        const right = parseNot();
+        node = { type: 'and', left: node, right };
+      }
+      return node;
+    };
+
+    const parseNot = (): SQLWhereExpr => {
+      if (this.peek()?.toUpperCase() === 'NOT') {
+        this.consume('NOT');
+        return { type: 'not', expr: parseNot() };
+      }
+      return parsePrimary();
+    };
+
+    const parsePrimary = (): SQLWhereExpr => {
+      if (this.peek() === '(' && !this.isTupleLHS()) {
+        this.consume('(');
+        const inner = parseOr();
+        this.consume(')');
+        return inner;
+      }
+
+      const pred = this.parsePredicate();
+      return { type: 'pred', pred };
+    };
+
+    return parseOr();
+  }
+
+  private isTupleLHS(): boolean {
+    if (this.peek() !== '(') return false;
+    const t1 = this.tokens[this.tokenPos + 1];
+    const t2 = this.tokens[this.tokenPos + 2];
+    // (a,b) ...
+    return !!t1 && this.isIdentifierToken(t1) && t2 === ',';
+  }
+
+  private isIdentifierToken(t: string): boolean {
+    return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t);
+  }
+
+  private parsePredicate(): Omit<SQLCondition, 'logic'> {
+    // 支持多列条件：(a,b) IN ((1,2),(3,4))
+    let column: string | string[];
+    if (this.peek() === '(') {
+      this.consume('(');
+      column = this.parseIdentifierList();
+      this.consume(')');
+    } else {
+      column = this.consumeIdentifier();
+    }
+
+    const operator = this.parseOperator();
+    const value = operator === 'IN' ? this.parseInValue() : this.parseValue();
+    return { column, operator, value };
+  }
+
+  // 兼容：把简单的 WHERE AST 线性化为旧 where[]
+  private linearizeWhereExpr(expr: SQLWhereExpr): SQLCondition[] | null {
+    const preds: Array<Omit<SQLCondition, 'logic'>> = [];
+
+    const collectAnd = (n: SQLWhereExpr): boolean => {
+      if (n.type === 'pred') {
+        preds.push(n.pred);
+        return true;
+      }
+      if (n.type === 'and') {
+        return collectAnd(n.left) && collectAnd(n.right);
+      }
+      return false;
+    };
+
+    if (!collectAnd(expr)) return null;
+
+    const out: SQLCondition[] = preds.map((p) => ({ ...p } as SQLCondition));
+    for (let i = 0; i < out.length - 1; i++) out[i].logic = 'AND';
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // WHERE (legacy linear conditions)
+  // ---------------------------------------------------------------------------
+
   private parseWhere(): SQLCondition[] {
     const conditions: SQLCondition[] = [];
-    
+
     while (true) {
       // 支持多列条件：(a,b) IN ((1,2),(3,4))
       let column: string | string[];
@@ -339,19 +453,19 @@ export class SQLParser {
       const operator = this.parseOperator();
 
       const value = operator === 'IN' ? this.parseInValue() : this.parseValue();
-      
+
       conditions.push({ column, operator, value });
-      
+
       const logic = this.peek()?.toUpperCase();
       if (logic === 'AND' || logic === 'OR') {
         this.consume();
         conditions[conditions.length - 1].logic = logic as 'AND' | 'OR';
         continue;
       }
-      
+
       break;
     }
-    
+
     return conditions;
   }
 
@@ -453,28 +567,54 @@ export class SQLParser {
     return token;
   }
 
-  // 解析 ORDER BY
-  private parseOrderBy(): { column: string; direction: 'ASC' | 'DESC' }[] {
-    const orderBy: { column: string; direction: 'ASC' | 'DESC' }[] = [];
-    
+  // 解析 ORDER BY（支持表达式 / alias / ordinal）
+  private parseOrderBy(): { expr: string; direction: 'ASC' | 'DESC' }[] {
+    const orderBy: { expr: string; direction: 'ASC' | 'DESC' }[] = [];
+
     while (true) {
-      const column = this.consumeIdentifier();
+      let expr = '';
+      let depth = 0;
+
+      while (this.tokenPos < this.tokens.length) {
+        const token = this.peek();
+        if (!token) break;
+
+        const upper = token.toUpperCase();
+
+        // depth==0: 子句边界 / 逗号分隔
+        if (depth === 0 && (token === ',' || ['LIMIT', 'OFFSET'].includes(upper))) {
+          break;
+        }
+
+        // depth==0: ASC/DESC 作为方向（不属于 expr 本身）
+        if (depth === 0 && (upper === 'ASC' || upper === 'DESC')) {
+          break;
+        }
+
+        if (token === '(') depth++;
+        if (token === ')') depth = Math.max(0, depth - 1);
+
+        expr += this.consume() + ' ';
+      }
+
+      expr = expr.trim();
+      if (!expr) throw new Error('Expected ORDER BY expression');
+
       let direction: 'ASC' | 'DESC' = 'ASC';
-      
       const next = this.peek()?.toUpperCase();
       if (next === 'ASC' || next === 'DESC') {
         direction = this.consume().toUpperCase() as 'ASC' | 'DESC';
       }
-      
-      orderBy.push({ column, direction });
-      
+
+      orderBy.push({ expr, direction });
+
       if (this.peek() === ',') {
         this.consume(',');
         continue;
       }
       break;
     }
-    
+
     return orderBy;
   }
 

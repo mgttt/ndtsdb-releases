@@ -255,8 +255,9 @@ export class ColumnarTable {
 
   /**
    * SAMPLE BY 聚合（时间桶）
+   * @param intervalSize 桶大小（与 timestamp 同单位，Kline 场景下为秒）
    */
-  sampleBy(timeColumn: string, intervalMs: number, aggregations: { column: string; op: 'first' | 'last' | 'min' | 'max' | 'sum' | 'avg' }[]): Record<string, number | bigint>[] {
+  sampleBy(timeColumn: string, intervalSize: number, aggregations: { column: string; op: 'first' | 'last' | 'min' | 'max' | 'sum' | 'avg' }[]): Record<string, number | bigint>[] {
     const timestamps = this.columns.get(timeColumn) as BigInt64Array;
     if (!timestamps) throw new Error(`Time column ${timeColumn} not found`);
 
@@ -265,7 +266,7 @@ export class ColumnarTable {
 
     for (let i = 0; i < this.rowCount; i++) {
       const ts = Number(timestamps[i]);
-      const bucket = Math.floor(ts / intervalMs) * intervalMs;
+      const bucket = Math.floor(ts / intervalSize) * intervalSize;
       
       if (!buckets.has(bucket)) {
         buckets.set(bucket, []);

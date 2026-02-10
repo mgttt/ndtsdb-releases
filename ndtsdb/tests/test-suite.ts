@@ -402,6 +402,74 @@ await runTest('SELECT 表达式 + 函数 (SQRT/ROUND)', async () => {
   if (Number(rows[1].y) !== 40) throw new Error(`Expected 40, got ${rows[1].y}`);
 });
 
+await runTest('ORDER BY alias', async () => {
+  const { SQLParser } = await import('../src/sql/parser.js');
+  const { SQLExecutor } = await import('../src/sql/executor.js');
+  const { ColumnarTable } = await import('../src/columnar.js');
+
+  const table = new ColumnarTable([
+    { name: 'id', type: 'int32' },
+    { name: 'price', type: 'float64' },
+  ]);
+  table.appendBatch([{ id: 1, price: 100.0 }, { id: 2, price: 50.0 }]);
+
+  const executor = new SQLExecutor();
+  executor.registerTable('t', table);
+  const parser = new SQLParser();
+
+  const r = executor.execute(parser.parse('SELECT id, price * 2 AS p2 FROM t ORDER BY p2 DESC')) as any;
+  if (r.rows.length !== 2) throw new Error('Expected 2 rows');
+  if (r.rows[0].id !== 1) throw new Error(`Expected first id=1, got ${r.rows[0].id}`);
+  if (Number(r.rows[0].p2) !== 200) throw new Error(`Expected p2=200, got ${r.rows[0].p2}`);
+});
+
+await runTest('ORDER BY ordinal (ORDER BY 1/2)', async () => {
+  const { SQLParser } = await import('../src/sql/parser.js');
+  const { SQLExecutor } = await import('../src/sql/executor.js');
+  const { ColumnarTable } = await import('../src/columnar.js');
+
+  const table = new ColumnarTable([
+    { name: 'id', type: 'int32' },
+    { name: 'price', type: 'float64' },
+  ]);
+  table.appendBatch([{ id: 1, price: 100.0 }, { id: 2, price: 50.0 }]);
+
+  const executor = new SQLExecutor();
+  executor.registerTable('t', table);
+  const parser = new SQLParser();
+
+  const r1 = executor.execute(parser.parse('SELECT id, price FROM t ORDER BY 2 DESC')) as any;
+  if (r1.rows[0].id !== 1) throw new Error(`Expected first id=1, got ${r1.rows[0].id}`);
+
+  const r2 = executor.execute(parser.parse('SELECT id, price FROM t ORDER BY 1 DESC')) as any;
+  if (r2.rows[0].id !== 2) throw new Error(`Expected first id=2, got ${r2.rows[0].id}`);
+});
+
+await runTest('ORDER BY scalar expr + multi key', async () => {
+  const { SQLParser } = await import('../src/sql/parser.js');
+  const { SQLExecutor } = await import('../src/sql/executor.js');
+  const { ColumnarTable } = await import('../src/columnar.js');
+
+  const table = new ColumnarTable([
+    { name: 'id', type: 'int32' },
+    { name: 'price', type: 'float64' },
+  ]);
+  table.appendBatch([
+    { id: 1, price: 100.0 },
+    { id: 2, price: 100.0 },
+    { id: 3, price: 50.0 },
+  ]);
+
+  const executor = new SQLExecutor();
+  executor.registerTable('t', table);
+  const parser = new SQLParser();
+
+  // price 相同则按 id ASC
+  const r = executor.execute(parser.parse('SELECT * FROM t ORDER BY price * 2 DESC, id ASC')) as any;
+  const ids = r.rows.map((x: any) => x.id).join(',');
+  if (ids !== '1,2,3') throw new Error(`Expected order 1,2,3 got ${ids}`);
+});
+
 await runTest('CREATE TABLE + INSERT', async () => {
   const { SQLParser } = await import('../src/sql/parser.js');
   const { SQLExecutor } = await import('../src/sql/executor.js');

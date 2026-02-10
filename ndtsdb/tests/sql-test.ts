@@ -99,6 +99,10 @@ executeQuery('SELECT * FROM trades');
 executeQuery('SELECT symbol, price FROM trades WHERE price > 100');
 executeQuery('SELECT * FROM trades ORDER BY price DESC LIMIT 3');
 
+// 测试 2.0: 复杂 WHERE（括号 + AND/OR/NOT 优先级）
+executeQuery("SELECT symbol, price FROM trades WHERE (symbol = 0 AND price > 101) OR (symbol = 1 AND price > 150)");
+executeQuery("SELECT symbol, price FROM trades WHERE NOT (symbol = 0 AND price > 101)");
+
 // 测试 2.1: CTE + 多列 IN + 字符串拼接
 console.log('\n🧩 测试 2.1: CTE + 多列 IN + 字符串拼接\n');
 
@@ -163,6 +167,56 @@ console.log(`   耗时: ${perfTime.toFixed(2)}ms`);
 console.log(`   扫描: 100000 行`);
 console.log(`   返回: ${(perfResult as any).rowCount} 行`);
 console.log(`   速度: ${(100000 / perfTime * 1000 / 1000000).toFixed(1)}M rows/s`);
+
+// 测试 2.2: Inline Window + PARTITION BY fast-path（波动率脚本模式）
+console.log('\n🧩 测试 2.2: Inline Window (STDDEV in expression) + PARTITION BY fast-path\n');
+
+const volTable = new ColumnarTable([
+  { name: 'base_currency', type: 'string' },
+  { name: 'quote_currency', type: 'string' },
+  { name: 'timestamp', type: 'int64' },
+  { name: 'close', type: 'float64' },
+]);
+
+// 模拟 2 个 symbol，每个 10 条数据
+const volData = [];
+for (let i = 0; i < 10; i++) {
+  volData.push({ base_currency: 'AAPL', quote_currency: 'USD', timestamp: BigInt(i), close: 100 + i });
+}
+for (let i = 0; i < 10; i++) {
+  volData.push({ base_currency: 'TSLA', quote_currency: 'USD', timestamp: BigInt(i), close: 200 + i * 2 });
+}
+volTable.appendBatch(volData);
+executor.registerTable('vol_klines', volTable);
+
+// 测试 inline window：STDDEV(close) OVER (...) / close 作为表达式
+const volQuery = `
+  WITH periods AS (
+    SELECT
+      base_currency,
+      quote_currency,
+      close AS price,
+      STDDEV(close) OVER (
+        PARTITION BY base_currency, quote_currency
+        ORDER BY timestamp
+        ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+      ) / close * 100 AS vol_pct,
+      ROW_NUMBER() OVER (PARTITION BY base_currency, quote_currency ORDER BY timestamp DESC) AS rn
+    FROM vol_klines
+  )
+  SELECT
+    base_currency || '/' || quote_currency AS symbol,
+    price,
+    ROUND(vol_pct, 2) AS vol_pct
+  FROM periods
+  WHERE rn = 1
+  ORDER BY symbol ASC
+`;
+
+const volStart = performance.now();
+executeQuery(volQuery);
+const volTime = performance.now() - volStart;
+console.log(`   耗时: ${volTime.toFixed(2)}ms (应走 PARTITION BY fast-path，只计算每分区最后一行)`);
 
 console.log('\n' + '=' .repeat(60));
 console.log('\n✅ SQL 测试完成！');

@@ -4,53 +4,21 @@
 
 **核心已完成** — 从零到一个功能完整的嵌入式时序数据库。
 
-### 迁移发现的问题 (quant-lib → ndtsdb)
+### 迁移中暴露的引擎限制（仅记录 *引擎* 侧问题）
 
-从 DuckDB 迁移到 ndtsdb 过程中发现的架构限制：
+> ndtsdb 的职责边界与非目标见：`docs/SCOPE.md`。
+
+从典型时序场景迁移/落地过程中，和“引擎本体”强相关的限制：
 
 | 限制 | 影响 | 当前 workaround | 优先级 |
 |------|------|-----------------|--------|
-| **Append-only 写入** | 无法 DELETE/UPDATE，需重写整个文件 | 读取→过滤→重写 | 🔴 高 |
-| **有限 SQL 支持** | 无 JOIN、子查询、复杂 WHERE | 手动 TS 过滤 | 🔴 高 |
-| **无二级索引** | SymbolTable 仅支持主键，无范围索引 | 全表扫描 | 🟡 中 |
-| **字符串字典编码** | 需手动管理 SymbolTable | 封装在 Provider 层 | 🟡 中 |
-| **无事务支持** | 无 ACID，chunk 写入可能部分失败 | CRC32 + 定期备份 | 🟡 中 |
-| **分析能力弱** | ~~无 GROUP BY、窗口函数~~ ✅ 已实现 | 阻塞波动率计算 | ✅ **已解决** |
+| **Append-only 写入** | 无法 DELETE/UPDATE，需重写整个文件 | 读取→过滤→重写 / compact | 🔴 高 |
+| **有限 SQL 支持** | JOIN、子查询、复杂 WHERE 覆盖不足 | 逐步补齐 SQL 子集 | 🔴 高 |
+| **无二级索引** | 范围查询/复合过滤可能退化为全表扫描 | 全表扫描 / 未来 BTree | 🟡 中 |
+| **字符串持久化** | string 目前仅内存可用（CTE/materialize 场景 OK） | 暂不持久化 | 🟡 中 |
+| **无事务支持** | 无 ACID/WAL | CRC + 原子重写（未来） | 🟡 中 |
 
-#### 迁移落地（集成层）额外发现
-
-⚠️ **重要：以下问题是 quant-lib 层的适配工作，不是 ndtsdb 引擎的责任**
-
-这些阻塞问题需在 **quant-lib** 层修复，避免在 ndtsdb 做无谓开发：
-
-- **KlineDatabase 兼容层（quant-lib 层）**：`quant-lib/src/storage/database.ts` 中的 `KlineDatabase` 类在迁移时丢失了原 DuckDB 版本的关键方法，导致上层组件无法运行。
-  - ❌ 方法名变更：`connect()` → `init()`，`upsertKlines()` → `insertKlines()`
-  - ❌ 方法缺失：`getLatestTimestamp()`、`getLatestKline()` 未实现
-  - ❌ 影响：`SmartKlineCache`（`upsertKlines`、`getLatestTimestamp`）、采集策略等直接崩溃
-  - ✅ **修复位置**：`quant-lib/src/storage/database.ts`（添加兼容方法/别名）
-  - ✅ **ndtsdb 无需改动**：ndtsdb 只提供底层存储，`KlineDatabase` 是 quant-lib 的业务封装
-
-- **timestamp 单位不一致（秒 vs 毫秒）**：Provider 输出 timestamp=Unix 秒，但部分脚本仍按毫秒计算 age/barsNeeded，导致拉取数量被放大 1000 倍。
-- **DuckDB 残留工具链/文档**：duckdb-async 已从主依赖移除，但 `export/validate/migrate` 等工具仍 import duckdb-async；同时仍存在 `klines.duckdb` 的路径叙述，需明确“迁移工具是否保留/如何隔离”。
-- **TypeScript/tsc 生态打包问题（NodeNext）**：在部分 tsc 编译环境中出现 `Cannot find module 'ndtsdb'`（依赖解析/类型声明可见性问题），需要明确 ndtsdb 的 types/exports 与安装方式，保证被下游稳定消费。
-
-**结论**：ndtsdb 适合**追加型时序数据**（K线、Tick），不适合**频繁更新**的 OLTP 场景。
-
----
-
-### 架构分层与责任边界
-
-| 层级 | 代码位置 | 职责 | 当前状态 |
-|------|----------|------|----------|
-| **ndtsdb** | `ndtsdb/src/` | 核心存储引擎：ColumnarTable、AppendWriter、SQL 执行器等 | ✅ 功能完整 |
-| **quant-lib** | `quant-lib/src/storage/` | 业务封装层：KlineDatabase、Provider 抽象、缓存层 | ⚠️ 需适配 |
-| **quant-lab** | `quant-lab/src/` | 应用层：策略、采集任务、报表 | ⚠️ 部分脚本需更新 |
-
-**关键澄清**：
-- `KlineDatabase` 是 **quant-lib** 层的类，不是 ndtsdb 的一部分
-- 迁移时 `KlineDatabase` 从 DuckDB 改为 ndtsdb 实现，但**接口未保持兼容**
-- 修复 `connect()`/`upsertKlines()`/`getLatestTimestamp()` 等方法的缺失，是 **quant-lib 层的任务**
-- ndtsdb 已提供所有必要的基础能力（`insertKlines`、`queryKlines` 等），无需改动
+> ⚠️ 诸如 Provider/业务封装/缓存/时间戳单位等“集成层/业务层”议题，**不在 ndtsdb roadmap** 内，应由上层应用库负责。
 
 ---
 
@@ -78,46 +46,17 @@
 
 ## 下一步方向
 
-### 🔴 高优先级（解决迁移阻塞问题）
+### 🔴 高优先级（引擎侧）
 
-**P0: 迁移稳定性（KlineDatabase 兼容层 + 时间戳语义统一）** ⭐⭐⭐⭐⭐
+**P0: SQL（引擎 SQL 子集补齐）** ⭐⭐⭐⭐⭐
 
-**目标**：让 quant-lib/quant-lab 在“完全不依赖 DuckDB”的前提下，端到端能跑通采集、缓存、报表、paper-trading。
-
-**需要落地的最小改动集**：
-
-1) **补齐 KlineDatabase 的兼容层（不要让上层代码被迫大改）**
-- `connect()` 作为 `init()` 的 alias（或保留 connect 并内部调用 init）
-- 实现/恢复：
-  - `upsertKlines(klines)`（可先走：读取→去重→排序→重写/或小范围 overlap 合并）
-  - `getLatestTimestamp(symbol, interval)`（优先 O(1)/O(logN)；短期可读末尾 chunk，避免全量 readAll）
-  - `getLatestKline(symbol, interval)`
-
-2) **时间戳语义“一刀切”**
-- 全链路固定：Kline.timestamp = **Unix 秒**
-- 所有脚本计算 barsNeeded/age/window 时，统一用秒（必要时：`Date.now()` → `Math.floor(Date.now()/1000)`）
-- 在关键入口加断言/监控（例如：发现 timestamp > 1e12 直接判定为毫秒并报错）
-
-3) **迁移工具链隔离策略（决定是否保留 DuckDB 工具）**
-- 如果保留 `export-duckdb-klines / validate-ndtsdb-migration`：
-  - 将 duckdb-async 作为**可选 dev 工具依赖**，不要污染运行时依赖
-  - 或者拆出独立包/目录（例如 `tools/duckdb-*` + 单独 lock/deps）
-- 文档明确：DuckDB 仅用于“历史数据导出”，生产链路不依赖
-
-4) **回归测试（防止迁移反复拉扯）**
-- 增加最小端到端：采集 → upsert → latestTs → 生成波动率/指标（即使先不走 SQL）
-
----
-
-**P0: SQL（迁移还剩的“真阻塞项”）** ⭐⭐⭐⭐⭐
-
-> 已完成（已挪到文末“✅ 已完成（SQL 扩展）”）：窗口函数、GROUP BY、CTE (WITH)、多列 IN、字符串拼接 `||`、ROUND/SQRT。
+> 已实现能力清单：见 `docs/FEATURES.md`。
 
 **仍需补齐 / 优化的 SQL 能力（按迁移阻塞程度排序）**：
 
 | 功能 | 状态 | 说明 | 优先级 |
 |------|------|------|--------|
-| **PARTITION BY 性能/一致性** | ⚠️ 部分可用 | 通用路径可用；但 `tryExecuteTailWindow` 快速路径会拒绝带 PARTITION BY，导致“多标的取每分区最后一行”场景会退化成全量 row object 化 | 🔴 P0 |
+| **PARTITION BY 性能/一致性** | ✅ 已实现 | 通用路径可用；新增 `tryExecutePartitionTail` 快速路径，专门优化 CTE + PARTITION BY + ROW_NUMBER + WHERE rn=1 模式（波动率脚本典型查询），避免全表物化 | ✅ P0 |
 | **复杂 WHERE 表达式** | ❌ 缺失 | 括号优先级 + `AND/OR/NOT`（现在还是线性 conditions），为 HAVING/子查询/CASE 打基础 | 🟡 P1 |
 | **ORDER BY <expr>** | ❌ 缺失 | 目前仅支持列名（对齐 SQLite/DuckDB：支持表达式排序） | 🟡 P1 |
 | **HAVING** | ❌ 缺失 | GROUP BY 后过滤 | 🟢 P2 |
@@ -257,20 +196,9 @@ Chunk 级原子写入：
 
 ---
 
-## ✅ 已完成（SQL 扩展，已移到后方）
+## ✅ 已实现功能（不再放 roadmap）
 
-这些能力已经实现，保留在 roadmap 里但不再阻塞迁移：
-
-- ✅ 窗口函数：`STDDEV/VARIANCE/ROW_NUMBER/... OVER (ORDER BY ... ROWS BETWEEN ...)`
-- ✅ GROUP BY 聚合：`COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/FIRST/LAST`
-- ✅ CTE：`WITH t AS (SELECT ...) SELECT ... FROM t`
-- ✅ 多列 IN：`WHERE (a,b) IN ((1,2),(3,4))`（含 string）
-- ✅ 字符串拼接：`a || '/' || b`
-- ✅ 标量函数：`ROUND/SQRT/ABS/LN/LOG/EXP/POW/MIN/MAX`
-
-已验证脚本：
-- `quant-lib/scripts/calculate-volatility.ts`
-- `quant-lib/scripts/futu-positions-volatility.ts`（SQL 语法层已迁移；性能优化与依赖收尾见上方 P0/P1）
+已实现能力清单不再在 roadmap 重复维护，统一放在：`docs/FEATURES.md`。
 
 ---
 
@@ -287,8 +215,8 @@ Chunk 级原子写入：
 | **v0.9.0** | 02-09 PM | **io_uring 评估** → 结论：不适合小文件场景 |
 | **v0.9.0** | 02-09 PM | **Gorilla 压缩移入 C** (3.9M/s 压缩, 11.5M/s 解压) |
 | **v0.9.0** | 02-09 PM | **重命名 data-lib → ndtsdb** |
-| **v0.10.0** | 02-09 PM | **quant-lib 完全迁移** → DuckDB 依赖移除 |
-| **v0.10.1** | 02-09 22:15 | **修复 quant-lib scripts**: `db.connect()` → `db.init()`, 路径 `klines.duckdb` → `ndtsdb/` |
+| **v0.10.0** | 02-09 PM | **下游集成验证**：DuckDB 依赖移除 |
+| **v0.10.1** | 02-09 22:15 | **下游脚本修复**：接口/路径收敛（connect/init、旧路径迁移） |
 | **v0.10.2** | 02-09 23:00 | **SQL 窗口函数**: 已实现 STDDEV/ROW_NUMBER/AVG... OVER (ORDER BY ... ROWS BETWEEN) |
 | **v0.10.2** | 02-09 23:00 | **SQL GROUP BY**: 已实现 COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/FIRST/LAST |
 
@@ -296,8 +224,9 @@ Chunk 级原子写入：
 
 | 版本 | 优先级 | 目标 |
 |------|--------|------|
-| **v0.11.0** | ✅ **已完成** | **SQL CTE (WITH) + 多列 IN + `||` + ROUND/SQRT**（已可支撑 `futu-positions-volatility.ts` 的 SQL 写法） |
-| **v0.11.1** | 🔴 **P0** | **PARTITION BY fast-path 统一 + 复杂 WHERE（括号优先级 / AND-OR-NOT）** |
+| **v0.11.0** | ✅ **已完成** | **SQL CTE (WITH) + 多列 IN + `||` + ROUND/SQRT** |
+| **v0.11.1** | ✅ **已完成** | **Inline Window + PARTITION BY fast-path 统一**（典型“每分区取最新一行”的窗口报表，避免全表物化） |
+| **v0.11.2** | ✅ **已完成（部分）** | **复杂 WHERE（括号优先级 / AND-OR-NOT）** ✅；`ORDER BY <expr>` 🟡 |
 | **v0.12.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
 | **v0.13.0** | 🔴 高 | SQL JOIN + 子查询 + HAVING |
 | **v0.14.0** | 🟡 中 | 自动二级索引（BTree） |

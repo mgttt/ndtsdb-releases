@@ -5,7 +5,7 @@
 // ============================================================
 
 import { ColumnarTable, type ColumnarType } from '../columnar.js';
-import type { SQLStatement, SQLSelect, SQLCTE, SQLCondition, SQLOperator, SQLUpsert, SQLCreateTable } from './parser.js';
+import type { SQLStatement, SQLSelect, SQLCTE, SQLCondition, SQLWhereExpr, SQLOperator, SQLUpsert, SQLCreateTable } from './parser.js';
 
 type RollingStdFn = (src: Float64Array, window: number) => Float64Array;
 
@@ -125,13 +125,26 @@ export class SQLExecutor {
 
   // 执行 SELECT
   private executeSelect(select: SQLSelect): SQLQueryResult {
-    const restore = select.with && select.with.length > 0 ? this.installCTEs(select.with) : null;
+    let restore: null | (() => void) = null;
 
     try {
+      // Fast path 0: 尝试在不 materialize CTE 的情况下执行（避免大表全量物化）
+      if (select.with && select.with.length === 1) {
+        const cte = select.with[0];
+        const baseTable = this.getTable(cte.select.from);
+        if (baseTable) {
+          const partTail = this.tryExecutePartitionTail(select, cte.name, cte.select, baseTable);
+          if (partTail) return partTail;
+        }
+      }
+
+      // 常规路径：安装/物化 CTE
+      restore = select.with && select.with.length > 0 ? this.installCTEs(select.with) : null;
+
       const table = this.getTable(select.from);
       if (!table) throw new Error(`Table not found: ${select.from}`);
 
-      // Fast path: tail window query (典型用于波动率脚本：ORDER BY ts DESC LIMIT 1 + 多个 STDDEV(...) OVER (...))
+      // Fast path 1: simple tail window (no PARTITION BY)
       const tail = this.tryExecuteTailWindow(select, table);
       if (tail) return tail;
 
@@ -139,7 +152,9 @@ export class SQLExecutor {
 
     // WHERE 过滤
     let rowIndices: number[] | undefined;
-    if (select.where && select.where.length > 0) {
+    if ((select as any).whereExpr) {
+      rowIndices = this.evaluateWhereExpr(table, (select as any).whereExpr);
+    } else if (select.where && select.where.length > 0) {
       rowIndices = this.evaluateWhere(table, select.where);
     }
 
@@ -148,7 +163,7 @@ export class SQLExecutor {
       let rows = this.extractRows(table, allColumns, rowIndices);
 
       if (select.orderBy && select.orderBy.length > 0) {
-        rows = this.executeOrderBy(rows, select.orderBy);
+        rows = this.executeOrderBy(rows, select.orderBy, allColumns);
       }
       if (select.offset !== undefined) rows = rows.slice(select.offset);
       if (select.limit !== undefined) rows = rows.slice(0, select.limit);
@@ -165,21 +180,32 @@ export class SQLExecutor {
     // 简化实现：直接抽全列，后续再按需裁剪（在大表上可优化）
     let baseRows = this.extractRows(table, allColumns, rowIndices);
 
-    // 计算窗口函数 + 别名映射（在 baseRows 上追加派生列）
-    this.applyWindowAndAliases(baseRows, selections);
+    // 提取内嵌窗口函数（如 vol_1d / price 中的 STDDEV(...) OVER (...)）
+    const { selections: rewrittenSel, windowItems } = this.prepareInlineWindows(selections);
+
+    // 计算窗口函数（包括内嵌的）+ 别名映射（在 baseRows 上追加派生列）
+    this.applyWindowAndAliases(baseRows, rewrittenSel);
+    for (const item of windowItems) {
+      const values = this.computeWindowColumn(baseRows, item.spec);
+      for (let i = 0; i < baseRows.length; i++) {
+        baseRows[i][item.name] = values[i];
+      }
+    }
 
     // 投影 / GROUP BY
     let rows: Array<Record<string, any>>;
     if (select.groupBy && select.groupBy.length > 0) {
       // 当前实现不支持「GROUP BY + 窗口函数」混用（后续可扩展）
-      rows = this.executeGroupBy(baseRows, selections, select.groupBy);
+      rows = this.executeGroupBy(baseRows, rewrittenSel, select.groupBy);
     } else {
-      rows = baseRows.map((r) => this.projectRow(r, selections));
+      rows = baseRows.map((r) => this.projectRow(r, rewrittenSel));
     }
+
+    const outputColumns = selections.map((s) => s.name);
 
     // ORDER BY
     if (select.orderBy && select.orderBy.length > 0) {
-      rows = this.executeOrderBy(rows, select.orderBy);
+      rows = this.executeOrderBy(rows, select.orderBy, outputColumns);
     }
 
     // LIMIT/OFFSET
@@ -205,7 +231,8 @@ export class SQLExecutor {
         continue;
       }
 
-      const expr = this.normalizeExpr(s.expr);
+      const rawExpr = (s as any).__rewrittenExpr ?? s.expr;
+      const expr = this.normalizeExpr(rawExpr);
 
       // 纯列名
       if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr)) {
@@ -244,6 +271,34 @@ export class SQLExecutor {
       }
 
       if (match) matching.push(i);
+    }
+
+    return matching;
+  }
+
+  private evaluateWhereExpr(table: ColumnarTable, expr: SQLWhereExpr): number[] {
+    const matching: number[] = [];
+    const rowCount = table.getRowCount();
+
+    const evalNode = (rowIndex: number, n: SQLWhereExpr): boolean => {
+      switch (n.type) {
+        case 'pred': {
+          const v = this.getConditionValue(table, n.pred.column as any, rowIndex);
+          return this.evaluateCondition(v, n.pred.operator as any, (n.pred as any).value);
+        }
+        case 'and':
+          return evalNode(rowIndex, n.left) && evalNode(rowIndex, n.right);
+        case 'or':
+          return evalNode(rowIndex, n.left) || evalNode(rowIndex, n.right);
+        case 'not':
+          return !evalNode(rowIndex, n.expr);
+        default:
+          return false;
+      }
+    };
+
+    for (let i = 0; i < rowCount; i++) {
+      if (evalNode(i, expr)) matching.push(i);
     }
 
     return matching;
@@ -342,13 +397,17 @@ export class SQLExecutor {
     // 条件尽量保守：只优化我们确定的波动率模式
     if (!select.limit || select.limit !== 1) return null;
     if (select.offset !== undefined) return null;
+    if ((select as any).whereExpr) return null;
     if (select.where && select.where.length > 0) return null;
     if (select.groupBy && select.groupBy.length > 0) return null;
     if (!select.orderBy || select.orderBy.length !== 1) return null;
 
     const ob = select.orderBy[0];
     if (ob.direction !== 'DESC') return null;
-    const orderCol = ob.column;
+
+    const orderExpr = this.normalizeExpr(ob.expr);
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(orderExpr)) return null;
+    const orderCol = orderExpr;
 
     if (!table.getColumnNames || !table.getColumn) return null;
 
@@ -493,6 +552,325 @@ export class SQLExecutor {
     }
   }
 
+  /**
+   * Fast path: CTE + PARTITION BY + ROW_NUMBER() ... DESC + WHERE rn=1
+   * 典型场景：波动率脚本的 periods CTE，只取每个 symbol 的最新一行
+   */
+  private tryExecutePartitionTail(
+    select: SQLSelect,
+    cteName: string,
+    cteSelect: SQLSelect,
+    baseTable: ColumnarTable
+  ): SQLQueryResult | null {
+    // 1) 检查外层是 FROM cte + WHERE rn=1
+    if (select.from !== cteName) return null;
+
+    let whereOk = false;
+    if (select.where && select.where.length === 1) {
+      const c = select.where[0];
+      whereOk = c.column === 'rn' && c.operator === '=' && c.value === 1;
+    } else if ((select as any).whereExpr && (select as any).whereExpr.type === 'pred') {
+      const p = (select as any).whereExpr.pred;
+      whereOk = p.column === 'rn' && p.operator === '=' && (p as any).value === 1;
+    }
+    if (!whereOk) return null;
+
+    // 2) 检查 CTE 包含 ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ... DESC) AS rn
+    const rnSel = cteSelect.columns.find((c: any) => (c.alias || c.expr) === 'rn');
+    if (!rnSel) return null;
+    const rnExpr = typeof rnSel === 'string' ? rnSel : rnSel.expr;
+    const rnSpec = this.parseWindowExpr(rnExpr);
+    if (!rnSpec || rnSpec.func !== 'row_number') return null;
+    if (!rnSpec.partitionBy || rnSpec.partitionBy.length === 0) return null;
+    if (!rnSpec.orderBy || rnSpec.orderBy.direction !== 'DESC') return null;
+    const orderCol = rnSpec.orderBy.column;
+
+    // 3) 收集 CTE 中的其他窗口函数（需要按 partition 计算 tail）
+    const cteSelections: SelectItem[] = cteSelect.columns.map((c: any) =>
+      typeof c === 'string' ? { expr: c, name: c } : { expr: c.expr, name: c.alias || c.expr }
+    );
+    const { selections: rewrittenCteSel, windowItems } = this.prepareInlineWindows(cteSelections);
+
+    // 额外：CTE 选择项本身可能就是窗口函数（例如 ROW_NUMBER() OVER (...) AS rn）
+    const standaloneWindowItems: Array<{ spec: WindowSpec; name: string; rawExpr: string }> = [];
+    for (const s of rewrittenCteSel) {
+      const spec = this.parseWindowExpr(s.expr);
+      if (spec) standaloneWindowItems.push({ spec, name: s.name, rawExpr: s.expr });
+    }
+
+    // 4) 确定 partition 边界（按 partition columns + orderCol 排序后的连续段）
+    const partCols = rnSpec.partitionBy;
+    let partitions = this.findPartitions(baseTable, partCols, orderCol, 'DESC');
+
+    // 4.1) 尝试从 CTE 的 WHERE 提取“分区级过滤”（典型：WHERE (a,b) IN (...)）
+    if (cteSelect.where && cteSelect.where.length > 0) {
+      const predFilter = this.tryBuildPartitionFilter(baseTable, partCols, cteSelect.where);
+      if (!predFilter) return null; // 有 WHERE 但无法安全优化 → 回退常规执行
+      partitions = partitions.filter(({ end }) => predFilter(end));
+    } else if ((cteSelect as any).whereExpr) {
+      // 有 whereExpr 但未线性化：为了正确性直接回退
+      return null;
+    }
+
+    // 5) 对每个 partition 计算最后一行的各窗口值
+    const rows: Array<Record<string, any>> = [];
+    for (const { start, end } of partitions) {
+      const lastIdx = end;
+      const row: Record<string, any> = {};
+
+      // 复制纯列值（同时保留原列名，避免后续表达式引用到原名时变成 undefined）
+      for (const sel of rewrittenCteSel) {
+        const expr = this.normalizeExpr((sel as any).__rewrittenExpr ?? sel.expr);
+        if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr)) {
+          const col = baseTable.getColumn(expr);
+          if (col) {
+            const v = (col as any)[lastIdx];
+            if (row[expr] === undefined) row[expr] = v;
+            row[sel.name] = v;
+          }
+        }
+      }
+
+      // 计算 standalone window（如 rn）
+      for (const item of standaloneWindowItems) {
+        // ROW_NUMBER() OVER (... ORDER BY ... DESC) 在“最新一行”上恒为 1
+        if (item.spec.func === 'row_number' && item.spec.orderBy?.direction === 'DESC') {
+          row[item.name] = 1;
+          continue;
+        }
+
+        const val = this.computeWindowTailPartition(baseTable, lastIdx, item.spec, start);
+        row[item.name] = val;
+      }
+
+      // 计算 inline window（表达式里嵌套的窗口）
+      for (const item of windowItems) {
+        const val = this.computeWindowTailPartition(baseTable, lastIdx, item.spec, start);
+        row[item.name] = val;
+      }
+
+      // 标量表达式（如 base || '/' || quote；或对 inline window 占位符做算术）
+      for (const sel of rewrittenCteSel) {
+        if (row[sel.name] !== undefined) continue;
+        const rawExpr = (sel as any).__rewrittenExpr ?? sel.expr;
+        const expr = this.normalizeExpr(rawExpr);
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(expr)) {
+          row[sel.name] = this.evalScalarExpr(expr, row);
+        }
+      }
+
+      rows.push(row);
+    }
+
+    // 6) 应用外层投影（scalar 表达式，如 vol_1d_pct）
+    const outerSelections: SelectItem[] = select.columns.map((c: any) =>
+      typeof c === 'string' ? { expr: c, name: c } : { expr: c.expr, name: c.alias || c.expr }
+    );
+    const { selections: rewrittenOuter } = this.prepareInlineWindows(outerSelections);
+    let finalRows = rows.map((r) => this.projectRow(r, rewrittenOuter));
+
+    // 外层 ORDER BY / LIMIT/OFFSET（分区数通常远小于总行数，可直接排序切片）
+    if (select.orderBy && select.orderBy.length > 0) {
+      finalRows = this.executeOrderBy(finalRows, select.orderBy, outerSelections.map((s) => s.name));
+    }
+    if (select.offset !== undefined) finalRows = finalRows.slice(select.offset);
+    if (select.limit !== undefined) finalRows = finalRows.slice(0, select.limit);
+
+    return {
+      columns: outerSelections.map((s) => s.name),
+      rows: finalRows,
+      rowCount: finalRows.length,
+    };
+  }
+
+  /**
+   * 查找 partitions（返回每个分区的 [start, end] 索引，包含 end）
+   * 假设 table 已按 orderCol 在 partition 内有序
+   */
+  private tryBuildPartitionFilter(
+    table: ColumnarTable,
+    partCols: string[],
+    where: SQLCondition[]
+  ): ((rowIndex: number) => boolean) | null {
+    // 仅支持 AND 链（legacy where[] 本身不表达括号/优先级）
+    for (let i = 0; i < where.length - 1; i++) {
+      if ((where[i].logic || 'AND') !== 'AND') return null;
+    }
+
+    // tuple IN: WHERE (a,b) IN ((..),(..))
+    const tuple = where.find((c) => Array.isArray(c.column));
+    let tupleSet: Set<string> | null = null;
+    if (tuple) {
+      const cols = tuple.column as string[];
+      if (tuple.operator !== 'IN') return null;
+      if (cols.length !== partCols.length) return null;
+      for (let i = 0; i < cols.length; i++) if (cols[i] !== partCols[i]) return null;
+      if (!Array.isArray(tuple.value) || tuple.value.length === 0) return null;
+      tupleSet = new Set(
+        (tuple.value as any[]).map((t) => {
+          if (!Array.isArray(t)) return '__invalid__';
+          return t.map((x) => String(x)).join('\u0000');
+        })
+      );
+      if (tupleSet.has('__invalid__')) return null;
+    }
+
+    // per-column filters: col IN (...) / col = ... (only on partition columns)
+    const colIn: Map<string, Set<string>> = new Map();
+    const colEq: Map<string, string> = new Map();
+
+    for (const c of where) {
+      if (Array.isArray(c.column)) continue; // tuple 已处理
+      const col = c.column;
+      if (!partCols.includes(col)) return null;
+
+      if (c.operator === 'IN') {
+        if (!Array.isArray(c.value)) return null;
+        colIn.set(col, new Set((c.value as any[]).map((x) => String(x))));
+        continue;
+      }
+      if (c.operator === '=') {
+        colEq.set(col, String(c.value));
+        continue;
+      }
+      return null;
+    }
+
+    return (rowIndex: number) => {
+      if (tupleSet) {
+        const key = partCols
+          .map((p) => {
+            const col = table.getColumn(p) as any;
+            return col ? String(col[rowIndex]) : 'undefined';
+          })
+          .join('\u0000');
+        if (!tupleSet.has(key)) return false;
+      }
+
+      for (const [col, s] of colIn) {
+        const arr = table.getColumn(col) as any;
+        if (!arr) return false;
+        if (!s.has(String(arr[rowIndex]))) return false;
+      }
+      for (const [col, v] of colEq) {
+        const arr = table.getColumn(col) as any;
+        if (!arr) return false;
+        if (String(arr[rowIndex]) !== v) return false;
+      }
+
+      return true;
+    };
+  }
+
+  private findPartitions(
+    table: ColumnarTable,
+    partCols: string[],
+    orderCol: string,
+    orderDir: 'ASC' | 'DESC'
+  ): Array<{ start: number; end: number }> {
+    const n = table.getRowCount();
+    if (n === 0) return [];
+
+    // 获取列数据
+    const getVals = (idx: number): (string | number | bigint)[] => {
+      return partCols.map((c) => {
+        const col = table.getColumn(c) as any;
+        return col ? col[idx] : undefined;
+      });
+    };
+
+    const partitions: Array<{ start: number; end: number }> = [];
+    let start = 0;
+    let prevKey = getVals(0);
+
+    for (let i = 1; i < n; i++) {
+      const key = getVals(i);
+      let same = true;
+      for (let j = 0; j < key.length; j++) {
+        if (key[j] !== prevKey[j]) {
+          same = false;
+          break;
+        }
+      }
+      if (!same) {
+        partitions.push({ start, end: i - 1 });
+        start = i;
+        prevKey = key;
+      }
+    }
+    partitions.push({ start, end: n - 1 });
+    return partitions;
+  }
+
+  /**
+   * 计算指定位置在 partition 范围内的窗口 tail 值
+   */
+  private computeWindowTailPartition(
+    table: ColumnarTable,
+    lastIdx: number,
+    spec: WindowSpec,
+    partStart: number
+  ): number {
+    if (spec.func === 'row_number') return 1; // 在 tail 位置，row_number=1（相对于 DESC）
+
+    const argCol = spec.arg && spec.arg !== '*' ? spec.arg : undefined;
+    if (!argCol) {
+      if (spec.func === 'count') return lastIdx - partStart + 1;
+      return NaN;
+    }
+
+    const col = table.getColumn(argCol) as any;
+    if (!col) return NaN;
+
+    const preceding = spec.frame?.preceding ?? 'unbounded';
+    const maxWin = preceding === 'unbounded' ? lastIdx - partStart + 1 : (preceding as number) + 1;
+    const start = Math.max(partStart, lastIdx - maxWin + 1);
+    const n = lastIdx - start + 1;
+    if (n <= 0) return NaN;
+
+    if (spec.func === 'count') return n;
+
+    let sum = 0;
+    let sumSq = 0;
+    let min = Infinity;
+    let max = -Infinity;
+
+    for (let i = start; i <= lastIdx; i++) {
+      const raw = col[i];
+      const v = typeof raw === 'bigint' ? Number(raw) : Number(raw);
+      if (!Number.isFinite(v)) return NaN;
+      sum += v;
+      sumSq += v * v;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+
+    switch (spec.func) {
+      case 'sum':
+        return sum;
+      case 'avg':
+        return sum / n;
+      case 'min':
+        return min;
+      case 'max':
+        return max;
+      case 'variance': {
+        if (n <= 1) return 0;
+        const mean = sum / n;
+        const varSamp = (sumSq - n * mean * mean) / (n - 1);
+        return Math.max(0, varSamp);
+      }
+      case 'stddev': {
+        if (n <= 1) return 0;
+        const mean = sum / n;
+        const varSamp = (sumSq - n * mean * mean) / (n - 1);
+        return Math.sqrt(Math.max(0, varSamp));
+      }
+      default:
+        return NaN;
+    }
+  }
+
   private getConditionValue(table: ColumnarTable, column: string | string[], rowIndex: number): any {
     if (Array.isArray(column)) {
       return column.map((c) => this.getColumnValue(table, c, rowIndex));
@@ -559,6 +937,71 @@ export class SQLExecutor {
         rows[i][item.name] = values[i];
       }
     }
+  }
+
+  /**
+   * 提取表达式中内嵌的窗口函数（如 STDDEV(close) OVER (...) / SQRT(1)）
+   * 返回 rewritten selections（窗口替换为占位符）+ 窗口项列表
+   */
+  private prepareInlineWindows(selections: SelectItem[]): {
+    selections: SelectItem[];
+    windowItems: Array<{ spec: WindowSpec; name: string; rawExpr: string }>;
+  } {
+    const windowItems: Array<{ spec: WindowSpec; name: string; rawExpr: string }> = [];
+    const newSelections: SelectItem[] = selections.map((s) => ({ ...s }));
+
+    for (let i = 0; i < newSelections.length; i++) {
+      const s = newSelections[i];
+      if (!/\bOVER\b/i.test(s.expr)) continue;
+
+      const { rewrittenExpr, extracted } = this.extractInlineWindows(s.expr, i);
+      if (extracted.length > 0) {
+        (s as any).__rewrittenExpr = rewrittenExpr;
+        for (const e of extracted) {
+          windowItems.push({ spec: e.spec, name: e.placeholder, rawExpr: e.rawExpr });
+        }
+      }
+    }
+
+    return { selections: newSelections, windowItems };
+  }
+
+  private extractInlineWindows(
+    expr: string,
+    selIdx: number
+  ): { rewrittenExpr: string; extracted: Array<{ placeholder: string; spec: WindowSpec; rawExpr: string }> } {
+    const extracted: Array<{ placeholder: string; spec: WindowSpec; rawExpr: string }> = [];
+    let rewritten = expr;
+
+    // 匹配 FUNC(...) OVER (...)
+    const windowRegex = /([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([^)]*)\s*\)\s+OVER\s*\(([^)]+)\)/gi;
+    let match: RegExpExecArray | null;
+
+    while ((match = windowRegex.exec(expr)) !== null) {
+      const rawExpr = match[0];
+      const funcRaw = match[1];
+      const argRaw = match[2].trim();
+      const overRaw = match[3];
+
+      const func = this.mapWindowFunc(funcRaw.toLowerCase());
+      if (!func) continue;
+
+      const spec: WindowSpec = {
+        func,
+        arg: argRaw === '' ? undefined : argRaw,
+        partitionBy: this.parsePartitionBy(overRaw),
+        orderBy: this.parseOrderBy(overRaw),
+        frame: this.parseRowsFrame(overRaw),
+      };
+
+      const placeholder = `__iw_${selIdx}_${extracted.length}`;
+      extracted.push({ placeholder, spec, rawExpr });
+
+      // 只替换第一次出现（避免重复替换同一子串）
+      rewritten = rewritten.replace(rawExpr, placeholder);
+    }
+
+    return { rewrittenExpr: rewritten, extracted };
   }
 
   private parseWindowExpr(expr: string): WindowSpec | null {
@@ -1291,17 +1734,51 @@ export class SQLExecutor {
   // ORDER BY
   // ---------------------------------------------------------------------------
 
-  private executeOrderBy(rows: Array<Record<string, any>>, orderBy: { column: string; direction: 'ASC' | 'DESC' }[]): Array<Record<string, any>> {
-    return rows.sort((a, b) => {
-      for (const { column, direction } of orderBy) {
-        const valA = a[column];
-        const valB = b[column];
+  private executeOrderBy(
+    rows: Array<Record<string, any>>,
+    orderBy: { expr: string; direction: 'ASC' | 'DESC' }[],
+    outputColumns: string[]
+  ): Array<Record<string, any>> {
+    const plans = orderBy.map(({ expr, direction }) => {
+      const raw = this.normalizeExpr(expr);
 
-        const cmp = this.compareValues(valA, valB);
-        if (cmp !== 0) return direction === 'ASC' ? cmp : -cmp;
+      // ORDER BY 1 / 2 / ...（按输出列序号）
+      if (/^[0-9]+$/.test(raw)) {
+        const idx = parseInt(raw, 10);
+        if (idx >= 1 && idx <= outputColumns.length) {
+          return { kind: 'col' as const, direction, col: outputColumns[idx - 1] };
+        }
       }
-      return 0;
+
+      // ORDER BY col/alias
+      if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(raw)) {
+        return { kind: 'col' as const, direction, col: raw };
+      }
+
+      // ORDER BY <scalar expr>
+      return { kind: 'expr' as const, direction, expr: raw };
     });
+
+    // Decorate → sort → undecorate（避免 sort comparator 内反复 eval expr）
+    const decorated = rows.map((row, index) => {
+      const keys = plans.map((p) => {
+        if (p.kind === 'col') return row[p.col];
+        return this.evalScalarExpr(p.expr, row);
+      });
+      return { row, index, keys };
+    });
+
+    decorated.sort((a, b) => {
+      for (let i = 0; i < plans.length; i++) {
+        const p = plans[i];
+        const cmp = this.compareValues(a.keys[i], b.keys[i]);
+        if (cmp !== 0) return p.direction === 'ASC' ? cmp : -cmp;
+      }
+      // 稳定排序：完全相等时按原顺序
+      return a.index - b.index;
+    });
+
+    return decorated.map((d) => d.row);
   }
 
   // ---------------------------------------------------------------------------

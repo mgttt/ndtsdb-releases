@@ -1,6 +1,6 @@
 {
   "name": "ndtsdb",
-  "version": "0.9.2.5",
+  "version": "0.9.2.6",
   "description": "Lightweight embedded time-series database inspired by QuestDB",
   "main": "src/index.ts",
   "type": "module",

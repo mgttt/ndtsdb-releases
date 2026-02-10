@@ -2,6 +2,10 @@
 
 **N-Dimensional Time Series Database** — 高性能嵌入式时序数据库，为量化交易而生。
 
+- Scope / Non-Goals: `docs/SCOPE.md`
+- Features: `docs/FEATURES.md`
+- Roadmap: `docs/ROADMAP.md`
+
 ```
 Bun · TypeScript · C FFI · mmap · zero-copy · Gorilla compression
 ```

@@ -1,7 +1,7 @@
 # ndtsdb SQL 功能评估报告
 
 **评估时间**: 2026-02-09
-**评估对象**: quant-lib + quant-lab 的 SQL 需求 vs ndtsdb 当前实现
+**评估对象**: 下游应用的 SQL 需求 vs ndtsdb 当前实现
 
 ---
 
@@ -45,7 +45,7 @@
 
 #### 2.1.1 CTE (WITH 子句)
 
-**需求来源**: `futu-positions-volatility.ts:183-220`
+**需求来源**: 下游“波动率/指标计算”的典型 SQL 模式（CTE + 窗口函数）
 
 ```sql
 WITH periods AS (
@@ -70,7 +70,7 @@ SELECT ... FROM periods WHERE rn = 1
 
 #### 2.1.2 PARTITION BY (窗口函数分区)
 
-**需求来源**: `futu-positions-volatility.ts:190-215`
+**需求来源**: 下游“多分区窗口计算”（PARTITION BY + ORDER BY + ROWS frame）
 
 ```sql
 STDDEV(close) OVER (
@@ -80,19 +80,17 @@ STDDEV(close) OVER (
 )
 ```
 
-**当前状态**: ⚠️ 部分支持
+**当前状态**: ✅ 已支持
 - executor 有 `parsePartitionBy` 方法
-- 但 `tryExecuteTailWindow` 快速路径会拒绝带 PARTITION BY 的查询
 - 通用路径 `computeWindowColumn` 支持 PARTITION BY
-
-**问题**: 快速路径与通用路径行为不一致，导致部分查询失败
-**建议**: 统一处理逻辑，确保 PARTITION BY 在所有场景可用
+- **新增** `tryExecutePartitionTail` 快速路径：专门优化 CTE + PARTITION BY + ROW_NUMBER + WHERE rn=1 模式（波动率脚本典型查询），避免全表物化
+- **新增** Inline Window 支持：表达式中嵌套窗口函数如 `STDDEV(close) OVER (...) / price * 100`
 
 ---
 
 #### 2.1.3 多列 IN 子句
 
-**需求来源**: `futu-positions-volatility.ts:225`
+**需求来源**: 下游“多标的筛选”常用写法（tuple IN）
 
 ```sql
 WHERE (base_currency, quote_currency) IN (('AAPL', 'USD'), ('TSLA', 'USD'))
@@ -107,7 +105,7 @@ WHERE (base_currency, quote_currency) IN (('AAPL', 'USD'), ('TSLA', 'USD'))
 
 #### 2.2.1 字符串拼接运算符
 
-**需求来源**: `futu-positions-volatility.ts:235`
+**需求来源**: 下游 symbol 格式化（base/quote 拼接）
 
 ```sql
 SELECT base_currency || '/' || quote_currency as symbol
@@ -119,7 +117,7 @@ SELECT base_currency || '/' || quote_currency as symbol
 
 #### 2.2.2 ROUND 函数
 
-**需求来源**: `futu-positions-volatility.ts:236-241`
+**需求来源**: 下游指标输出格式化（ROUND/百分比等）
 
 ```sql
 ROUND(vol_1d / price * 100, 2) as vol_1d_pct
@@ -131,7 +129,7 @@ ROUND(vol_1d / price * 100, 2) as vol_1d_pct
 
 #### 2.2.3 SQRT 函数
 
-**需求来源**: `futu-positions-volatility.ts:192`
+**需求来源**: 下游归一化表达式（/ SQRT(n) 等）
 
 ```sql
 STDDEV(close) OVER (...) / SQRT(1)
@@ -147,7 +145,7 @@ STDDEV(close) OVER (...) / SQRT(1)
 
 **当前状态**: ❌ 不支持
 **影响**: 无法多表关联查询
-**评估**: quant-lib 当前场景多为单表时序数据，JOIN 需求不强烈
+**评估**: 当前典型场景多为单表时序数据，JOIN 需求不强烈
 
 #### 2.3.2 子查询 (Subquery)
 
@@ -162,114 +160,23 @@ STDDEV(close) OVER (...) / SQRT(1)
 
 ---
 
-## 3. 现有功能验证
+## 3. 结论
 
-### 3.1 calculate-volatility.ts 兼容性 ✅
+ndtsdb SQL 目前定位为 **SQLite/DuckDB 常用子集**，优先覆盖“单表时序分析 + 常见窗口/聚合 + 轻量表达式计算”的需求。
 
-该脚本已改为使用 ndtsdb SQL:
-
-```typescript
-const sql = `SELECT
-  close AS price,
-  STDDEV(close) OVER (ORDER BY timestamp ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) AS std_1d,
-  ...
-FROM klines
-ORDER BY timestamp DESC
-LIMIT 1`;
-```
-
-**验证结果**: ✅ 完全兼容
-- 无 PARTITION BY
-- 无 CTE
-- 单表查询
-- 使用已支持的窗口函数
-
-### 3.2 futu-positions-volatility.ts 兼容性 ❌
-
-该脚本仍使用 DuckDB SQL，包含不兼容特性:
-
-| 特性 | 状态 | 影响 |
-|------|------|------|
-| CTE (WITH) | ✅ | 可直接按 DuckDB 风格写分层查询 |
-| PARTITION BY | ⚠️ | 行为不一致，需验证 |
-| 多列 IN | ✅ | 支持 (a,b) IN ((..),(..)) |
-| 字符串拼接 || | ✅ | 已支持 |
-| ROUND | ✅ | 已支持 |
-
----
-
-## 4. 迁移建议
-
-### 4.1 短期方案（立即可用）
-
-将 `futu-positions-volatility.ts` 改写为 ndtsdb 兼容的 SQL:
-
-```typescript
-// 原 SQL（DuckDB）
-const query = `
-  WITH periods AS (...)
-  SELECT ... FROM periods WHERE rn = 1
-`;
-
-// 新方案（ndtsdb 兼容）
-// 1. 逐个 symbol 查询（避免 PARTITION BY）
-// 2. 仍可使用 ROUND/SQRT/字符串拼接（SQL 层已支持）
-// 3. 应用层过滤 rn = 1（取最后一条）
-
-for (const symbol of symbols) {
-  const sql = `
-    SELECT 
-      close as price,
-      STDDEV(close) OVER (ORDER BY timestamp ROWS BETWEEN 96 PRECEDING AND CURRENT ROW) as std_1d,
-      ...
-    FROM klines
-    WHERE symbol = '${symbol}'
-    ORDER BY timestamp DESC
-    LIMIT 1
-  `;
-  // 应用层计算标准化波动率
-}
-```
-
-### 4.2 中期方案（需要开发）
-
-按优先级实现缺失功能:
-
-| 优先级 | 功能 | 工作量 | 指派 |
-|--------|------|--------|------|
-| 🔴 高 | ~~CTE (WITH)~~ ✅ | 已完成 | bot-001 |
-| 🔴 高 | ~~多列 IN~~ ✅ | 已完成 | bot-001 |
-| 🔴 高 | PARTITION BY 统一 | 1天 | bot-007 |
-| 🟡 中 | ~~ROUND~~ ✅ | 已完成 | bot-001 |
-| 🟡 中 | ~~字符串拼接 \|\|~~ ✅ | 已完成 | bot-001 |
-| 🟢 低 | ~~SQRT~~ ✅ | 已完成 | bot-001 |
-| 🟢 低 | JOIN | 3-5天 | 待定 |
-
----
-
-## 5. 结论
-
-### 5.1 当前 SQL 能力评估
+### 3.1 当前 SQL 能力评估（引擎视角）
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
-| 基础查询 | ⭐⭐⭐⭐⭐ | SELECT/WHERE/ORDER BY/LIMIT 完善 |
-| 聚合查询 | ⭐⭐⭐⭐ | COUNT/SUM/AVG/MIN/MAX/STDDEV 支持 |
-| 窗口函数 | ⭐⭐⭐ | 基础窗口支持，缺 PARTITION BY 优化 |
-| 复杂查询 | ⭐⭐ | 无 CTE/子查询/JOIN |
-| 函数库 | ⭐⭐ | 仅聚合函数，缺数学/字符串函数 |
+| 基础查询 | ⭐⭐⭐⭐⭐ | SELECT/WHERE/ORDER BY/LIMIT/OFFSET |
+| 聚合查询 | ⭐⭐⭐⭐ | COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE/FIRST/LAST |
+| 窗口函数 | ⭐⭐⭐⭐ | PARTITION BY + ROWS frame；并包含针对“取每分区最后一行”的 fast-path |
+| 复杂查询 | ⭐⭐ | 暂无 JOIN/子查询/HAVING |
+| 函数/表达式 | ⭐⭐⭐ | 基础算术、`||`、ROUND/SQRT 等常用函数 |
 
-### 5.2 quant-lib 迁移状态
+### 3.2 不在引擎评估范围内
 
-| 脚本 | 状态 | 说明 |
-|------|------|------|
-| `calculate-volatility.ts` | ✅ 已迁移 | 使用 ndtsdb SQL |
-| `futu-positions-volatility.ts` | ❌ 未迁移 | 仍依赖 DuckDB，需改写或增强 ndtsdb |
+- 下游应用如何封装 Provider/业务封装层/缓存/迁移脚本
+- 具体脚本的迁移策略与业务语义（timestamp 单位、symbol 规范化等）
 
-### 5.3 最终建议
-
-1. **短期**: 改写 `futu-positions-volatility.ts` 为 ndtsdb 兼容 SQL（逐个 symbol 查询）
-2. **中期**: 统一/优化 PARTITION BY（尤其是与 fast-path 的一致性）
-3. **长期**: 根据实际需求决定是否实现 JOIN/子查询
-
-ndtsdb SQL 当前能力**基本满足**简单时序分析场景，但**不足以支持**复杂的多表/多层分析查询。
+这些内容应由上层库文档承载，不应写入 ndtsdb 发布文档。
