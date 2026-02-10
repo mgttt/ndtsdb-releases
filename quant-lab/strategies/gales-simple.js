@@ -15,10 +15,11 @@ const CONFIG = {
   orderSize: 10,
   maxPosition: 100,
   
-  magnetDistance: 0.002,
-  cancelDistance: 0.005,
+  magnetDistance: 0.005,     // 0.5%（扩大 2.5 倍）
+  cancelDistance: 0.01,      // 1%
   priceOffset: 0.0005,
   postOnly: true,
+  cooldownSec: 60,           // 60 秒冷却
   
   simMode: true,
 };
@@ -277,6 +278,8 @@ function initializeGrids() {
       side: 'Buy',
       state: 'IDLE',
       attempts: 0,
+      lastTriggerTime: null,
+      lastTriggerPrice: null,
     });
   }
   
@@ -289,6 +292,8 @@ function initializeGrids() {
       side: 'Sell',
       state: 'IDLE',
       attempts: 0,
+      lastTriggerTime: null,
+      lastTriggerPrice: null,
     });
   }
   
@@ -298,23 +303,21 @@ function initializeGrids() {
 function shouldPlaceOrder(grid, distance) {
   const distancePct = (distance * 100).toFixed(2);
   
+  // 1. 磁铁检查（双向）
   if (distance > CONFIG.magnetDistance) {
-    // 价格未达到磁铁区域（太远）
-    return false;
+    return false;  // 距离太远
   }
   
-  if (grid.side === 'Buy' && state.lastPrice < grid.price) {
-    // 买单要求价格在网格上方
-    logDebug('买单 #' + grid.id + ' 价格未达到 (' + state.lastPrice.toFixed(4) + ' < ' + grid.price.toFixed(4) + ')');
-    return false;
+  // 2. 冷却时间检查（防止重复触发）
+  if (grid.lastTriggerTime) {
+    const cooldownMs = CONFIG.cooldownSec * 1000;
+    const elapsed = Date.now() - grid.lastTriggerTime;
+    if (elapsed < cooldownMs) {
+      return false;  // 冷却中
+    }
   }
   
-  if (grid.side === 'Sell' && state.lastPrice > grid.price) {
-    // 卖单要求价格在网格下方
-    logDebug('卖单 #' + grid.id + ' 价格未达到 (' + state.lastPrice.toFixed(4) + ' > ' + grid.price.toFixed(4) + ')');
-    return false;
-  }
-  
+  // 3. 仓位检查
   if (grid.side === 'Buy' && state.positionNotional >= CONFIG.maxPosition) {
     logWarn('买单 #' + grid.id + ' 仓位已达上限');
     return false;
@@ -325,7 +328,7 @@ function shouldPlaceOrder(grid, distance) {
     return false;
   }
   
-  // 通过所有检查，可以下单
+  // 4. 通过所有检查，可以触发
   logInfo('✨ 触发网格 #' + grid.id + ' ' + grid.side + ' @ ' + grid.price.toFixed(4) + ' (距离 ' + distancePct + '%)');
   return true;
 }
@@ -333,6 +336,8 @@ function shouldPlaceOrder(grid, distance) {
 function placeOrder(grid) {
   grid.state = 'PLACING';
   grid.attempts++;
+  grid.lastTriggerTime = Date.now();
+  grid.lastTriggerPrice = state.lastPrice;
   
   let orderPrice = grid.price;
   if (grid.side === 'Buy') {
@@ -354,7 +359,7 @@ function placeOrder(grid) {
   const quantity = CONFIG.orderSize / orderPrice;
   const orderLinkId = 'gales-' + grid.id + '-' + grid.side;
   
-  logInfo((CONFIG.simMode ? '[SIM] ' : '') + '挂单 gridId=' + grid.id + ' ' + grid.side + ' ' + quantity.toFixed(4) + ' @ ' + orderPrice);
+  logInfo((CONFIG.simMode ? '[SIM] ' : '') + '挂单 gridId=' + grid.id + ' ' + grid.side + ' ' + quantity.toFixed(4) + ' @ ' + orderPrice.toFixed(4));
   
   if (CONFIG.simMode) {
     grid.state = 'ACTIVE';
