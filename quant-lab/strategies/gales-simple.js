@@ -43,6 +43,8 @@ let state = {
   positionNotional: 0,
   gridLevels: [],
   nextGridId: 1,
+  openOrders: [],
+  tickCount: 0,
 };
 
 // 加载状态
