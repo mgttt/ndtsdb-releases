@@ -76,6 +76,78 @@ function logWarn(msg) {
   bridge_log('warn', '[Gales] ' + msg);
 }
 
+function logDebug(msg) {
+  bridge_log('debug', '[Gales] ' + msg);
+}
+
+/**
+ * 心跳日志（每 10 次输出一次）
+ */
+function logHeartbeat() {
+  const activeOrders = state.openOrders.length;
+  const nearestGrid = findNearestGrid();
+  
+  let msg = '[心跳 #' + state.tickCount + '] 价格: ' + state.lastPrice.toFixed(4);
+  
+  if (nearestGrid) {
+    const distance = (Math.abs(state.lastPrice - nearestGrid.price) / nearestGrid.price * 100).toFixed(2);
+    msg += ' | 最近网格: ' + nearestGrid.side + ' ' + nearestGrid.price.toFixed(4);
+    msg += ' (距离 ' + distance + '%)';
+  }
+  
+  msg += ' | 活跃订单: ' + activeOrders;
+  
+  logInfo(msg);
+}
+
+/**
+ * 找到最近的网格
+ */
+function findNearestGrid() {
+  if (!state.gridLevels || state.gridLevels.length === 0) return null;
+  
+  let nearest = state.gridLevels[0];
+  let minDistance = Math.abs(state.lastPrice - nearest.price);
+  
+  for (let i = 1; i < state.gridLevels.length; i++) {
+    const grid = state.gridLevels[i];
+    const distance = Math.abs(state.lastPrice - grid.price);
+    if (distance < minDistance) {
+      minDistance = distance;
+      nearest = grid;
+    }
+  }
+  
+  return nearest;
+}
+
+/**
+ * 打印网格状态
+ */
+function printGridStatus() {
+  logInfo('=== 网格档位 ===');
+  
+  const buyGrids = state.gridLevels.filter(function(g) { return g.side === 'Buy'; });
+  const sellGrids = state.gridLevels.filter(function(g) { return g.side === 'Sell'; });
+  
+  logInfo('买单网格 (' + buyGrids.length + ' 个):');
+  buyGrids.forEach(function(g) {
+    logInfo('  #' + g.id + ' @ ' + g.price.toFixed(4) + ' [' + g.state + ']');
+  });
+  
+  logInfo('卖单网格 (' + sellGrids.length + ' 个):');
+  sellGrids.forEach(function(g) {
+    logInfo('  #' + g.id + ' @ ' + g.price.toFixed(4) + ' [' + g.state + ']');
+  });
+  
+  logInfo('磁铁距离: ' + (CONFIG.magnetDistance * 100).toFixed(2) + '%');
+  logInfo('取消距离: ' + (CONFIG.cancelDistance * 100).toFixed(2) + '%');
+}
+
+function logWarn(msg) {
+  bridge_log('warn', '[Gales] ' + msg);
+}
+
 // ================================
 // 生命周期函数
 // ================================
@@ -99,6 +171,7 @@ function st_heartbeat(tick) {
   if (!tick || !tick.price) return;
   
   state.lastPrice = tick.price;
+  state.tickCount = (state.tickCount || 0) + 1;
   
   // 首次初始化网格
   if (!state.initialized) {
@@ -106,8 +179,14 @@ function st_heartbeat(tick) {
     initializeGrids();
     state.initialized = true;
     logInfo('网格初始化完成，中心价格: ' + state.centerPrice);
+    printGridStatus();
     saveState();
     return;
+  }
+  
+  // 每 10 次心跳输出一次状态（避免刷屏）
+  if (state.tickCount % 10 === 0) {
+    logHeartbeat();
   }
   
   // 检查网格
@@ -217,11 +296,37 @@ function initializeGrids() {
 }
 
 function shouldPlaceOrder(grid, distance) {
-  if (distance > CONFIG.magnetDistance) return false;
-  if (grid.side === 'Buy' && state.lastPrice < grid.price) return false;
-  if (grid.side === 'Sell' && state.lastPrice > grid.price) return false;
-  if (grid.side === 'Buy' && state.positionNotional >= CONFIG.maxPosition) return false;
-  if (grid.side === 'Sell' && state.positionNotional <= -CONFIG.maxPosition) return false;
+  const distancePct = (distance * 100).toFixed(2);
+  
+  if (distance > CONFIG.magnetDistance) {
+    // 价格未达到磁铁区域（太远）
+    return false;
+  }
+  
+  if (grid.side === 'Buy' && state.lastPrice < grid.price) {
+    // 买单要求价格在网格上方
+    logDebug('买单 #' + grid.id + ' 价格未达到 (' + state.lastPrice.toFixed(4) + ' < ' + grid.price.toFixed(4) + ')');
+    return false;
+  }
+  
+  if (grid.side === 'Sell' && state.lastPrice > grid.price) {
+    // 卖单要求价格在网格下方
+    logDebug('卖单 #' + grid.id + ' 价格未达到 (' + state.lastPrice.toFixed(4) + ' > ' + grid.price.toFixed(4) + ')');
+    return false;
+  }
+  
+  if (grid.side === 'Buy' && state.positionNotional >= CONFIG.maxPosition) {
+    logWarn('买单 #' + grid.id + ' 仓位已达上限');
+    return false;
+  }
+  
+  if (grid.side === 'Sell' && state.positionNotional <= -CONFIG.maxPosition) {
+    logWarn('卖单 #' + grid.id + ' 仓位已达下限');
+    return false;
+  }
+  
+  // 通过所有检查，可以下单
+  logInfo('✨ 触发网格 #' + grid.id + ' ' + grid.side + ' @ ' + grid.price.toFixed(4) + ' (距离 ' + distancePct + '%)');
   return true;
 }
 
