@@ -5,6 +5,7 @@
 
 import { openSync, closeSync, writeSync, readSync, fstatSync, existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import { dirname } from 'path';
+import { TombstoneManager } from './tombstone.js';
 
 /**
  * CRC32 计算 (IEEE 802.3)
@@ -83,10 +84,12 @@ export class AppendWriter {
   private fd: number = -1;
   private totalRows = 0;
   private chunkCount = 0;
+  private tombstone: TombstoneManager;
 
   constructor(path: string, columns: Array<{ name: string; type: string }>) {
     this.path = path;
     this.columns = columns;
+    this.tombstone = new TombstoneManager(path);
   }
 
   /**
@@ -176,6 +179,190 @@ export class AppendWriter {
       closeSync(this.fd);
       this.fd = -1;
     }
+    // 保存 tombstone
+    this.tombstone.save();
+  }
+
+  /**
+   * 标记行为已删除（tombstone）
+   */
+  markDeleted(rowIndex: number): void {
+    this.tombstone.markDeleted(rowIndex);
+  }
+
+  /**
+   * 批量标记删除
+   */
+  markDeletedBatch(rowIndices: number[]): void {
+    this.tombstone.markDeletedBatch(rowIndices);
+  }
+
+  /**
+   * 获取已删除行数
+   */
+  getDeletedCount(): number {
+    return this.tombstone.getDeletedCount();
+  }
+
+  /**
+   * 读取并过滤 tombstone
+   */
+  readAllFiltered(): { header: AppendFileHeader; data: Map<string, ArrayLike<any>> } {
+    const { header, data } = AppendWriter.readAll(this.path);
+    
+    // 过滤已删除行
+    const deletedRows = this.tombstone.getDeletedRows();
+    if (deletedRows.length === 0) {
+      return { header, data };
+    }
+
+    const deletedSet = new Set(deletedRows);
+    const validCount = header.totalRows - deletedRows.length;
+    const filteredData = new Map<string, ArrayLike<any>>();
+
+    for (const [name, col] of data) {
+      const colDef = this.columns.find((c) => c.name === name);
+      if (!colDef) continue;
+
+      // 创建新数组，不包含已删除行
+      let newCol: any;
+
+      switch (colDef.type) {
+        case 'int64':
+          newCol = new BigInt64Array(validCount);
+          break;
+        case 'float64':
+          newCol = new Float64Array(validCount);
+          break;
+        case 'int32':
+          newCol = new Int32Array(validCount);
+          break;
+        case 'int16':
+          newCol = new Int16Array(validCount);
+          break;
+        case 'string':
+          newCol = new Array(validCount);
+          break;
+        default:
+          newCol = new Array(validCount);
+      }
+
+      let writeIdx = 0;
+      for (let i = 0; i < header.totalRows; i++) {
+        if (!deletedSet.has(i)) {
+          newCol[writeIdx++] = (col as any)[i];
+        }
+      }
+
+      filteredData.set(name, newCol);
+    }
+
+    return {
+      header: { ...header, totalRows: validCount },
+      data: filteredData,
+    };
+  }
+
+  /**
+   * 使用 tombstone 标记删除（O(1)，延迟清理）
+   */
+  deleteWhereWithTombstone(predicate: (row: Record<string, any>, index: number) => boolean): number {
+    const { header, data } = AppendWriter.readAll(this.path);
+    const toDelete: number[] = [];
+
+    for (let i = 0; i < header.totalRows; i++) {
+      const row: Record<string, any> = {};
+      for (const [name, col] of data) {
+        row[name] = (col as any)[i];
+      }
+      if (predicate(row, i)) {
+        toDelete.push(i);
+      }
+    }
+
+    this.tombstone.markDeletedBatch(toDelete);
+    this.tombstone.save();
+    return toDelete.length;
+  }
+
+  /**
+   * 删除并立即 compact（兼容旧接口）
+   */
+  async deleteWhereAndCompact(
+    predicate: (row: Record<string, any>, index: number) => boolean,
+    options: AppendRewriteOptions = {}
+  ): Promise<AppendRewriteResult> {
+    this.deleteWhereWithTombstone(predicate);
+    return this.compact(options);
+  }
+
+  /**
+   * Compact：清理 tombstone + 重写文件
+   */
+  async compact(options: AppendRewriteOptions = {}): Promise<AppendRewriteResult> {
+    const deletedCount = this.tombstone.getDeletedCount();
+    if (deletedCount === 0) {
+      return { beforeRows: this.totalRows, afterRows: this.totalRows, deletedRows: 0, chunksWritten: 0 };
+    }
+
+    // 读取并过滤
+    const { header, data } = this.readAllFiltered();
+    
+    // 重写文件
+    const tmpPath = options.tmpPath || this.path + '.tmp';
+    const writer = new AppendWriter(tmpPath, this.columns);
+    writer.open();
+
+    const batchSize = options.batchSize || 10000;
+    const rows: Record<string, any>[] = [];
+
+    for (let i = 0; i < header.totalRows; i++) {
+      const row: Record<string, any> = {};
+      for (const [name, col] of data) {
+        row[name] = (col as any)[i];
+      }
+      rows.push(row);
+
+      if (rows.length >= batchSize) {
+        writer.append(rows);
+        rows.length = 0;
+      }
+    }
+
+    if (rows.length > 0) {
+      writer.append(rows);
+    }
+
+    writer.close();
+
+    // 原子替换
+    const backupPath = options.backupPath || this.path + '.bak';
+    if (existsSync(this.path)) {
+      renameSync(this.path, backupPath);
+    }
+    renameSync(tmpPath, this.path);
+
+    if (!options.keepBackup && existsSync(backupPath)) {
+      rmSync(backupPath);
+    }
+
+    // 清空 tombstone
+    this.tombstone.clear();
+    this.tombstone.save();
+
+    // 重新打开
+    if (this.fd !== -1) {
+      closeSync(this.fd);
+      this.fd = -1;
+    }
+    this.open();
+
+    return {
+      beforeRows: this.totalRows + deletedCount,
+      afterRows: this.totalRows,
+      deletedRows: deletedCount,
+      chunksWritten: Math.ceil(header.totalRows / batchSize),
+    };
   }
 
   // ─── Header 操作 ───────────────────────────────────

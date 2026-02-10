@@ -208,7 +208,7 @@ KEY (symbol, interval, timestamp);
 
 **TON 链钱包**: `UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG`
 
-> 💎 支持赞助数字货币（金额随意）  
+> 💎 支持赞助 <a href="https://www.tradingview.com/symbols/XUSDT/markets/" target="_blank">**$X**</a>（金额随意）  
 > 🔗 这是 [TON 链](https://ton.foundation/) 的钱包地址
 
 **扫码支付** (Telegram 钱包可直接扫码):

@@ -12,7 +12,11 @@
 - chunked append-only
 - header + per-chunk CRC32
 - reopen & append 无需重写
-- **rewrite/compact**：`rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换）
+- **Tombstone 删除**：`deleteWhereWithTombstone`（O(1) 标记 + 延迟 compact）
+  - 独立 .tomb 文件（RoaringBitmap 压缩存储已删除行号）
+  - `compact()` 清理 tombstone + 重写文件
+  - `readAllFiltered()` 自动过滤已删除行
+- **rewrite/compact**：`rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换，向后兼容）
 
 ### ColumnarTable
 - 内存列式表

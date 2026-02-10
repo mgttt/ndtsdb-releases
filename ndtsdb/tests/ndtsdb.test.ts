@@ -4,7 +4,7 @@
 // ============================================================
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { existsSync, mkdirSync, rmdirSync, unlinkSync, readdirSync } from 'fs';
+import { existsSync, mkdirSync, rmdirSync, unlinkSync, readdirSync, rmSync } from 'fs';
 import { join } from 'path';
 
 import { ColumnarTable } from '../src/columnar.js';
@@ -196,6 +196,73 @@ describe('AppendWriter', () => {
     expect(header.totalRows).toBe(3);
     const v = data.get('v') as Int32Array;
     expect(Array.from(v)).toEqual([1, 3, 5]);
+  });
+
+  it('should mark deleted rows with tombstone', () => {
+    const path = '/tmp/test-tombstone-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(path, [
+      { name: 'id', type: 'int32' },
+      { name: 'value', type: 'float64' },
+    ]);
+
+    writer.open();
+    writer.append([
+      { id: 1, value: 10 },
+      { id: 2, value: 20 },
+      { id: 3, value: 30 },
+      { id: 4, value: 40 },
+    ]);
+
+    // 使用 tombstone 标记删除
+    const deleted = writer.deleteWhereWithTombstone((row) => row.value >= 30);
+    expect(deleted).toBe(2); // rows 2, 3
+
+    // 验证 tombstone 计数
+    expect(writer.getDeletedCount()).toBe(2);
+
+    // 读取并过滤
+    const { header, data } = writer.readAllFiltered();
+    expect(header.totalRows).toBe(2);
+    expect((data.get('id') as Int32Array)[0]).toBe(1);
+    expect((data.get('id') as Int32Array)[1]).toBe(2);
+
+    writer.close();
+    rmSync(path);
+    rmSync(path + '.tomb', { force: true });
+  });
+
+  it('should compact tombstones', async () => {
+    const path = '/tmp/test-compact-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(path, [
+      { name: 'id', type: 'int32' },
+    ]);
+
+    writer.open();
+    writer.append([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }]);
+    
+    // 标记删除
+    writer.deleteWhereWithTombstone((row) => row.id % 2 === 0);
+    expect(writer.getDeletedCount()).toBe(2);
+
+    // Compact
+    const result = await writer.compact();
+    expect(result.beforeRows).toBe(5);
+    expect(result.afterRows).toBe(3);
+    expect(result.deletedRows).toBe(2);
+
+    // 验证 tombstone 已清空
+    expect(writer.getDeletedCount()).toBe(0);
+
+    // 读取验证
+    const { header, data } = AppendWriter.readAll(path);
+    expect(header.totalRows).toBe(3);
+    expect((data.get('id') as Int32Array)[0]).toBe(1);
+    expect((data.get('id') as Int32Array)[1]).toBe(3);
+    expect((data.get('id') as Int32Array)[2]).toBe(5);
+
+    writer.close();
+    rmSync(path);
+    rmSync(path + '.tomb', { force: true });
   });
 
   it('should updateWhere by rewriting file', () => {

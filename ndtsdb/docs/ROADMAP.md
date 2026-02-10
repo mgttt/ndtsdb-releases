@@ -234,7 +234,7 @@ Chunk 级原子写入：
 - ✅ **ORDER BY <expr>（alias/ordinal/expr）**
 - ✅ **SQL 子查询（FROM 派生表 + WHERE IN 子查询）**
 - ✅ **二级索引（BTree on 数值列 + SQL 自动优化）**
-- ⏳ **UPDATE/DELETE tombstone 优化**（当前有基础版 rewrite/streaming）
+- ✅ **UPDATE/DELETE tombstone 优化**（独立 .tomb 文件 + RoaringBitmap 压缩 + 延迟 compact）
 
 **🟡 中优先级**：
 - ⏳ **原生字符串类型**（透明字典编码 + 变长编码）
