@@ -19,14 +19,38 @@
 
 #### 迁移落地（集成层）额外发现
 
-这些问题不完全是 ndtsdb 引擎能力缺失，但会直接阻塞「quant-lib/quant-lab 端到端迁移」：
+⚠️ **重要：以下问题是 quant-lib 层的适配工作，不是 ndtsdb 引擎的责任**
 
-- **KlineDatabase 兼容层缺失/接口回归**：`connect()`/`init()` 语义变更、缺少 `upsertKlines()` / `getLatestTimestamp()` / `getLatestKline()` 等调用点，导致系统策略（如 volatility collector）与缓存层（SmartKlineCache）直接无法运行。
+这些阻塞问题需在 **quant-lib** 层修复，避免在 ndtsdb 做无谓开发：
+
+- **KlineDatabase 兼容层（quant-lib 层）**：`quant-lib/src/storage/database.ts` 中的 `KlineDatabase` 类在迁移时丢失了原 DuckDB 版本的关键方法，导致上层组件无法运行。
+  - ❌ 方法名变更：`connect()` → `init()`，`upsertKlines()` → `insertKlines()`
+  - ❌ 方法缺失：`getLatestTimestamp()`、`getLatestKline()` 未实现
+  - ❌ 影响：`SmartKlineCache`（`upsertKlines`、`getLatestTimestamp`）、采集策略等直接崩溃
+  - ✅ **修复位置**：`quant-lib/src/storage/database.ts`（添加兼容方法/别名）
+  - ✅ **ndtsdb 无需改动**：ndtsdb 只提供底层存储，`KlineDatabase` 是 quant-lib 的业务封装
+
 - **timestamp 单位不一致（秒 vs 毫秒）**：Provider 输出 timestamp=Unix 秒，但部分脚本仍按毫秒计算 age/barsNeeded，导致拉取数量被放大 1000 倍。
 - **DuckDB 残留工具链/文档**：duckdb-async 已从主依赖移除，但 `export/validate/migrate` 等工具仍 import duckdb-async；同时仍存在 `klines.duckdb` 的路径叙述，需明确“迁移工具是否保留/如何隔离”。
 - **TypeScript/tsc 生态打包问题（NodeNext）**：在部分 tsc 编译环境中出现 `Cannot find module 'ndtsdb'`（依赖解析/类型声明可见性问题），需要明确 ndtsdb 的 types/exports 与安装方式，保证被下游稳定消费。
 
 **结论**：ndtsdb 适合**追加型时序数据**（K线、Tick），不适合**频繁更新**的 OLTP 场景。
+
+---
+
+### 架构分层与责任边界
+
+| 层级 | 代码位置 | 职责 | 当前状态 |
+|------|----------|------|----------|
+| **ndtsdb** | `ndtsdb/src/` | 核心存储引擎：ColumnarTable、AppendWriter、SQL 执行器等 | ✅ 功能完整 |
+| **quant-lib** | `quant-lib/src/storage/` | 业务封装层：KlineDatabase、Provider 抽象、缓存层 | ⚠️ 需适配 |
+| **quant-lab** | `quant-lab/src/` | 应用层：策略、采集任务、报表 | ⚠️ 部分脚本需更新 |
+
+**关键澄清**：
+- `KlineDatabase` 是 **quant-lib** 层的类，不是 ndtsdb 的一部分
+- 迁移时 `KlineDatabase` 从 DuckDB 改为 ndtsdb 实现，但**接口未保持兼容**
+- 修复 `connect()`/`upsertKlines()`/`getLatestTimestamp()` 等方法的缺失，是 **quant-lib 层的任务**
+- ndtsdb 已提供所有必要的基础能力（`insertKlines`、`queryKlines` 等），无需改动
 
 ---
 
