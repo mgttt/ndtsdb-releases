@@ -6,6 +6,7 @@ export { DataProvider, RestDataProvider, WebSocketDataProvider } from './base.js
 export { BinanceProvider } from './binance.js';
 export { BinanceCurlProvider } from './binance-curl.js';
 export { BybitProvider } from './bybit.js';
+export { BybitCurlProvider } from './bybit-curl.js';
 export { TradingViewProvider } from './tradingview.js';
 
 // NOTE: FUTU provider depends on a futu-trader native client that is not present in this repo.
