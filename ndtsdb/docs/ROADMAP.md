@@ -48,6 +48,71 @@
 
 > 已完成功能详见 `docs/FEATURES.md`
 
+### 📋 Benchmark 发现的问题（2026-02-10）
+
+> 来源：`ndtsdb/scripts/benchmark-compare.ts` 测试过程
+
+| 问题 | 影响 | 优先级 | 状态 |
+|------|------|--------|------|
+| **AVG() 函数未实现** | SQL 无法计算平均值 | 🔴 高 | 待修复 |
+| **COUNT(*) 语法不支持** | 无法统计行数 | 🔴 高 | 待修复 |
+| **SUM() 函数未实现** | SQL 无法求和 | 🔴 高 | 待修复 |
+| **全表聚合性能低** | 100K 行聚合 ~477ms（2 ops/sec） | 🟡 中 | 待优化 |
+
+**修复建议**：
+1. `sql/executor.ts` 的 `evalNode` 函数需要添加 AVG/SUM/COUNT 支持
+2. COUNT(*) 需要特殊处理（当前 parser 不支持 `*` 作为函数参数）
+3. 聚合性能优化：考虑使用 FFI 加速或提前终止
+
+---
+
+### 🔵 进行中（2026-02-10）
+
+**并发推进计划** - 两条线同时进行：
+
+#### 线程 A：测试增强（bot-007）⏳
+**任务卡**: `tasks/assigned/bot-007-ndtsdb-testing-enhancement.md`
+
+- [ ] A1: 压缩功能测试增强（大规模/边界情况/兼容性）
+- [ ] A2: 真实数据验证（Binance/TV K 线）
+- [ ] A3: 性能基准测试套件
+- [ ] A4: 边界情况 & 错误处理测试
+
+**预计完成**: 2026-02-16（Week 1）或 2026-02-23（Week 2）
+
+---
+
+#### 线程 B：quant-lib/quant-lab 适配（bot-001）⏳
+**任务卡**: `tasks/in-progress/bot-001-quant-lib-adaptation.md`
+
+**B1. quant-lib 适配 ndtsdb v0.9.3.8**:
+- [x] B1.1: 启用压缩（部分完成）✅
+  - ✅ int64/int32 列使用 delta 压缩
+  - ⚠️ float64 列暂不压缩（压缩率仅 0.77%）
+  - 📝 **发现问题**：Gorilla 压缩算法已实现（`compression.ts`），但未集成到 AppendWriter 文件格式
+- [ ] B1.1.1: **Gorilla 压缩集成**（新增）⭐⭐⭐⭐
+  - 目标：让 float64 列可以使用 Gorilla 压缩
+  - 修改：`append.ts` 中 `compressColumn` / `decompressColumn` 支持 Gorilla
+  - 预期压缩率提升：0.77% → 70-85%
+  - 预计工期：1-2 天
+- [ ] B1.2: 迁移到分区表（按 symbol 哈希分区）
+  - 当前：3000 symbols × 3 intervals = 9000 个文件
+  - 目标：100 个分区文件（文件数减少 90%）
+  - 预计工期：2-3 天
+- [ ] B1.3: 集成流式聚合（实时 SMA/EMA/StdDev）
+  - 预计工期：1-2 天
+
+**B2. quant-lab 策略运行时**:
+- [ ] 回测引擎 + 实盘引擎 + 策略接口
+- 预计工期：3-5 天
+
+**B3. 实战验证**:
+- 边用边修（发现 ndtsdb 问题 → 立即修复）
+
+**预计完成**: 2026-02-16（Week 1）或 2026-02-23（Week 2）
+
+---
+
 ### 🔴 高优先级 - ✅ 全部完成
 
 - ✅ SQL 子集补齐（CTE/JOIN/子查询/HAVING/复杂 WHERE/ORDER BY expr）
@@ -164,6 +229,20 @@
 | **v0.9.3.6** | 02-10 16:30 | **分区查询优化 v1**（timeRange 提前过滤分区扫描） |
 | **v0.9.3.7** | 02-10 16:45 | **压缩工具导出** + **PartitionedTable 与 SQL 集成**（extractTimeRange + queryPartitionedTableToColumnar） |
 | **v0.9.3.8** | 02-10 17:10 | **AppendWriter 压缩文件格式集成 v1**（启用压缩时写入 colLen+colData，读取端自动解压；兼容旧格式） |
+
+### 计划中（2026-02-10 ~ 02-23）
+
+| 版本 | 预计时间 | 计划内容 |
+|------|----------|----------|
+| **v0.9.3.9** | 02-11 ~ 02-12 | **Gorilla 压缩集成到 AppendWriter**（float64 列压缩支持；预期压缩率提升到 70-85%） |
+| **quant-lib v1** | 02-12 ~ 02-14 | **分区表迁移**（按 symbol 哈希分区；文件数减少 90%；优化单 symbol 查询） |
+| **quant-lib v2** | 02-14 ~ 02-16 | **流式聚合集成**（实时 SMA/EMA/StdDev；WebSocket 行情回调） |
+| **quant-lab v1** | 02-17 ~ 02-23 | **策略运行时**（回测引擎 + 实盘引擎 + 策略接口） |
+
+**并行任务**：
+- **ndtsdb 测试增强**（bot-007）：压缩测试/真实数据验证/性能基准（02-10 ~ 02-23）
+
+---
 
 ### 后续计划（按优先级）
 
