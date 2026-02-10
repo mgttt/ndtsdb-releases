@@ -153,8 +153,9 @@ export class TradingViewProvider extends WebSocketDataProvider {
         
         // 立即失败所有 pending requests（避免每个请求等待 30 秒超时）
         this.rejectAllPending(new Error('WebSocket 连接关闭'));
-        
-        this.attemptReconnect();
+
+        // 不在这里自动重连：TradingView 会频繁主动断连，自动重连会导致 Bun 端频繁创建 WebSocket，
+        // 反而更容易触发 Bun 崩溃。重连由下一次 getKlines() 按需触发。
       });
       
       this.ws.on('error', (error: Error) => {

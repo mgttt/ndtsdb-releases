@@ -4,6 +4,7 @@
 
 export { DataProvider, RestDataProvider, WebSocketDataProvider } from './base.js';
 export { BinanceProvider } from './binance.js';
+export { BinanceCurlProvider } from './binance-curl.js';
 export { BybitProvider } from './bybit.js';
 export { TradingViewProvider } from './tradingview.js';
 

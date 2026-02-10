@@ -22,10 +22,11 @@
     "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {
-    "ws": "^8.16.0",
-    "undici": "^6.20.1",
+    "@moltbaby/workpool-lib": "workspace:*",
+    "https-proxy-agent": "^7.0.6",
     "ndtsdb": "file:../ndtsdb",
-    "@moltbaby/workpool-lib": "workspace:*"
+    "undici": "^6.20.1",
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "@types/ws": "^8.5.10",

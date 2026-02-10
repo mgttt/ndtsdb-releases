@@ -13,7 +13,7 @@ import { RestDataProvider } from './base';
 import type { Kline, KlineQuery } from '../types/kline';
 import type { ProviderConfig, Exchange, AssetType } from '../types/common';
 import { NetworkError, RateLimitError } from '../types/common';
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 export interface BinanceProviderConfig extends Partial<ProviderConfig> {
   /** 代理地址（可选） */
@@ -47,7 +47,7 @@ type BinanceKlineRaw = [
 export class BinanceProvider extends RestDataProvider {
   private baseUrl: string;
   private proxyUrl?: string;
-  private proxyAgent?: any; // ProxyAgent from undici
+  private proxyAgent?: HttpsProxyAgent<string>; // HttpsProxyAgent
   private timeout: number;
   
   constructor(config: BinanceProviderConfig = {}) {
@@ -63,9 +63,9 @@ export class BinanceProvider extends RestDataProvider {
     
     this.proxyUrl = config.proxy || process.env.HTTP_PROXY;
     
-    // 创建 ProxyAgent（如果配置了代理）
+    // 创建 HttpsProxyAgent（如果配置了代理）
     if (this.proxyUrl) {
-      this.proxyAgent = new ProxyAgent(this.proxyUrl);
+      this.proxyAgent = new HttpsProxyAgent(this.proxyUrl);
       console.log(`  🌐 Binance 使用代理: ${this.proxyUrl}`);
     }
     
@@ -292,7 +292,7 @@ export class BinanceProvider extends RestDataProvider {
   ): Promise<T> {
     const url = this.buildUrl(endpoint, params);
     
-    const options: Parameters<typeof undiciFetch>[1] = {
+    const options: RequestInit = {
       method,
       headers: {
         'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
@@ -300,9 +300,9 @@ export class BinanceProvider extends RestDataProvider {
       }
     };
     
-    // 设置代理（使用 undici ProxyAgent）
+    // 设置代理（使用 HttpsProxyAgent）
     if (this.proxyAgent) {
-      options.dispatcher = this.proxyAgent;
+      (options as any).agent = this.proxyAgent;
     }
     
     // 设置超时
@@ -311,7 +311,7 @@ export class BinanceProvider extends RestDataProvider {
     options.signal = controller.signal;
     
     try {
-      const response = await undiciFetch(url, options);
+      const response = await fetch(url, options);
       clearTimeout(timeoutId);
       
       if (!response.ok) {
