@@ -6,6 +6,7 @@
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { BTreeIndex } from './index/btree.js';
+import { CompositeIndex } from './index/composite.js';
 
 export type ColumnarType = 'int64' | 'float64' | 'int32' | 'int16' | 'string';
 
@@ -25,6 +26,7 @@ export class ColumnarTable {
   private capacity: number;
   private readonly growthFactor = 1.5;
   private indexes: Map<string, BTreeIndex<number | bigint>> = new Map();
+  private compositeIndexes: Map<string, CompositeIndex> = new Map(); // key: "col1,col2"
 
   /**
    * 从现有 TypedArray 直接创建表视图（零拷贝）。
@@ -145,6 +147,23 @@ export class ColumnarTable {
           if (val != null) {
             index.insert(val, rowIndex);
           }
+        }
+      }
+    }
+
+    // 更新复合索引
+    for (const [key, compositeIndex] of this.compositeIndexes) {
+      const columns = key.split(',');
+      for (let i = 0; i < data.length; i++) {
+        const rowIndex = startRow + i;
+        const values: (number | bigint | string)[] = [];
+        for (const col of columns) {
+          const colData = this.columns.get(col);
+          if (!colData) continue;
+          values.push((colData as any)[rowIndex]);
+        }
+        if (values.length === columns.length) {
+          compositeIndex.insert(values, rowIndex);
         }
       }
     }
@@ -639,6 +658,77 @@ export class ColumnarTable {
    */
   getIndexedColumns(): string[] {
     return Array.from(this.indexes.keys());
+  }
+
+  // ─── 复合索引 ───────────────────────────────────────
+
+  /**
+   * 创建复合索引（多列组合）
+   * @param columns 列名数组，例如 ['symbol', 'timestamp']
+   */
+  createCompositeIndex(columns: string[]): void {
+    if (columns.length < 2) {
+      throw new Error('Composite index requires at least 2 columns');
+    }
+
+    // 验证列存在
+    for (const col of columns) {
+      const def = this.columnDefs.find((d) => d.name === col);
+      if (!def) throw new Error(`Column not found: ${col}`);
+    }
+
+    const key = columns.join(',');
+    const index = new CompositeIndex(columns);
+
+    // 批量插入现有数据
+    for (let i = 0; i < this.rowCount; i++) {
+      const values: (number | bigint | string)[] = [];
+      for (const col of columns) {
+        const colData = this.columns.get(col);
+        if (!colData) throw new Error(`Column not found: ${col}`);
+        values.push((colData as any)[i]);
+      }
+      index.insert(values, i);
+    }
+
+    this.compositeIndexes.set(key, index);
+  }
+
+  /**
+   * 删除复合索引
+   */
+  dropCompositeIndex(columns: string[]): void {
+    const key = columns.join(',');
+    this.compositeIndexes.delete(key);
+  }
+
+  /**
+   * 查询复合索引
+   * @param filters 条件对象，例如 { symbol: 'BTC', timestamp: { gte: 1000 } }
+   */
+  queryCompositeIndex(
+    columns: string[],
+    filters: Record<string, number | bigint | string | { gte?: any; lte?: any; gt?: any; lt?: any }>,
+  ): number[] {
+    const key = columns.join(',');
+    const index = this.compositeIndexes.get(key);
+    if (!index) throw new Error(`No composite index on columns: ${columns.join(', ')}`);
+    return index.query(filters);
+  }
+
+  /**
+   * 检查复合索引是否存在
+   */
+  hasCompositeIndex(columns: string[]): boolean {
+    const key = columns.join(',');
+    return this.compositeIndexes.has(key);
+  }
+
+  /**
+   * 获取所有复合索引
+   */
+  getCompositeIndexes(): string[][] {
+    return Array.from(this.compositeIndexes.keys()).map((k) => k.split(','));
   }
 }
 

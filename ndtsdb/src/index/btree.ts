@@ -204,7 +204,7 @@ export class BTreeIndex<T extends number | bigint> {
   }
 
   /**
-   * 大于查询
+   * 大于查询（严格大于）
    */
   greaterThan(key: T): number[] {
     const result: number[] = [];
@@ -225,6 +225,31 @@ export class BTreeIndex<T extends number | bigint> {
 
     if (!node.isLeaf) {
       this.greaterThanNode(node.children[i + 1], key, result);
+    }
+  }
+
+  /**
+   * 大于等于查询
+   */
+  greaterThanOrEqual(key: T): number[] {
+    const result: number[] = [];
+    this.greaterThanOrEqualNode(this.root, key, result);
+    return result.sort((a, b) => a - b);
+  }
+
+  private greaterThanOrEqualNode(node: BTreeNode<T>, key: T, result: number[]): void {
+    let i = node.keys.length - 1;
+
+    while (i >= 0 && node.keys[i] >= key) {
+      result.push(...node.values[i]);
+      if (!node.isLeaf) {
+        this.greaterThanOrEqualNode(node.children[i + 1], key, result);
+      }
+      i--;
+    }
+
+    if (!node.isLeaf) {
+      this.greaterThanOrEqualNode(node.children[i + 1], key, result);
     }
   }
 
@@ -258,6 +283,27 @@ export class BTreeIndex<T extends number | bigint> {
       node = node.children[0];
     }
     return height;
+  }
+
+  /**
+   * 获取所有行号（用于复合索引扫描）
+   */
+  getAllRows(): number[] {
+    const result: number[] = [];
+    this.collectAllRows(this.root, result);
+    return result;
+  }
+
+  private collectAllRows(node: BTreeNode<T>, result: number[]): void {
+    if (node.isLeaf) {
+      for (const rowList of node.values) {
+        result.push(...rowList);
+      }
+    } else {
+      for (const child of node.children) {
+        this.collectAllRows(child, result);
+      }
+    }
   }
 }
 

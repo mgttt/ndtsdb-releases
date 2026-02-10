@@ -123,7 +123,7 @@ const ticks = await rdma.read(storageNode, symbolId, startTs, endTs);
 
 #### 3. 存储节点池化 ⭐⭐⭐
 
-**当前**：嵌入式单机模式（应用 + 存储同进程）
+**当前**：单机模式（应用 + 存储同进程）
 
 **优化**：存储服务 + 计算服务分离
 

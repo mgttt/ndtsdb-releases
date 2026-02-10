@@ -762,6 +762,73 @@ describe('Index', () => {
     expect(r.rows[0].price).toBeGreaterThan(0);
   });
 
+  it('should create and query composite index', () => {
+    const table = new ColumnarTable([
+      { name: 'symbol', type: 'string' },
+      { name: 'timestamp', type: 'int64' },
+      { name: 'price', type: 'float64' },
+    ]);
+
+    // 插入测试数据
+    table.appendBatch([
+      { symbol: 'BTC', timestamp: 1000n, price: 50000 },
+      { symbol: 'BTC', timestamp: 2000n, price: 51000 },
+      { symbol: 'ETH', timestamp: 1000n, price: 3000 },
+      { symbol: 'ETH', timestamp: 2000n, price: 3100 },
+      { symbol: 'BTC', timestamp: 3000n, price: 52000 },
+    ]);
+
+    // 创建复合索引
+    table.createCompositeIndex(['symbol', 'timestamp']);
+    expect(table.hasCompositeIndex(['symbol', 'timestamp'])).toBe(true);
+
+    // 查询：symbol='BTC' AND timestamp>=2000
+    const rows1 = table.queryCompositeIndex(['symbol', 'timestamp'], {
+      symbol: 'BTC',
+      timestamp: { gte: 2000n },
+    });
+    expect(rows1.sort()).toEqual([1, 4]);
+
+    // 查询：symbol='ETH'
+    const rows2 = table.queryCompositeIndex(['symbol', 'timestamp'], {
+      symbol: 'ETH',
+    });
+    expect(rows2.sort()).toEqual([2, 3]);
+
+    // 查询：symbol='BTC' AND timestamp=1000
+    const rows3 = table.queryCompositeIndex(['symbol', 'timestamp'], {
+      symbol: 'BTC',
+      timestamp: 1000n,
+    });
+    expect(rows3).toEqual([0]);
+  });
+
+  it('should update composite index on new inserts', () => {
+    const table = new ColumnarTable([
+      { name: 'category', type: 'string' },
+      { name: 'value', type: 'int32' },
+    ]);
+
+    table.appendBatch([
+      { category: 'A', value: 10 },
+      { category: 'B', value: 20 },
+    ]);
+
+    table.createCompositeIndex(['category', 'value']);
+
+    // 追加新数据
+    table.appendBatch([
+      { category: 'A', value: 15 },
+      { category: 'C', value: 30 },
+    ]);
+
+    // 验证索引自动更新
+    const rows = table.queryCompositeIndex(['category', 'value'], {
+      category: 'A',
+    });
+    expect(rows.sort()).toEqual([0, 2]);
+  });
+
   it('should add and check RoaringBitmap', () => {
     const bitmap = new RoaringBitmap();
     bitmap.add(1);

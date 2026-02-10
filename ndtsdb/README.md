@@ -1,6 +1,6 @@
 # ndtsdb
 
-**N-Dimensional Time Series Database** — 高性能嵌入式时序数据库，为量化交易而生。
+**N-Dimensional Time Series Database** — 高性能多维时序数据库，为量化交易而生。
 
 <!-- VERSION_START -->
 **Version: 0.9.2.6**

@@ -76,6 +76,25 @@ export type AppendRewriteOptions = {
   mode?: 'stream' | 'readAll'; // 默认 stream（不展开全表）
 };
 
+export interface AppendWriterOptions {
+  /**
+   * 自动 compact 开关（默认 false）
+   */
+  autoCompact?: boolean;
+
+  /**
+   * Tombstone 比例触发阈值（默认 0.2 = 20%）
+   * 当 deletedRows / totalRows >= threshold 时触发 compact
+   */
+  compactThreshold?: number;
+
+  /**
+   * Compact 触发的最小行数（默认 1000）
+   * 避免小表频繁 compact
+   */
+  compactMinRows?: number;
+}
+
 /**
  * 增量写入器
  */
@@ -88,11 +107,17 @@ export class AppendWriter {
   private tombstone: TombstoneManager;
   private stringDicts: Map<string, Map<string, number>> = new Map(); // columnName → (value → id)
   private stringDictsReverse: Map<string, Map<number, string>> = new Map(); // columnName → (id → value)
+  private options: AppendWriterOptions;
 
-  constructor(path: string, columns: Array<{ name: string; type: string }>) {
+  constructor(path: string, columns: Array<{ name: string; type: string }>, options: AppendWriterOptions = {}) {
     this.path = path;
     this.columns = columns;
     this.tombstone = new TombstoneManager(path);
+    this.options = {
+      autoCompact: options.autoCompact ?? false,
+      compactThreshold: options.compactThreshold ?? 0.2,
+      compactMinRows: options.compactMinRows ?? 1000,
+    };
 
     // 初始化 string 列字典
     for (const col of columns) {
