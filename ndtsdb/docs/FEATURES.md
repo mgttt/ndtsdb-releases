@@ -10,8 +10,9 @@
 
 ### AppendWriter (DLv2)
 - chunked append-only
-- header + per-chunk CRC32
+- header + per-chunk CRC32（固定 4KB header 预留空间）
 - reopen & append 无需重写
+- **String 持久化**：字典编码（string → int32 id），存储在 header.stringDicts
 - **Tombstone 删除**：`deleteWhereWithTombstone`（O(1) 标记 + 延迟 compact）
   - 独立 .tomb 文件（RoaringBitmap 压缩存储已删除行号）
   - `compact()` 清理 tombstone + 重写文件
@@ -21,7 +22,7 @@
 ### ColumnarTable
 - 内存列式表
 - 数值列使用 TypedArray
-- **string 列仅内存可用**（用于 SQL/CTE/materialize）；二进制持久化暂不支持
+- **string 列支持持久化**（字典编码，透明存储为 int32 id）
 
 ### SymbolTable
 - 字典编码：string → int

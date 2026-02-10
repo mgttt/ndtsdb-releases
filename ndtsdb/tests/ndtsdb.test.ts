@@ -265,6 +265,71 @@ describe('AppendWriter', () => {
     rmSync(path + '.tomb', { force: true });
   });
 
+  it('should support string columns with dictionary encoding', () => {
+    const path = '/tmp/test-string-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(path, [
+      { name: 'id', type: 'int32' },
+      { name: 'symbol', type: 'string' },
+      { name: 'price', type: 'float64' },
+    ]);
+
+    writer.open();
+    writer.append([
+      { id: 1, symbol: 'AAPL', price: 150 },
+      { id: 2, symbol: 'TSLA', price: 200 },
+      { id: 3, symbol: 'AAPL', price: 151 }, // 重复 symbol
+    ]);
+    writer.close();
+
+    // 读取验证
+    const { header, data } = AppendWriter.readAll(path);
+    expect(header.totalRows).toBe(3);
+    expect(header.stringDicts).toBeDefined();
+    expect(header.stringDicts!.symbol).toBeDefined();
+    expect(header.stringDicts!.symbol.length).toBe(2); // 只有 AAPL, TSLA
+
+    const symbols = data.get('symbol') as string[];
+    expect(symbols[0]).toBe('AAPL');
+    expect(symbols[1]).toBe('TSLA');
+    expect(symbols[2]).toBe('AAPL');
+
+    const prices = data.get('price') as Float64Array;
+    expect(prices[0]).toBe(150);
+    expect(prices[1]).toBe(200);
+
+    rmSync(path);
+  });
+
+  it('should reopen and append with string dictionary', () => {
+    const path = '/tmp/test-string-reopen-' + Date.now() + '.ndts';
+    
+    // 第一次写入
+    let writer = new AppendWriter(path, [
+      { name: 'symbol', type: 'string' },
+    ]);
+    writer.open();
+    writer.append([{ symbol: 'BTC' }, { symbol: 'ETH' }]);
+    writer.close();
+
+    // 重新打开并追加
+    writer = new AppendWriter(path, [
+      { name: 'symbol', type: 'string' },
+    ]);
+    writer.open();
+    writer.append([{ symbol: 'BTC' }, { symbol: 'SOL' }]); // BTC 重复，SOL 新增
+    writer.close();
+
+    // 验证
+    const { header, data } = AppendWriter.readAll(path);
+    expect(header.totalRows).toBe(4);
+    expect(header.stringDicts!.symbol.length).toBe(3); // BTC, ETH, SOL
+
+    const symbols = data.get('symbol') as string[];
+    expect(symbols).toEqual(['BTC', 'ETH', 'BTC', 'SOL']);
+
+    rmSync(path);
+  });
+
   it('should updateWhere by rewriting file', () => {
     const path = `${TEST_DIR}/rewrite-update.ndts`;
 

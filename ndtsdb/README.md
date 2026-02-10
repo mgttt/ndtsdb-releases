@@ -211,13 +211,11 @@ KEY (symbol, interval, timestamp);
 > 💎 支持赞助 <a href="https://www.tradingview.com/symbols/XUSDT/markets/" target="_blank">**$X**</a>（金额随意）  
 > 🔗 这是 [TON 链](https://ton.foundation/) 的钱包地址
 
-**扫码支付** $X (使用 Tonkeeper 或 Telegram 钱包):
+**扫码支付** (Telegram 钱包 → 选择 **TON** 或 **$X**):
 
-<a href="https://app.tonkeeper.com/transfer/UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG?jetton=EQB4zZusHsbU2vVTPqjhlokIOoiZhEdCMT703CWEzhTOo__X" target="_blank">
-  <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=https://app.tonkeeper.com/transfer/UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG?jetton=EQB4zZusHsbU2vVTPqjhlokIOoiZhEdCMT703CWEzhTOo__X" alt="TON Wallet QR Code for $X" width="200" />
-</a>
+<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG" alt="TON Wallet Address QR" width="200" />
 
-> 💡 点击二维码或扫码后，在钱包中选择 **X Empire** 代币
+> 扫码后选择发送 **$X** (X Empire) 或 **TON**
 
 ---
 

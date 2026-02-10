@@ -235,11 +235,12 @@ Chunk 级原子写入：
 - ✅ **SQL 子查询（FROM 派生表 + WHERE IN 子查询）**
 - ✅ **二级索引（BTree on 数值列 + SQL 自动优化）**
 - ✅ **UPDATE/DELETE tombstone 优化**（独立 .tomb 文件 + RoaringBitmap 压缩 + 延迟 compact）
+- ✅ **原生字符串类型**（字典编码 + 固定 header 空间，透明存储为 int32 id）
 
 **🟡 中优先级**：
-- ⏳ **原生字符串类型**（透明字典编码 + 变长编码）
 - 复合索引（多列组合，如 `(symbol, timestamp)`）
 - 自动 compact 策略（时间窗口 / 文件大小触发）
+- 列式压缩（Gorilla/delta 编码，减少磁盘占用）
 
 **🟢 低优先级**：
 - 事务支持（WAL + 原子写入）

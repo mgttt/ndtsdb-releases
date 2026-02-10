@@ -58,6 +58,7 @@ export interface AppendFileHeader {
   columns: Array<{ name: string; type: string }>;
   totalRows: number;    // 所有 chunk 的总行数
   chunkCount: number;   // chunk 数量
+  stringDicts?: { [columnName: string]: string[] }; // string 列字典（v2.1+）
 }
 
 export type AppendRewriteResult = {
@@ -85,11 +86,21 @@ export class AppendWriter {
   private totalRows = 0;
   private chunkCount = 0;
   private tombstone: TombstoneManager;
+  private stringDicts: Map<string, Map<string, number>> = new Map(); // columnName → (value → id)
+  private stringDictsReverse: Map<string, Map<number, string>> = new Map(); // columnName → (id → value)
 
   constructor(path: string, columns: Array<{ name: string; type: string }>) {
     this.path = path;
     this.columns = columns;
     this.tombstone = new TombstoneManager(path);
+
+    // 初始化 string 列字典
+    for (const col of columns) {
+      if (col.type === 'string') {
+        this.stringDicts.set(col.name, new Map());
+        this.stringDictsReverse.set(col.name, new Map());
+      }
+    }
   }
 
   /**
@@ -105,6 +116,22 @@ export class AppendWriter {
       const header = this.readHeader();
       this.totalRows = header.totalRows;
       this.chunkCount = header.chunkCount;
+
+      // 加载字典
+      if (header.stringDicts) {
+        for (const [colName, dict] of Object.entries(header.stringDicts)) {
+          const fwdMap = this.stringDicts.get(colName) || new Map();
+          const revMap = this.stringDictsReverse.get(colName) || new Map();
+
+          for (let i = 0; i < dict.length; i++) {
+            fwdMap.set(dict[i], i);
+            revMap.set(i, dict[i]);
+          }
+
+          this.stringDicts.set(colName, fwdMap);
+          this.stringDictsReverse.set(colName, revMap);
+        }
+      }
     } else {
       // 新文件 — 写入 header
       this.fd = openSync(this.path, 'w+');
@@ -130,6 +157,8 @@ export class AppendWriter {
     parts.push(rcBuf);
 
     // Column data
+    let dictDirty = false;
+
     for (const col of this.columns) {
       const byteLen = this.getByteLength(col.type);
       const buf = Buffer.allocUnsafe(byteLen * rowCount);
@@ -149,6 +178,23 @@ export class AppendWriter {
           case 'int16':
             buf.writeInt16LE(Number(val), i * 2);
             break;
+          case 'string': {
+            // 字典编码
+            const fwdMap = this.stringDicts.get(col.name)!;
+            const revMap = this.stringDictsReverse.get(col.name)!;
+            const str = String(val ?? '');
+
+            let id = fwdMap.get(str);
+            if (id === undefined) {
+              id = fwdMap.size;
+              fwdMap.set(str, id);
+              revMap.set(id, str);
+              dictDirty = true;
+            }
+
+            buf.writeInt32LE(id, i * 4);
+            break;
+          }
         }
       }
       parts.push(buf);
@@ -168,7 +214,61 @@ export class AppendWriter {
     // 更新 header
     this.totalRows += rowCount;
     this.chunkCount++;
-    this.updateHeader();
+
+    // 字典更新时需要重写 header
+    if (dictDirty) {
+      this.updateHeader();
+    } else {
+      // 快速更新（只改 totalRows + chunkCount，不重写整个 header）
+      this.updateHeaderCountsOnly();
+    }
+  }
+
+  /**
+   * 快速更新 header 计数（避免重写字典）
+   */
+  private updateHeaderCountsOnly(): void {
+    // 读取现有 header
+    const header = this.readHeader();
+    header.totalRows = this.totalRows;
+    header.chunkCount = this.chunkCount;
+
+    // 重写 header（保持字典不变）
+    this.writeHeaderData(header);
+  }
+
+  private writeHeaderData(header: AppendFileHeader): void {
+    const headerJson = JSON.stringify(header);
+    const headerBuf = Buffer.from(headerJson);
+
+    // 预留固定 header 空间：4KB（足够容纳大多数字典）
+    const RESERVED_HEADER_SIZE = 4096;
+    const headerActualSize = 4 + 4 + headerBuf.length; // magic + len + json
+    
+    if (headerActualSize > RESERVED_HEADER_SIZE - 8) { // -8 for padding + CRC
+      throw new Error(`Header too large: ${headerActualSize} bytes (max ${RESERVED_HEADER_SIZE - 8})`);
+    }
+
+    const paddingSize = RESERVED_HEADER_SIZE - headerActualSize;
+
+    const headerLenBuf = Buffer.allocUnsafe(4);
+    headerLenBuf.writeUInt32LE(headerBuf.length);
+
+    const headerBlock = Buffer.concat([
+      MAGIC,
+      headerLenBuf,
+      headerBuf,
+      Buffer.alloc(paddingSize),
+    ]);
+
+    // CRC32 计算整个 headerBlock（magic + length + header + padding）
+    const headerCrc = crc32(new Uint8Array(headerBlock.buffer, headerBlock.byteOffset, headerBlock.byteLength));
+    const crcBuf = Buffer.allocUnsafe(4);
+    crcBuf.writeUInt32LE(headerCrc);
+
+    // 覆盖写入 header 区域（固定大小）
+    writeSync(this.fd, headerBlock, 0, headerBlock.length, 0);
+    writeSync(this.fd, crcBuf, 0, 4, headerBlock.length);
   }
 
   /**
@@ -181,6 +281,31 @@ export class AppendWriter {
     }
     // 保存 tombstone
     this.tombstone.save();
+  }
+
+  // ... 其他方法保持不变
+
+  private updateHeader(): void {
+    const header: AppendFileHeader = {
+      columns: this.columns,
+      totalRows: this.totalRows,
+      chunkCount: this.chunkCount,
+    };
+
+    // 序列化字典
+    if (this.stringDicts.size > 0) {
+      header.stringDicts = {};
+      for (const [colName, fwdMap] of this.stringDicts) {
+        const dict: string[] = [];
+        const revMap = this.stringDictsReverse.get(colName)!;
+        for (let i = 0; i < fwdMap.size; i++) {
+          dict[i] = revMap.get(i) || '';
+        }
+        header.stringDicts[colName] = dict;
+      }
+    }
+
+    this.writeHeaderData(header);
   }
 
   /**
@@ -368,64 +493,21 @@ export class AppendWriter {
   // ─── Header 操作 ───────────────────────────────────
 
   private writeHeader(): void {
-    const headerJson = JSON.stringify({
+    const header: AppendFileHeader = {
       columns: this.columns,
       totalRows: 0,
       chunkCount: 0,
-    });
-    const headerBuf = Buffer.from(headerJson);
+    };
 
-    // 对齐
-    const headerEndOffset = 4 + 4 + headerBuf.length;
-    const paddingSize = (8 - (headerEndOffset % 8)) % 8;
+    // 初始化字典结构（避免后续 header 变长覆盖 chunk）
+    if (this.stringDicts.size > 0) {
+      header.stringDicts = {};
+      for (const [colName] of this.stringDicts) {
+        header.stringDicts[colName] = [];
+      }
+    }
 
-    const headerLenBuf = Buffer.allocUnsafe(4);
-    headerLenBuf.writeUInt32LE(headerBuf.length);
-
-    const headerBlock = Buffer.concat([
-      MAGIC,
-      headerLenBuf,
-      headerBuf,
-      Buffer.alloc(paddingSize),
-    ]);
-
-    // Header CRC
-    const headerCrc = crc32(new Uint8Array(headerBlock.buffer, headerBlock.byteOffset, headerBlock.byteLength));
-    const crcBuf = Buffer.allocUnsafe(4);
-    crcBuf.writeUInt32LE(headerCrc);
-
-    writeSync(this.fd, headerBlock, 0, headerBlock.length, 0);
-    writeSync(this.fd, crcBuf, 0, 4, headerBlock.length);
-  }
-
-  private updateHeader(): void {
-    // 重写 header JSON 中的 totalRows 和 chunkCount
-    // 只改 header 区域，不动 chunk 数据
-    const headerJson = JSON.stringify({
-      columns: this.columns,
-      totalRows: this.totalRows,
-      chunkCount: this.chunkCount,
-    });
-    const headerBuf = Buffer.from(headerJson);
-    const headerLenBuf = Buffer.allocUnsafe(4);
-    headerLenBuf.writeUInt32LE(headerBuf.length);
-
-    const headerEndOffset = 4 + 4 + headerBuf.length;
-    const paddingSize = (8 - (headerEndOffset % 8)) % 8;
-
-    const headerBlock = Buffer.concat([
-      MAGIC,
-      headerLenBuf,
-      headerBuf,
-      Buffer.alloc(paddingSize),
-    ]);
-
-    const headerCrc = crc32(new Uint8Array(headerBlock.buffer, headerBlock.byteOffset, headerBlock.byteLength));
-    const crcBuf = Buffer.allocUnsafe(4);
-    crcBuf.writeUInt32LE(headerCrc);
-
-    writeSync(this.fd, headerBlock, 0, headerBlock.length, 0);
-    writeSync(this.fd, crcBuf, 0, 4, headerBlock.length);
+    this.writeHeaderData(header);
   }
 
   private readHeader(): AppendFileHeader {
@@ -452,6 +534,7 @@ export class AppendWriter {
       case 'float64': return 8;
       case 'int32': return 4;
       case 'int16': return 2;
+      case 'string': return 4; // 字典 id (int32)
       default: return 8;
     }
   }
@@ -482,10 +565,9 @@ export class AppendWriter {
     readSync(fd, headerBuf, 0, headerLen, 8);
     const header: AppendFileHeader = JSON.parse(headerBuf.toString());
 
-    // 跳过 header + padding + CRC
-    const headerEndOffset = 4 + 4 + headerLen;
-    const paddingSize = (8 - (headerEndOffset % 8)) % 8;
-    let offset = headerEndOffset + paddingSize + 4; // +4 for header CRC
+    // Header 固定大小 4KB + 4 bytes CRC
+    const RESERVED_HEADER_SIZE = 4096;
+    let offset = RESERVED_HEADER_SIZE + 4; // header block + CRC
 
     // 分配结果数组
     const data = new Map<string, any>();
@@ -495,6 +577,7 @@ export class AppendWriter {
         case 'float64': data.set(col.name, new Float64Array(header.totalRows)); break;
         case 'int32': data.set(col.name, new Int32Array(header.totalRows)); break;
         case 'int16': data.set(col.name, new Int16Array(header.totalRows)); break;
+        case 'string': data.set(col.name, new Array(header.totalRows)); break;
       }
     }
 
@@ -507,16 +590,25 @@ export class AppendWriter {
       const chunkRows = rcBuf.readUInt32LE();
       offset += 4;
 
-      // 计算 chunk 数据大小
-      let chunkDataSize = 0;
-      for (const col of header.columns) {
-        const byteLen = col.type === 'int64' || col.type === 'float64' ? 8 : col.type === 'int32' ? 4 : 2;
-        chunkDataSize += byteLen * chunkRows;
-      }
-
       // 读取列数据
       for (const col of header.columns) {
-        const byteLen = col.type === 'int64' || col.type === 'float64' ? 8 : col.type === 'int32' ? 4 : 2;
+        let byteLen: number;
+        switch (col.type) {
+          case 'int64':
+          case 'float64':
+            byteLen = 8;
+            break;
+          case 'int32':
+          case 'string': // string 存储为 int32 id
+            byteLen = 4;
+            break;
+          case 'int16':
+            byteLen = 2;
+            break;
+          default:
+            byteLen = 8;
+        }
+
         const colBytes = byteLen * chunkRows;
         const buf = Buffer.allocUnsafe(colBytes);
         readSync(fd, buf, 0, colBytes, offset);
@@ -526,10 +618,29 @@ export class AppendWriter {
         const targetArr = data.get(col.name)!;
         for (let i = 0; i < chunkRows; i++) {
           switch (col.type) {
-            case 'int64': targetArr[rowOffset + i] = buf.readBigInt64LE(i * 8); break;
-            case 'float64': targetArr[rowOffset + i] = buf.readDoubleLE(i * 8); break;
-            case 'int32': targetArr[rowOffset + i] = buf.readInt32LE(i * 4); break;
-            case 'int16': targetArr[rowOffset + i] = buf.readInt16LE(i * 2); break;
+            case 'int64':
+              targetArr[rowOffset + i] = buf.readBigInt64LE(i * 8);
+              break;
+            case 'float64':
+              targetArr[rowOffset + i] = buf.readDoubleLE(i * 8);
+              break;
+            case 'int32':
+              targetArr[rowOffset + i] = buf.readInt32LE(i * 4);
+              break;
+            case 'int16':
+              targetArr[rowOffset + i] = buf.readInt16LE(i * 2);
+              break;
+            case 'string': {
+              // 反向映射：int32 id → string
+              const dict = header.stringDicts?.[col.name];
+              if (dict) {
+                const id = buf.readInt32LE(i * 4);
+                targetArr[rowOffset + i] = dict[id] || '';
+              } else {
+                targetArr[rowOffset + i] = '';
+              }
+              break;
+            }
           }
         }
       }
@@ -579,6 +690,7 @@ export class AppendWriter {
         case 'float64':
           return 8;
         case 'int32':
+        case 'string': // string 存储为 int32 id
           return 4;
         case 'int16':
           return 2;
@@ -603,10 +715,9 @@ export class AppendWriter {
 
       if (header.totalRows === 0 || header.chunkCount === 0) return null;
 
-      // 跳过 header + padding + CRC
-      const headerEndOffset = 4 + 4 + headerLen;
-      const paddingSize = (8 - (headerEndOffset % 8)) % 8;
-      let offset = headerEndOffset + paddingSize + 4; // +4 for header CRC
+      // Header 固定大小 4KB + 4 bytes CRC
+      const RESERVED_HEADER_SIZE = 4096;
+      let offset = RESERVED_HEADER_SIZE + 4;
 
       // 走到最后一个 chunk
       for (let c = 0; c < header.chunkCount; c++) {
@@ -638,6 +749,12 @@ export class AppendWriter {
               case 'int16':
                 out[col.name] = buf.readInt16LE(0);
                 break;
+              case 'string': {
+                const id = buf.readInt32LE(0);
+                const dict = header.stringDicts?.[col.name];
+                out[col.name] = dict ? (dict[id] || '') : '';
+                break;
+              }
               default:
                 out[col.name] = buf.readDoubleLE(0);
             }
@@ -774,6 +891,7 @@ export class AppendWriter {
         case 'float64':
           return 8;
         case 'int32':
+        case 'string': // string 存储为 int32 id
           return 4;
         case 'int16':
           return 2;
@@ -782,7 +900,7 @@ export class AppendWriter {
       }
     };
 
-    const readValue = (t: string, buf: Buffer, offset: number) => {
+    const readValue = (t: string, buf: Buffer, offset: number, stringDict?: string[]) => {
       switch (t) {
         case 'int64':
           return buf.readBigInt64LE(offset);
@@ -792,6 +910,10 @@ export class AppendWriter {
           return buf.readInt32LE(offset);
         case 'int16':
           return buf.readInt16LE(offset);
+        case 'string': {
+          const id = buf.readInt32LE(offset);
+          return stringDict ? (stringDict[id] || '') : '';
+        }
         default:
           return buf.readDoubleLE(offset);
       }
@@ -813,10 +935,9 @@ export class AppendWriter {
 
       const beforeRows = header.totalRows;
 
-      // 跳过 header + padding + CRC
-      const headerEndOffset = 4 + 4 + headerLen;
-      const paddingSize = (8 - (headerEndOffset % 8)) % 8;
-      let offset = headerEndOffset + paddingSize + 4; // +4 for header CRC
+      // Header 固定大小 4KB + 4 bytes CRC
+      const RESERVED_HEADER_SIZE = 4096;
+      let offset = RESERVED_HEADER_SIZE + 4;
 
       const tmpPath = options.tmpPath || `${path}.tmp`;
       const backupPath = options.backupPath || `${path}.bak`;
@@ -868,7 +989,8 @@ export class AppendWriter {
             const col = header.columns[k];
             const byteLen = colByteLens[k];
             const buf = colBufs[k];
-            row[col.name] = readValue(col.type, buf, i * byteLen);
+            const stringDict = col.type === 'string' ? header.stringDicts?.[col.name] : undefined;
+            row[col.name] = readValue(col.type, buf, i * byteLen, stringDict);
           }
 
           const out = transform(row, globalIndex);
@@ -965,9 +1087,9 @@ export class AppendWriter {
       readSync(fd, lenBuf, 0, 4, 4);
       const headerLen = lenBuf.readUInt32LE();
 
-      const headerEndOffset = 4 + 4 + headerLen;
-      const paddingSize = (8 - (headerEndOffset % 8)) % 8;
-      const headerBlockSize = headerEndOffset + paddingSize;
+      // Header 固定大小 4KB
+      const RESERVED_HEADER_SIZE = 4096;
+      const headerBlockSize = RESERVED_HEADER_SIZE;
 
       // 验证 header CRC
       const headerBlock = Buffer.allocUnsafe(headerBlockSize);
@@ -994,7 +1116,22 @@ export class AppendWriter {
 
         let chunkDataSize = 4; // 包含 row count
         for (const col of header.columns) {
-          const byteLen = col.type === 'int64' || col.type === 'float64' ? 8 : col.type === 'int32' ? 4 : 2;
+          let byteLen: number;
+          switch (col.type) {
+            case 'int64':
+            case 'float64':
+              byteLen = 8;
+              break;
+            case 'int32':
+            case 'string': // string 存储为 int32 id
+              byteLen = 4;
+              break;
+            case 'int16':
+              byteLen = 2;
+              break;
+            default:
+              byteLen = 8;
+          }
           chunkDataSize += byteLen * chunkRows;
         }
 
