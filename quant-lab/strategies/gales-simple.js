@@ -168,7 +168,10 @@ function st_init() {
 /**
  * 心跳
  */
-function st_heartbeat(tick) {
+function st_heartbeat(tickJson) {
+  // QuickJS 传递的是 JSON 字符串
+  const tick = (typeof tickJson === 'string') ? JSON.parse(tickJson) : tickJson;
+  
   if (!tick || !tick.price) return;
   
   state.lastPrice = tick.price;
@@ -211,7 +214,9 @@ function st_heartbeat(tick) {
 /**
  * 参数热更新（不重启沙箱）
  */
-function st_onParamsUpdate(newParams) {
+function st_onParamsUpdate(newParamsJson) {
+  const newParams = (typeof newParamsJson === 'string') ? JSON.parse(newParamsJson) : newParamsJson;
+  
   logInfo('[Gales] 参数热更新: ' + JSON.stringify(newParams));
   
   // 更新配置
