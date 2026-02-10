@@ -1,0 +1,22 @@
+{
+  "name": "@moltbaby/workpool-lib",
+  "version": "2.0.0",
+  "description": "通用资源编排框架 - 统一调度 AI Agent、容器、终端等资源",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./engine/*": "./src/engine/*.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "bun test"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/bun": "latest"
+  }
+}
