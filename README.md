@@ -2,17 +2,6 @@
 
 **N-Dimensional Time Series Database** — 高性能嵌入式时序数据库，为量化交易而生。
 
-📦 **当前版本**: v0.9.2.6
-
----
-
-## 📖 完整文档
-
-👉 请查看主仓库的完整文档：
-**https://github.com/mgttt/moltbaby/tree/main/ndtsdb**
-
----
-
 ## 快速安装
 
 ```bash
@@ -35,8 +24,5 @@ bun add github:mgttt/ndtsdb-releases#v0.9.2.6
 
 ---
 
-⚠️ **注意**: 此仓库为自动发布仓库，不接受直接 PR。请向 [moltbaby/ndtsdb](https://github.com/mgttt/moltbaby/tree/main/ndtsdb) 提交代码。
-
----
-
+⚠️ **注意**: 此仓库为自动发布仓库，不接受 PR。有问题发issues
 MIT License
