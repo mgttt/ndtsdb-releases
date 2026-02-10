@@ -6,7 +6,7 @@
 import { openSync, closeSync, writeSync, readSync, fstatSync, existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import { dirname } from 'path';
 import { TombstoneManager } from './tombstone.js';
-import { DeltaEncoderInt64, DeltaEncoderInt32, RLEEncoder } from './compression.js';
+import { DeltaEncoderInt64, DeltaEncoderInt32, RLEEncoder, GorillaEncoder } from './compression.js';
 
 /**
  * CRC32 计算 (IEEE 802.3)
@@ -337,7 +337,7 @@ export class AppendWriter {
       case 'int32':
         return 'delta'; // 默认 delta（若 RLE 更优可手动指定）
       case 'float64':
-        return 'none'; // Gorilla 暂不集成
+        return 'gorilla'; // 浮点数时序数据（价格、指标等）
       default:
         return 'none';
     }
@@ -379,9 +379,15 @@ export class AppendWriter {
           break;
         }
 
-        case 'gorilla':
-          // TODO: Gorilla 压缩集成
-          return null;
+        case 'gorilla': {
+          if (type === 'float64') {
+            const arr = new Float64Array(buf.buffer, buf.byteOffset, rowCount);
+            const encoder = new GorillaEncoder();
+            const compressed = encoder.compress(arr);
+            return Buffer.from(compressed);
+          }
+          break;
+        }
 
         case 'none':
         default:
@@ -428,9 +434,14 @@ export class AppendWriter {
           break;
         }
 
-        case 'gorilla':
-          // TODO: Gorilla 解压
-          return null;
+        case 'gorilla': {
+          if (type === 'float64') {
+            const encoder = new GorillaEncoder();
+            const decompressed = encoder.decompress(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          }
+          break;
+        }
 
         case 'none':
         default:

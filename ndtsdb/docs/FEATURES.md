@@ -13,8 +13,10 @@ ndtsdb 提供多种压缩算法，适用于不同数据类型和模式：
 ### Gorilla Compression
 - **用途**：浮点数时序数据（价格、指标等）
 - **算法**：Delta-of-Delta + XOR（Facebook 开源）
-- **压缩率**：70-90%（浮点数），90-95%（时间戳）
-- **实现**：C FFI（libndts）+ JavaScript fallback
+- **压缩率**：20-30%（真实浮点数），97%（常量值）
+- **类型**：float64
+- **实现**：纯 TypeScript（GorillaEncoder）
+- **注意**：对随机浮点数压缩率较低（~20%），但对平滑/重复数据效果好
 
 ### Delta Encoding
 - **用途**：单调递增序列（timestamp, ID）
@@ -42,14 +44,25 @@ const writer = new AppendWriter(path, columns, {
   compression: {
     enabled: true,
     algorithms: {
-      timestamp: 'delta',
-      symbol_id: 'rle',
+      timestamp: 'delta',    // int64: 单调递增 → Delta
+      price: 'gorilla',      // float64: 浮点数 → Gorilla
+      symbol_id: 'rle',      // int32: 重复值 → RLE
     },
   },
 });
 ```
-- 压缩启用时：chunk 写入为 `rowCount + (colLen+colData)*N + crc32`
-- 未启用压缩：保持旧格式（固定列长），读取端自动兼容
+- **支持算法**：
+  - `delta`：int64/int32 单调递增序列
+  - `rle`：int32 重复值序列
+  - `gorilla`：float64 浮点数时序数据
+  - `none`：不压缩
+- **文件格式**：
+  - 压缩启用时：chunk 写入为 `rowCount + (colLen+colData)*N + crc32`
+  - 未启用压缩：保持旧格式（固定列长），读取端自动兼容
+- **自动选择**：不指定 algorithms 时，自动选择最优算法
+  - int64 → delta
+  - int32 → delta
+  - float64 → gorilla
 
 ---
 

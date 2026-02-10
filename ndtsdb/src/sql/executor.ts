@@ -213,7 +213,14 @@ export class SQLExecutor {
           }
         } else {
           if ((select as any).havingExpr) throw new Error('HAVING requires GROUP BY');
-          rows = baseRows.map((r) => this.projectRow(r, selections));
+          
+          // 检测是否有聚合函数（如果有，执行整体聚合）
+          if (this.hasAggregateInSelections(selections)) {
+            // 整体聚合：把所有行当作一个组
+            rows = this.executeGroupBy(baseRows, selections, []);
+          } else {
+            rows = baseRows.map((r) => this.projectRow(r, selections));
+          }
         }
 
         const outputColumns = selections.map((s) => s.name);
@@ -305,7 +312,15 @@ export class SQLExecutor {
       if ((select as any).havingExpr) {
         throw new Error('HAVING requires GROUP BY');
       }
-      rows = baseRows.map((r) => this.projectRow(r, rewrittenSel));
+      
+      // 检测是否有聚合函数（如果有，执行整体聚合）
+      const hasAgg = this.hasAggregateInSelections(rewrittenSel);
+      if (hasAgg) {
+        // 整体聚合：把所有行当作一个组
+        rows = this.executeGroupBy(baseRows, rewrittenSel, []);
+      } else {
+        rows = baseRows.map((r) => this.projectRow(r, rewrittenSel));
+      }
     }
 
     const outputColumns = selections.map((s) => s.name);
@@ -2181,8 +2196,37 @@ export class SQLExecutor {
   }
 
   // ---------------------------------------------------------------------------
-  // GROUP BY
+  // GROUP BY & Aggregation
   // ---------------------------------------------------------------------------
+
+  /**
+   * 检测表达式是否包含聚合函数
+   */
+  private hasAggregateFunction(expr: string): boolean {
+    const normalized = this.normalizeExpr(expr).toLowerCase().replace(/\s+/g, '');
+    const aggregateFunctions = ['count', 'sum', 'avg', 'min', 'max', 'stddev', 'variance', 'first', 'last'];
+    
+    for (const fn of aggregateFunctions) {
+      if (normalized.includes(`${fn}(`)) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  /**
+   * 检测 SelectItem 列表中是否有聚合函数
+   */
+  private hasAggregateInSelections(selections: SelectItem[]): boolean {
+    for (const sel of selections) {
+      const rawExpr = (sel as any).__rewrittenExpr ?? sel.expr;
+      if (this.hasAggregateFunction(rawExpr)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   private executeGroupBy(rows: Array<Record<string, any>>, selections: SelectItem[], groupByCols: string[]): Array<Record<string, any>> {
     const groups = new Map<string, Array<Record<string, any>>>();

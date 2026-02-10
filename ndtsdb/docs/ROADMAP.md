@@ -229,12 +229,13 @@
 | **v0.9.3.6** | 02-10 16:30 | **分区查询优化 v1**（timeRange 提前过滤分区扫描） |
 | **v0.9.3.7** | 02-10 16:45 | **压缩工具导出** + **PartitionedTable 与 SQL 集成**（extractTimeRange + queryPartitionedTableToColumnar） |
 | **v0.9.3.8** | 02-10 17:10 | **AppendWriter 压缩文件格式集成 v1**（启用压缩时写入 colLen+colData，读取端自动解压；兼容旧格式） |
+| **v0.9.3.9** | 02-10 18:35 | **Gorilla 压缩集成到 AppendWriter**（float64 列支持；GorillaEncoder 导出；quant-lib 压缩率 0.77% → 12%） |
+| **v0.9.3.10** | 02-10 18:45 | **SQL 聚合函数补全**（支持无 GROUP BY 的 AVG/SUM/COUNT(*)；整体聚合逻辑；79 tests pass） |
 
 ### 计划中（2026-02-10 ~ 02-23）
 
 | 版本 | 预计时间 | 计划内容 |
 |------|----------|----------|
-| **v0.9.3.9** | 02-11 ~ 02-12 | **Gorilla 压缩集成到 AppendWriter**（float64 列压缩支持；预期压缩率提升到 70-85%） |
 | **quant-lib v1** | 02-12 ~ 02-14 | **分区表迁移**（按 symbol 哈希分区；文件数减少 90%；优化单 symbol 查询） |
 | **quant-lib v2** | 02-14 ~ 02-16 | **流式聚合集成**（实时 SMA/EMA/StdDev；WebSocket 行情回调） |
 | **quant-lab v1** | 02-17 ~ 02-23 | **策略运行时**（回测引擎 + 实盘引擎 + 策略接口） |

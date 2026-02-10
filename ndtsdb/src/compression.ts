@@ -348,6 +348,38 @@ export class DeltaEncoderInt32 {
 }
 
 /**
+ * Gorilla 编码器（Float64 数组）
+ * 适用于浮点数时序数据（价格、指标等）
+ * 压缩率：70-90%
+ */
+export class GorillaEncoder {
+  compress(values: Float64Array): Uint8Array {
+    if (values.length === 0) return new Uint8Array(0);
+
+    const compressor = new GorillaCompressor(values.length * 8 * 2); // 预留空间
+    for (let i = 0; i < values.length; i++) {
+      compressor.compress(values[i]);
+    }
+    return compressor.finish();
+  }
+
+  decompress(buffer: Uint8Array, count: number): Float64Array {
+    if (buffer.length === 0) return new Float64Array(0);
+
+    const decompressor = new GorillaDecompressor(buffer);
+    const result = new Float64Array(count);
+
+    for (let i = 0; i < count; i++) {
+      const value = decompressor.decompress();
+      if (value === null) break;
+      result[i] = value;
+    }
+
+    return result;
+  }
+}
+
+/**
  * RLE (Run-Length Encoding) 编码器
  * 适用于有大量重复值的序列（如状态字段、symbol ID）
  */

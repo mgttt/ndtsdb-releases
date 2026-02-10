@@ -1,6 +1,6 @@
 {
   "name": "ndtsdb",
-  "version": "0.9.3.8",
+  "version": "0.9.3.10",
   "description": "High-performance N-dimensional time-series database inspired by QuestDB",
   "main": "src/index.ts",
   "type": "module",
