@@ -2,7 +2,7 @@
 // 分区表管理 - 按时间/symbol 自动分区
 // ============================================================
 
-import { AppendWriter, AppendFileHeader } from './append.js';
+import { AppendWriter, AppendFileHeader, AppendWriterOptions } from './append.js';
 import { existsSync, mkdirSync, readdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 
@@ -33,17 +33,20 @@ export class PartitionedTable {
   private basePath: string;
   private columns: Array<{ name: string; type: string }>;
   private strategy: PartitionStrategy;
+  private options?: AppendWriterOptions;
   private partitions: Map<string, PartitionMeta> = new Map();
   private writers: Map<string, AppendWriter> = new Map();
 
   constructor(
     basePath: string,
     columns: Array<{ name: string; type: string }>,
-    strategy: PartitionStrategy
+    strategy: PartitionStrategy,
+    options?: AppendWriterOptions
   ) {
     this.basePath = basePath;
     this.columns = columns;
     this.strategy = strategy;
+    this.options = options;
 
     // 确保基础目录存在
     if (!existsSync(basePath)) {
@@ -147,7 +150,7 @@ export class PartitionedTable {
     }
 
     const path = join(this.basePath, `${label}.ndts`);
-    const writer = new AppendWriter(path, this.columns);
+    const writer = new AppendWriter(path, this.columns, this.options);
 
     const isNew = !existsSync(path);
     writer.open(); // open() 会自动创建文件如果不存在
