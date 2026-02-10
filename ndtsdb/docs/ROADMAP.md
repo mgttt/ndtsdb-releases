@@ -12,7 +12,7 @@
 
 | 限制 | 影响 | 当前 workaround | 优先级 |
 |------|------|-----------------|--------|
-| **Append-only 写入** | 无法 DELETE/UPDATE，需重写整个文件 | 读取→过滤→重写 / compact | 🔴 高 |
+| **Append-only 写入** | 无法原地 DELETE/UPDATE（仍需重写文件） | `AppendWriter.rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换）；未来可加 tombstone/增量 compact | 🔴 高 |
 | **有限 SQL 支持** | JOIN、子查询、复杂 WHERE 覆盖不足 | 逐步补齐 SQL 子集 | 🔴 高 |
 | **无二级索引** | 范围查询/复合过滤可能退化为全表扫描 | 全表扫描 / 未来 BTree | 🟡 中 |
 | **字符串持久化** | string 目前仅内存可用（CTE/materialize 场景 OK） | 暂不持久化 | 🟡 中 |
@@ -57,8 +57,8 @@
 | 功能 | 状态 | 说明 | 优先级 |
 |------|------|------|--------|
 | **PARTITION BY 性能/一致性** | ✅ 已实现 | 通用路径可用；新增 `tryExecutePartitionTail` 快速路径，专门优化 CTE + PARTITION BY + ROW_NUMBER + WHERE rn=1 模式（波动率脚本典型查询），避免全表物化 | ✅ P0 |
-| **复杂 WHERE 表达式** | ❌ 缺失 | 括号优先级 + `AND/OR/NOT`（现在还是线性 conditions），为 HAVING/子查询/CASE 打基础 | 🟡 P1 |
-| **ORDER BY <expr>** | ❌ 缺失 | 目前仅支持列名（对齐 SQLite/DuckDB：支持表达式排序） | 🟡 P1 |
+| **复杂 WHERE 表达式** | ✅ 已实现 | 括号优先级 + `AND/OR/NOT`（WHERE AST + executor 评估；并保留 legacy where[] 兼容） | ✅ P0 |
+| **ORDER BY <expr>** | ✅ 已实现 | 支持 alias/ordinal（ORDER BY 1）/标量表达式 + 多 key（对齐 SQLite/DuckDB 常用子集） | ✅ P0 |
 | **HAVING** | ❌ 缺失 | GROUP BY 后过滤 | 🟢 P2 |
 | **JOIN** | ❌ 缺失 | INNER/LEFT JOIN | 🟢 P2 |
 | **子查询** | ❌ 缺失 | `FROM (SELECT ...)` / `IN (SELECT ...)` | 🟢 P2 |
@@ -67,8 +67,13 @@
 
 **1. 支持 UPDATE/DELETE（重写优化）** ⭐⭐⭐
 
-Append-only 是最大限制。方案：
-- 添加 `CompactWriter`：读取旧 chunk → 应用变更 → 写入新文件
+Append-only 是最大限制。
+
+现状（已落地，够用版）：
+- ✅ `AppendWriter.rewrite/deleteWhere/updateWhere`：读取旧文件 → 写 tmp → 原子替换（适合小文件/每 symbol 文件场景）
+
+下一步（优化版）：
+- 添加 `CompactWriter`：按 chunk 流式重写（避免 readAll 全量展开）
 - 支持 tombstone 标记（软删除，定期 compact）
 - 参考 LSM-Tree 的合并策略
 
@@ -89,7 +94,7 @@ await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
 - ~~CTE (WITH 子句)~~ ✅ 已实现
 - JOIN 支持（至少 INNER JOIN）- 多表关联
 - 子查询（WHERE col IN (SELECT ...)）
-- 复杂 WHERE（嵌套括号优先级）
+- ~~复杂 WHERE（嵌套括号优先级）~~ ✅ 已实现
 - HAVING 子句（GROUP BY 后过滤）
 
 ### 🟡 中优先级（提升易用性）
@@ -226,7 +231,7 @@ Chunk 级原子写入：
 |------|--------|------|
 | **v0.11.0** | ✅ **已完成** | **SQL CTE (WITH) + 多列 IN + `||` + ROUND/SQRT** |
 | **v0.11.1** | ✅ **已完成** | **Inline Window + PARTITION BY fast-path 统一**（典型“每分区取最新一行”的窗口报表，避免全表物化） |
-| **v0.11.2** | ✅ **已完成（部分）** | **复杂 WHERE（括号优先级 / AND-OR-NOT）** ✅；`ORDER BY <expr>` 🟡 |
+| **v0.11.2** | ✅ **已完成** | **复杂 WHERE（括号优先级 / AND-OR-NOT）** ✅；**ORDER BY <expr>（alias/ordinal/expr）** ✅ |
 | **v0.12.0** | 🔴 高 | UPDATE/DELETE 支持（CompactWriter / Tombstone） |
 | **v0.13.0** | 🔴 高 | SQL JOIN + 子查询 + HAVING |
 | **v0.14.0** | 🟡 中 | 自动二级索引（BTree） |

@@ -3,7 +3,7 @@
 // append-only 模式，不重写整个文件
 // ============================================================
 
-import { openSync, closeSync, writeSync, readSync, fstatSync, existsSync, mkdirSync } from 'fs';
+import { openSync, closeSync, writeSync, readSync, fstatSync, existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import { dirname } from 'path';
 
 /**
@@ -58,6 +58,20 @@ export interface AppendFileHeader {
   totalRows: number;    // 所有 chunk 的总行数
   chunkCount: number;   // chunk 数量
 }
+
+export type AppendRewriteResult = {
+  beforeRows: number;
+  afterRows: number;
+  deletedRows: number;
+  chunksWritten: number;
+};
+
+export type AppendRewriteOptions = {
+  batchSize?: number; // 控制输出 chunk 大小（默认 10k）
+  tmpPath?: string;
+  backupPath?: string;
+  keepBackup?: boolean;
+};
 
 /**
  * 增量写入器
@@ -460,6 +474,121 @@ export class AppendWriter {
     } finally {
       closeSync(fd);
     }
+  }
+
+  // (types moved to top-level)
+
+  // (types moved to top-level)
+
+  /**
+   * Rewrite/Compact：读取旧文件 → 逐行 transform → 写入新文件 → 原子替换。
+   *
+   * - transform 返回 null 表示删除该行
+   * - transform 返回新 row 表示保留/更新
+   */
+  static rewrite(
+    path: string,
+    transform: (row: Record<string, any>, index: number) => Record<string, any> | null,
+    options: AppendRewriteOptions = {}
+  ): AppendRewriteResult {
+    if (!existsSync(path)) {
+      return { beforeRows: 0, afterRows: 0, deletedRows: 0, chunksWritten: 0 };
+    }
+
+    const { header, data } = AppendWriter.readAll(path);
+    const beforeRows = header.totalRows;
+
+    const tmpPath = options.tmpPath || `${path}.tmp`;
+    const backupPath = options.backupPath || `${path}.bak`;
+    const batchSize = options.batchSize ?? 10_000;
+
+    try {
+      if (existsSync(tmpPath)) rmSync(tmpPath);
+    } catch {}
+    try {
+      if (existsSync(backupPath)) rmSync(backupPath);
+    } catch {}
+
+    const writer = new AppendWriter(tmpPath, header.columns);
+    writer.open();
+
+    let deletedRows = 0;
+    let afterRows = 0;
+    let chunksWritten = 0;
+
+    const batch: Record<string, any>[] = [];
+
+    for (let i = 0; i < beforeRows; i++) {
+      const row: Record<string, any> = {};
+      for (const col of header.columns) {
+        const arr = data.get(col.name) as any;
+        row[col.name] = arr ? arr[i] : undefined;
+      }
+
+      const out = transform(row, i);
+      if (out == null) {
+        deletedRows++;
+        continue;
+      }
+
+      batch.push(out);
+      afterRows++;
+
+      if (batch.length >= batchSize) {
+        writer.append(batch);
+        chunksWritten++;
+        batch.length = 0;
+      }
+    }
+
+    if (batch.length > 0) {
+      writer.append(batch);
+      chunksWritten++;
+    }
+
+    writer.close();
+
+    // 原子替换：path -> bak, tmp -> path
+    if (existsSync(path)) renameSync(path, backupPath);
+    renameSync(tmpPath, path);
+
+    if (!options.keepBackup) {
+      try {
+        if (existsSync(backupPath)) rmSync(backupPath);
+      } catch {}
+    }
+
+    return { beforeRows, afterRows, deletedRows, chunksWritten };
+  }
+
+  static deleteWhere(
+    path: string,
+    predicate: (row: Record<string, any>, index: number) => boolean,
+    options: AppendRewriteOptions = {}
+  ): AppendRewriteResult {
+    return AppendWriter.rewrite(
+      path,
+      (row, i) => (predicate(row, i) ? null : row),
+      options
+    );
+  }
+
+  static updateWhere(
+    path: string,
+    predicate: (row: Record<string, any>, index: number) => boolean,
+    patchOrUpdater: Partial<Record<string, any>> | ((row: Record<string, any>) => Partial<Record<string, any>>),
+    options: AppendRewriteOptions = {}
+  ): AppendRewriteResult {
+    const isFn = typeof patchOrUpdater === 'function';
+    return AppendWriter.rewrite(
+      path,
+      (row, i) => {
+        if (!predicate(row, i)) return row;
+        const patch = isFn ? (patchOrUpdater as any)(row) : patchOrUpdater;
+        return { ...row, ...patch };
+      },
+      options
+    );
   }
 
   /**

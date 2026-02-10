@@ -2,6 +2,10 @@
 
 **N-Dimensional Time Series Database** — 高性能嵌入式时序数据库，为量化交易而生。
 
+<!-- VERSION_START -->
+**Version: 0.9.2.6**
+<!-- VERSION_END -->
+
 - Scope / Non-Goals: `docs/SCOPE.md`
 - Features: `docs/FEATURES.md`
 - Roadmap: `docs/ROADMAP.md`
@@ -175,6 +179,11 @@ KEY (symbol, interval, timestamp);
 | 批量 UPDATE | 360K rows/s |
 
 ## 版本
+
+- **v0.9.2.6** (2026-02-10)
+  - SQL 扩展: CTE (WITH), 多列 IN, 字符串拼接 `||`, ROUND/SQRT
+  - ORDER BY 支持表达式 (alias/ordinal)
+  - 统一版本号管理 (VERSION 文件)
 
 - **v0.9.2** (2026-02-09)
   - SymbolTable.getId() / has() — 只读查询不创建新 ID

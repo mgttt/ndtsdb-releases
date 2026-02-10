@@ -12,6 +12,7 @@
 - chunked append-only
 - header + per-chunk CRC32
 - reopen & append 无需重写
+- **rewrite/compact**：`rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换）
 
 ### ColumnarTable
 - 内存列式表
@@ -29,7 +30,7 @@
 
 - SELECT / FROM（单表）
 - WHERE（括号优先级 + AND/OR/NOT；基础比较 + LIKE + IN）
-- ORDER BY（列名）
+- ORDER BY（列名 / alias / ordinal(ORDER BY 1) / 标量表达式；多 key 支持 ASC/DESC）
 - LIMIT / OFFSET
 - GROUP BY（基础聚合）
 - CTE / WITH（materialize 临时表）
@@ -76,7 +77,6 @@
 ## 5. Not Yet (Planned)
 
 - JOIN / 子查询 / HAVING
-- ORDER BY <expr>
-- UPDATE/DELETE（compact/tombstone）
+- tombstone/增量 compact（避免全量重写；可选）
 - 二级索引（BTree 等）
 - string 持久化（透明字典编码/变长编码）

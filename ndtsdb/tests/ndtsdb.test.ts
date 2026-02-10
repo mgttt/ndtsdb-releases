@@ -178,6 +178,49 @@ describe('AppendWriter', () => {
     const result = AppendWriter.verify(path);
     expect(result.ok).toBe(true);
   });
+
+  it('should deleteWhere by rewriting file', () => {
+    const path = `${TEST_DIR}/rewrite-delete.ndts`;
+
+    const writer = new AppendWriter(path, [{ name: 'v', type: 'int32' }]);
+    writer.open();
+    writer.append([{ v: 1 }, { v: 2 }, { v: 3 }, { v: 4 }, { v: 5 }]);
+    writer.close();
+
+    const res = AppendWriter.deleteWhere(path, (row) => Number(row.v) % 2 === 0, { batchSize: 2 });
+    expect(res.beforeRows).toBe(5);
+    expect(res.afterRows).toBe(3);
+    expect(res.deletedRows).toBe(2);
+
+    const { header, data } = AppendWriter.readAll(path);
+    expect(header.totalRows).toBe(3);
+    const v = data.get('v') as Int32Array;
+    expect(Array.from(v)).toEqual([1, 3, 5]);
+  });
+
+  it('should updateWhere by rewriting file', () => {
+    const path = `${TEST_DIR}/rewrite-update.ndts`;
+
+    const writer = new AppendWriter(path, [{ name: 'v', type: 'int32' }]);
+    writer.open();
+    writer.append([{ v: 1 }, { v: 2 }, { v: 3 }, { v: 4 }, { v: 5 }]);
+    writer.close();
+
+    const res = AppendWriter.updateWhere(
+      path,
+      (row) => Number(row.v) >= 3,
+      (row) => ({ v: Number(row.v) * 10 }),
+      { batchSize: 3 }
+    );
+    expect(res.beforeRows).toBe(5);
+    expect(res.afterRows).toBe(5);
+    expect(res.deletedRows).toBe(0);
+
+    const { header, data } = AppendWriter.readAll(path);
+    expect(header.totalRows).toBe(5);
+    const v = data.get('v') as Int32Array;
+    expect(Array.from(v)).toEqual([1, 2, 30, 40, 50]);
+  });
 });
 
 // ─── CRC32 ────────────────────────────────────────
