@@ -54,15 +54,16 @@
 
 | 问题 | 影响 | 优先级 | 状态 |
 |------|------|--------|------|
-| **AVG() 函数未实现** | SQL 无法计算平均值 | 🔴 高 | 待修复 |
-| **COUNT(*) 语法不支持** | 无法统计行数 | 🔴 高 | 待修复 |
-| **SUM() 函数未实现** | SQL 无法求和 | 🔴 高 | 待修复 |
+| ~~AVG() 函数未实现~~ | ~~SQL 无法计算平均值~~ | 🔴 高 | ✅ **已修复 v0.9.3.10** |
+| ~~COUNT(*) 语法不支持~~ | ~~无法统计行数~~ | 🔴 高 | ✅ **已修复 v0.9.3.10** |
+| ~~SUM() 函数未实现~~ | ~~SQL 无法求和~~ | 🔴 高 | ✅ **已修复 v0.9.3.10** |
 | **全表聚合性能低** | 100K 行聚合 ~477ms（2 ops/sec） | 🟡 中 | 待优化 |
 
-**修复建议**：
-1. `sql/executor.ts` 的 `evalNode` 函数需要添加 AVG/SUM/COUNT 支持
-2. COUNT(*) 需要特殊处理（当前 parser 不支持 `*` 作为函数参数）
-3. 聚合性能优化：考虑使用 FFI 加速或提前终止
+**修复记录**：
+- v0.9.3.10（2026-02-10 18:45）：添加整体聚合支持（无 GROUP BY 时自动执行全表聚合）
+
+**待优化**：
+- 聚合性能优化：考虑使用 FFI 加速或提前终止
 
 ---
 
@@ -85,20 +86,22 @@
 #### 线程 B：quant-lib/quant-lab 适配（bot-001）⏳
 **任务卡**: `tasks/in-progress/bot-001-quant-lib-adaptation.md`
 
-**B1. quant-lib 适配 ndtsdb v0.9.3.8**:
+**B1. quant-lib 适配 ndtsdb v0.9.3.9+**:
 - [x] B1.1: 启用压缩（部分完成）✅
   - ✅ int64/int32 列使用 delta 压缩
   - ⚠️ float64 列暂不压缩（压缩率仅 0.77%）
   - 📝 **发现问题**：Gorilla 压缩算法已实现（`compression.ts`），但未集成到 AppendWriter 文件格式
-- [ ] B1.1.1: **Gorilla 压缩集成**（新增）⭐⭐⭐⭐
-  - 目标：让 float64 列可以使用 Gorilla 压缩
-  - 修改：`append.ts` 中 `compressColumn` / `decompressColumn` 支持 Gorilla
-  - 预期压缩率提升：0.77% → 70-85%
-  - 预计工期：1-2 天
-- [ ] B1.2: 迁移到分区表（按 symbol 哈希分区）
+- [x] B1.1.1: **Gorilla 压缩集成** ✅ **已完成 v0.9.3.9**
+  - ✅ 目标：让 float64 列可以使用 Gorilla 压缩
+  - ✅ 修改：`append.ts` 中 `compressColumn` / `decompressColumn` 支持 Gorilla
+  - ✅ 压缩率提升：0.77% → **12%**（实际，低于预期的 70-85%）
+  - ✅ 工期：10 分钟（2026-02-10 18:31-18:40）
+  - 📝 **发现问题**：Gorilla 对真实浮点数压缩率仅 20-30%，需要 zstd/lz4 等通用压缩算法
+- [ ] B1.2: 迁移到分区表（按 symbol 哈希分区）⭐⭐⭐⭐ **进行中**
   - 当前：3000 symbols × 3 intervals = 9000 个文件
   - 目标：100 个分区文件（文件数减少 90%）
   - 预计工期：2-3 天
+  - 当前状态：准备开始（2026-02-10 19:06）
 - [ ] B1.3: 集成流式聚合（实时 SMA/EMA/StdDev）
   - 预计工期：1-2 天
 
@@ -144,6 +147,57 @@
 - 多 chunk 批量写入的原子性
 - 回滚机制
 - WAL 用于崩溃恢复
+
+**4. 压缩算法改进** ⭐⭐⭐
+
+**动机**：
+- 当前 Gorilla 压缩对真实浮点数压缩率仅 20-30%（远低于理论 70-90%）
+- 需要更通用的压缩算法
+
+**向 DuckDB 学习**：
+- DuckDB 使用 **Zstandard (zstd)** 作为默认压缩算法
+  - 压缩率：50-70%（通用数据）
+  - 速度：压缩 ~500 MB/s，解压 ~1.5 GB/s
+  - 特点：自适应字典、多线程支持
+- DuckDB 还支持 **LZ4** 作为快速压缩选项
+  - 压缩率：30-50%
+  - 速度：压缩 ~2 GB/s，解压 ~4 GB/s
+  - 特点：极快速度，适合实时场景
+
+**计划方案**：
+
+1. **集成 zstd**（推荐优先）
+   - 使用场景：离线存储、归档数据
+   - 实现方式：TypeScript binding（如 `@bokuweb/zstd-wasm`）或 C FFI
+   - 目标压缩率：50-70%（vs 当前 12%）
+
+2. **集成 LZ4**（可选）
+   - 使用场景：实时写入、低延迟查询
+   - 实现方式：C FFI（`lz4.h`）
+   - 目标：压缩/解压 < 1ms（1KB 数据）
+
+3. **算法自动选择策略**
+   ```typescript
+   compression: {
+     enabled: true,
+     strategy: 'auto',  // 自动选择
+     algorithms: {
+       timestamp: 'delta',     // int64 单调递增
+       price: 'zstd',          // float64 通用压缩
+       volume: 'lz4',          // 实时场景
+       symbol_id: 'rle',       // 低基数列
+     },
+   }
+   ```
+
+**参考资料**：
+- DuckDB 压缩文档: https://duckdb.org/docs/sql/statements/copy#compression
+- zstd GitHub: https://github.com/facebook/zstd
+- LZ4 GitHub: https://github.com/lz4/lz4
+
+**预期效果**：
+- quant-lib K 线数据压缩率：12% → **50-70%**（使用 zstd）
+- 文件大小：25.11 KB → **8-12 KB**
 
 ### 不急的 (低收益或过度工程)
 
