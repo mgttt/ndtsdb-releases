@@ -672,9 +672,16 @@ export class ColumnarTable {
     }
 
     // 验证列存在
-    for (const col of columns) {
+    const defs = columns.map((col) => {
       const def = this.columnDefs.find((d) => d.name === col);
       if (!def) throw new Error(`Column not found: ${col}`);
+      return def;
+    });
+
+    // 限制：最后一列必须是数值列（用于 BTree range）
+    const lastDef = defs[defs.length - 1];
+    if (lastDef.type !== 'int64' && lastDef.type !== 'float64' && lastDef.type !== 'int32' && lastDef.type !== 'int16') {
+      throw new Error(`Composite index last column must be numeric, got: ${lastDef.type}`);
     }
 
     const key = columns.join(',');

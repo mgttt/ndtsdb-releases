@@ -1,166 +1,192 @@
 // ============================================================
 // 复合索引（多列组合）
-// 例如：(symbol, timestamp) → 先按 symbol 分组，再按 timestamp 建 BTree
+// 目标：覆盖最常见的 (symbol, timestamp) 场景
+//
+// 结构（N 列）：
+// - 前 N-1 列：嵌套 Map（key -> next）
+// - 最后一列：BTreeIndex（key -> rowIndices）
+//
+// 例子：columns = ['symbol','timestamp']
+//   root: Map<symbol, BTreeIndex<timestamp>>
 // ============================================================
 
 import { BTreeIndex } from './btree.js';
 
-type IndexKey = number | bigint | string;
+type PrefixKey = number | bigint | string;
 
-/**
- * 复合索引：支持多列组合查询
- * 
- * 例子：
- * - (symbol, timestamp) → Map<symbol, BTreeIndex<timestamp>>
- * - 查询 symbol='BTC' AND timestamp>=1000 → 先定位 symbol，再用 BTree 范围查询
- */
+type RangeFilter<T> = {
+  gte?: T;
+  lte?: T;
+  gt?: T;
+  lt?: T;
+};
+
+type FilterValue = PrefixKey | RangeFilter<number | bigint>;
+
 export class CompositeIndex {
-  private columns: string[];
-  private index: Map<string, any>; // 递归嵌套结构
+  private readonly columns: string[];
+  private readonly root: Map<string, any>; // Map<string, Map|BTreeIndex>
 
   constructor(columns: string[]) {
     if (columns.length < 2) {
       throw new Error('Composite index requires at least 2 columns');
     }
     this.columns = columns;
-    this.index = new Map();
+    this.root = new Map();
   }
 
-  /**
-   * 插入一条记录到复合索引
-   */
-  insert(values: IndexKey[], rowIndex: number): void {
-    if (values.length !== this.columns.length) {
-      throw new Error(`Expected ${this.columns.length} values, got ${values.length}`);
-    }
-
-    this.insertRecursive(this.index, values, 0, rowIndex);
-  }
-
-  private insertRecursive(
-    level: Map<string, any>,
-    values: IndexKey[],
-    depth: number,
-    rowIndex: number,
-  ): void {
-    const key = String(values[depth]); // 统一转字符串作为 Map key
-
-    if (depth === values.length - 1) {
-      // 最后一层：使用 BTree 存储行号
-      if (!level.has(key)) {
-        level.set(key, new BTreeIndex<IndexKey>(32));
-      }
-      const btree = level.get(key) as BTreeIndex<IndexKey>;
-      btree.insert(values[depth], rowIndex);
-    } else {
-      // 中间层：继续嵌套 Map
-      if (!level.has(key)) {
-        level.set(key, new Map());
-      }
-      this.insertRecursive(level.get(key) as Map<string, any>, values, depth + 1, rowIndex);
-    }
-  }
-
-  /**
-   * 查询复合索引
-   * @param filters 条件对象，例如：{ symbol: 'BTC', timestamp: { gte: 1000 } }
-   * @returns 匹配的行号数组
-   */
-  query(filters: Record<string, IndexKey | { gte?: IndexKey; lte?: IndexKey; gt?: IndexKey; lt?: IndexKey }>): number[] {
-    // 从第一列开始递归查询
-    return this.queryRecursive(this.index, filters, 0);
-  }
-
-  private queryRecursive(
-    level: Map<string, any>,
-    filters: Record<string, any>,
-    depth: number,
-  ): number[] {
-    const colName = this.columns[depth];
-    const filter = filters[colName];
-
-    if (filter === undefined) {
-      // 没有该列的过滤条件 → 扫描所有子树
-      const results: number[] = [];
-      for (const child of level.values()) {
-        if (depth === this.columns.length - 1) {
-          // 最后一层：BTree
-          const btree = child as BTreeIndex<IndexKey>;
-          results.push(...btree.getAllRows());
-        } else {
-          // 中间层：递归
-          results.push(...this.queryRecursive(child as Map<string, any>, filters, depth + 1));
-        }
-      }
-      return results;
-    }
-
-    // 范围查询（只在最后一层 BTree 有效）
-    if (typeof filter === 'object' && ('gte' in filter || 'lte' in filter || 'gt' in filter || 'lt' in filter)) {
-      if (depth !== this.columns.length - 1) {
-        throw new Error('Range query only supported on the last column');
-      }
-
-      // 此时 level 应该只有一个 entry（前面的列已经精确匹配）
-      // 但为了安全，遍历所有 BTree（如果前面有列没有过滤条件）
-      const results: number[] = [];
-      for (const btree of level.values()) {
-        const tree = btree as BTreeIndex<IndexKey>;
-        const { gte, lte, gt, lt } = filter;
-
-        if (gte !== undefined && lte !== undefined) {
-          results.push(...tree.rangeQuery(gte as any, lte as any));
-        } else if (gt !== undefined && lt !== undefined) {
-          // gt 和 lt 之间的范围（不包含边界）
-          const allGt = tree.greaterThan(gt as any);
-          const allLt = tree.lessThan(lt as any);
-          const gtSet = new Set(allGt);
-          results.push(...allLt.filter(r => gtSet.has(r)));
-        } else if (gte !== undefined) {
-          results.push(...tree.greaterThanOrEqual(gte as any));
-        } else if (gt !== undefined) {
-          results.push(...tree.greaterThan(gt as any));
-        } else if (lte !== undefined) {
-          // lte 需要包含等于的值
-          const ltRows = tree.lessThan(lte as any);
-          const eqRows = tree.query(lte as any);
-          results.push(...ltRows, ...eqRows);
-        } else if (lt !== undefined) {
-          results.push(...tree.lessThan(lt as any));
-        }
-      }
-      return results;
-    }
-
-    // 精确匹配
-    const key = String(filter);
-    if (!level.has(key)) {
-      return []; // 没有匹配
-    }
-
-    const child = level.get(key);
-
-    if (depth === this.columns.length - 1) {
-      // 最后一层：BTree
-      const btree = child as BTreeIndex<IndexKey>;
-      return btree.query(filter as any);
-    } else {
-      // 中间层：递归
-      return this.queryRecursive(child as Map<string, any>, filters, depth + 1);
-    }
-  }
-
-  /**
-   * 获取索引列
-   */
   getColumns(): string[] {
     return [...this.columns];
   }
 
-  /**
-   * 清空索引
-   */
   clear(): void {
-    this.index.clear();
+    this.root.clear();
+  }
+
+  /**
+   * 插入一条记录
+   * @param values 与 columns 一一对应
+   */
+  insert(values: PrefixKey[], rowIndex: number): void {
+    if (values.length !== this.columns.length) {
+      throw new Error(`Expected ${this.columns.length} values, got ${values.length}`);
+    }
+
+    const lastVal = values[values.length - 1];
+    if (typeof lastVal !== 'number' && typeof lastVal !== 'bigint') {
+      throw new Error(`CompositeIndex last column must be number|bigint, got ${typeof lastVal}`);
+    }
+
+    let level: Map<string, any> = this.root;
+
+    // 遍历前 N-1 列
+    for (let depth = 0; depth < values.length - 1; depth++) {
+      const key = String(values[depth]);
+      const isPrefixLast = depth === values.length - 2;
+
+      if (isPrefixLast) {
+        // 这一层存放 BTreeIndex<lastVal>
+        if (!level.has(key)) {
+          level.set(key, new BTreeIndex<number | bigint>(32));
+        }
+        const tree = level.get(key) as BTreeIndex<number | bigint>;
+        tree.insert(lastVal as any, rowIndex);
+      } else {
+        if (!level.has(key)) {
+          level.set(key, new Map());
+        }
+        level = level.get(key) as Map<string, any>;
+      }
+    }
+  }
+
+  /**
+   * 查询
+   * - 前缀列：支持精确匹配（=）或不提供（扫描所有）
+   * - 最后一列：支持精确匹配或范围（gt/gte/lt/lte）
+   */
+  query(filters: Record<string, FilterValue>): number[] {
+    const trees = this.collectTrees(this.root, 0, filters);
+
+    const lastCol = this.columns[this.columns.length - 1];
+    const lastFilter = filters[lastCol];
+
+    const out: number[] = [];
+    for (const tree of trees) {
+      out.push(...this.queryLast(tree, lastFilter as any));
+    }
+
+    // 去重 + 排序
+    return [...new Set(out)].sort((a, b) => a - b);
+  }
+
+  private collectTrees(level: Map<string, any>, depth: number, filters: Record<string, FilterValue>): Array<BTreeIndex<number | bigint>> {
+    const colName = this.columns[depth];
+    const filter = filters[colName];
+    const isPrefixLast = depth === this.columns.length - 2;
+
+    // prefixLast: 这一层的 value 就是 BTreeIndex
+    if (isPrefixLast) {
+      if (filter === undefined) {
+        return Array.from(level.values()) as Array<BTreeIndex<number | bigint>>;
+      }
+
+      if (typeof filter === 'object' && (filter as any) && ('gte' in (filter as any) || 'lte' in (filter as any) || 'gt' in (filter as any) || 'lt' in (filter as any))) {
+        throw new Error('Range filter is only supported on the last column');
+      }
+
+      const key = String(filter);
+      const tree = level.get(key) as BTreeIndex<number | bigint> | undefined;
+      return tree ? [tree] : [];
+    }
+
+    // 非 prefixLast：继续向下遍历 Map
+    if (filter === undefined) {
+      const out: Array<BTreeIndex<number | bigint>> = [];
+      for (const child of level.values()) {
+        out.push(...this.collectTrees(child as Map<string, any>, depth + 1, filters));
+      }
+      return out;
+    }
+
+    if (typeof filter === 'object' && (filter as any) && ('gte' in (filter as any) || 'lte' in (filter as any) || 'gt' in (filter as any) || 'lt' in (filter as any))) {
+      throw new Error('Range filter is only supported on the last column');
+    }
+
+    const key = String(filter);
+    const child = level.get(key) as Map<string, any> | undefined;
+    if (!child) return [];
+    return this.collectTrees(child, depth + 1, filters);
+  }
+
+  private queryLast(tree: BTreeIndex<number | bigint>, filter: FilterValue | undefined): number[] {
+    if (filter === undefined) {
+      return tree.getAllRows();
+    }
+
+    // range on last col
+    if (typeof filter === 'object' && (filter as any) && ('gte' in (filter as any) || 'lte' in (filter as any) || 'gt' in (filter as any) || 'lt' in (filter as any))) {
+      const { gte, lte, gt, lt } = filter as RangeFilter<number | bigint>;
+
+      if (gte !== undefined && lte !== undefined) {
+        return tree.rangeQuery(gte as any, lte as any);
+      }
+
+      if (gt !== undefined && lt !== undefined) {
+        // (gt, lt)
+        const allGt = tree.greaterThan(gt as any);
+        const allLt = tree.lessThan(lt as any);
+        const gtSet = new Set(allGt);
+        return allLt.filter((r) => gtSet.has(r));
+      }
+
+      if (gte !== undefined) {
+        return tree.greaterThanOrEqual(gte as any);
+      }
+
+      if (gt !== undefined) {
+        return tree.greaterThan(gt as any);
+      }
+
+      if (lte !== undefined) {
+        const ltRows = tree.lessThan(lte as any);
+        const eqRows = tree.query(lte as any);
+        return [...ltRows, ...eqRows];
+      }
+
+      if (lt !== undefined) {
+        return tree.lessThan(lt as any);
+      }
+
+      return tree.getAllRows();
+    }
+
+    // exact
+    const v = filter as any;
+    if (typeof v !== 'number' && typeof v !== 'bigint') {
+      // last 列必须是数值/时间戳
+      return [];
+    }
+    return tree.query(v);
   }
 }

@@ -216,6 +216,8 @@ KEY (symbol, interval, timestamp);
 <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=UQC9Q9NuCkI8Wmuk5l_flSWfNf21XToXmVbJikw3P9MflhzG" alt="TON Wallet Address QR" width="200" />
 
 > 📱 扫码后点击「**切换币种**」→ 选择 **$X** (X Empire) 或 **TON**
+>
+> 💡 如需使用 **$X** 支付：复制上方地址 → 粘贴到 Bybit 或其他支持代币选择的钱包
 
 ---
 
