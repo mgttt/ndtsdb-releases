@@ -71,6 +71,7 @@ export type AppendRewriteOptions = {
   tmpPath?: string;
   backupPath?: string;
   keepBackup?: boolean;
+  mode?: 'stream' | 'readAll'; // 默认 stream（不展开全表）
 };
 
 /**
@@ -491,74 +492,238 @@ export class AppendWriter {
     transform: (row: Record<string, any>, index: number) => Record<string, any> | null,
     options: AppendRewriteOptions = {}
   ): AppendRewriteResult {
+    // 兼容：需要旧行为时可强制 readAll（调试/小文件）
+    if (options.mode === 'readAll') {
+      if (!existsSync(path)) {
+        return { beforeRows: 0, afterRows: 0, deletedRows: 0, chunksWritten: 0 };
+      }
+
+      const { header, data } = AppendWriter.readAll(path);
+      const beforeRows = header.totalRows;
+
+      const tmpPath = options.tmpPath || `${path}.tmp`;
+      const backupPath = options.backupPath || `${path}.bak`;
+      const batchSize = options.batchSize ?? 10_000;
+
+      try {
+        if (existsSync(tmpPath)) rmSync(tmpPath);
+      } catch {}
+      try {
+        if (existsSync(backupPath)) rmSync(backupPath);
+      } catch {}
+
+      const writer = new AppendWriter(tmpPath, header.columns);
+      writer.open();
+
+      let deletedRows = 0;
+      let afterRows = 0;
+      let chunksWritten = 0;
+
+      const batch: Record<string, any>[] = [];
+
+      for (let i = 0; i < beforeRows; i++) {
+        const row: Record<string, any> = {};
+        for (const col of header.columns) {
+          const arr = data.get(col.name) as any;
+          row[col.name] = arr ? arr[i] : undefined;
+        }
+
+        const out = transform(row, i);
+        if (out == null) {
+          deletedRows++;
+          continue;
+        }
+
+        batch.push(out);
+        afterRows++;
+
+        if (batch.length >= batchSize) {
+          writer.append(batch);
+          chunksWritten++;
+          batch.length = 0;
+        }
+      }
+
+      if (batch.length > 0) {
+        writer.append(batch);
+        chunksWritten++;
+      }
+
+      writer.close();
+
+      // 原子替换：path -> bak, tmp -> path
+      if (existsSync(path)) renameSync(path, backupPath);
+      renameSync(tmpPath, path);
+
+      if (!options.keepBackup) {
+        try {
+          if (existsSync(backupPath)) rmSync(backupPath);
+        } catch {}
+      }
+
+      return { beforeRows, afterRows, deletedRows, chunksWritten };
+    }
+
+    return AppendWriter.rewriteStreaming(path, transform, options);
+  }
+
+  /**
+   * rewrite 的 streaming 实现：不展开全表（按 chunk 读取），同时可自然“compact”（把旧 chunk 合并成更大的 chunk）。
+   */
+  static rewriteStreaming(
+    path: string,
+    transform: (row: Record<string, any>, index: number) => Record<string, any> | null,
+    options: AppendRewriteOptions = {}
+  ): AppendRewriteResult {
     if (!existsSync(path)) {
       return { beforeRows: 0, afterRows: 0, deletedRows: 0, chunksWritten: 0 };
     }
 
-    const { header, data } = AppendWriter.readAll(path);
-    const beforeRows = header.totalRows;
+    const fd = openSync(path, 'r');
 
-    const tmpPath = options.tmpPath || `${path}.tmp`;
-    const backupPath = options.backupPath || `${path}.bak`;
-    const batchSize = options.batchSize ?? 10_000;
+    const getByteLen = (t: string) => {
+      switch (t) {
+        case 'int64':
+        case 'float64':
+          return 8;
+        case 'int32':
+          return 4;
+        case 'int16':
+          return 2;
+        default:
+          return 8;
+      }
+    };
+
+    const readValue = (t: string, buf: Buffer, offset: number) => {
+      switch (t) {
+        case 'int64':
+          return buf.readBigInt64LE(offset);
+        case 'float64':
+          return buf.readDoubleLE(offset);
+        case 'int32':
+          return buf.readInt32LE(offset);
+        case 'int16':
+          return buf.readInt16LE(offset);
+        default:
+          return buf.readDoubleLE(offset);
+      }
+    };
 
     try {
-      if (existsSync(tmpPath)) rmSync(tmpPath);
-    } catch {}
-    try {
-      if (existsSync(backupPath)) rmSync(backupPath);
-    } catch {}
+      // header
+      const magicBuf = Buffer.allocUnsafe(4);
+      readSync(fd, magicBuf, 0, 4, 0);
+      if (!magicBuf.equals(MAGIC)) throw new Error('Invalid file magic');
 
-    const writer = new AppendWriter(tmpPath, header.columns);
-    writer.open();
+      const lenBuf = Buffer.allocUnsafe(4);
+      readSync(fd, lenBuf, 0, 4, 4);
+      const headerLen = lenBuf.readUInt32LE();
 
-    let deletedRows = 0;
-    let afterRows = 0;
-    let chunksWritten = 0;
+      const headerBuf = Buffer.allocUnsafe(headerLen);
+      readSync(fd, headerBuf, 0, headerLen, 8);
+      const header: AppendFileHeader = JSON.parse(headerBuf.toString());
 
-    const batch: Record<string, any>[] = [];
+      const beforeRows = header.totalRows;
 
-    for (let i = 0; i < beforeRows; i++) {
-      const row: Record<string, any> = {};
-      for (const col of header.columns) {
-        const arr = data.get(col.name) as any;
-        row[col.name] = arr ? arr[i] : undefined;
-      }
+      // 跳过 header + padding + CRC
+      const headerEndOffset = 4 + 4 + headerLen;
+      const paddingSize = (8 - (headerEndOffset % 8)) % 8;
+      let offset = headerEndOffset + paddingSize + 4; // +4 for header CRC
 
-      const out = transform(row, i);
-      if (out == null) {
-        deletedRows++;
-        continue;
-      }
+      const tmpPath = options.tmpPath || `${path}.tmp`;
+      const backupPath = options.backupPath || `${path}.bak`;
+      const batchSize = options.batchSize ?? 10_000;
 
-      batch.push(out);
-      afterRows++;
-
-      if (batch.length >= batchSize) {
-        writer.append(batch);
-        chunksWritten++;
-        batch.length = 0;
-      }
-    }
-
-    if (batch.length > 0) {
-      writer.append(batch);
-      chunksWritten++;
-    }
-
-    writer.close();
-
-    // 原子替换：path -> bak, tmp -> path
-    if (existsSync(path)) renameSync(path, backupPath);
-    renameSync(tmpPath, path);
-
-    if (!options.keepBackup) {
+      try {
+        if (existsSync(tmpPath)) rmSync(tmpPath);
+      } catch {}
       try {
         if (existsSync(backupPath)) rmSync(backupPath);
       } catch {}
-    }
 
-    return { beforeRows, afterRows, deletedRows, chunksWritten };
+      const writer = new AppendWriter(tmpPath, header.columns);
+      writer.open();
+
+      let deletedRows = 0;
+      let afterRows = 0;
+      let chunksWritten = 0;
+      const batch: Record<string, any>[] = [];
+
+      let globalIndex = 0;
+
+      for (let c = 0; c < header.chunkCount; c++) {
+        const rcBuf = Buffer.allocUnsafe(4);
+        readSync(fd, rcBuf, 0, 4, offset);
+        const chunkRows = rcBuf.readUInt32LE();
+        offset += 4;
+
+        const colBufs: Buffer[] = [];
+        const colByteLens: number[] = [];
+
+        for (const col of header.columns) {
+          const byteLen = getByteLen(col.type);
+          const buf = Buffer.allocUnsafe(byteLen * chunkRows);
+          if (buf.length > 0) {
+            readSync(fd, buf, 0, buf.length, offset);
+          }
+          offset += buf.length;
+          colBufs.push(buf);
+          colByteLens.push(byteLen);
+        }
+
+        // skip chunk CRC
+        offset += 4;
+
+        for (let i = 0; i < chunkRows; i++) {
+          const row: Record<string, any> = {};
+          for (let k = 0; k < header.columns.length; k++) {
+            const col = header.columns[k];
+            const byteLen = colByteLens[k];
+            const buf = colBufs[k];
+            row[col.name] = readValue(col.type, buf, i * byteLen);
+          }
+
+          const out = transform(row, globalIndex);
+          globalIndex++;
+
+          if (out == null) {
+            deletedRows++;
+            continue;
+          }
+
+          batch.push(out);
+          afterRows++;
+
+          if (batch.length >= batchSize) {
+            writer.append(batch);
+            chunksWritten++;
+            batch.length = 0;
+          }
+        }
+      }
+
+      if (batch.length > 0) {
+        writer.append(batch);
+        chunksWritten++;
+      }
+
+      writer.close();
+
+      // 原子替换：path -> bak, tmp -> path
+      if (existsSync(path)) renameSync(path, backupPath);
+      renameSync(tmpPath, path);
+
+      if (!options.keepBackup) {
+        try {
+          if (existsSync(backupPath)) rmSync(backupPath);
+        } catch {}
+      }
+
+      return { beforeRows, afterRows, deletedRows, chunksWritten };
+    } finally {
+      closeSync(fd);
+    }
   }
 
   static deleteWhere(

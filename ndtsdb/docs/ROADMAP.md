@@ -73,7 +73,7 @@ Append-only 是最大限制。
 - ✅ `AppendWriter.rewrite/deleteWhere/updateWhere`：读取旧文件 → 写 tmp → 原子替换（适合小文件/每 symbol 文件场景）
 
 下一步（优化版）：
-- 添加 `CompactWriter`：按 chunk 流式重写（避免 readAll 全量展开）
+- ✅ `AppendWriter.rewriteStreaming`：按 chunk 流式重写（避免 readAll 全量展开），并在重写时自然合并/compact chunk
 - 支持 tombstone 标记（软删除，定期 compact）
 - 参考 LSM-Tree 的合并策略
 
