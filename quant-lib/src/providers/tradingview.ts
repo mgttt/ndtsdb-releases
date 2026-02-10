@@ -60,6 +60,7 @@ export class TradingViewProvider extends WebSocketDataProvider {
     klines: Kline[];
     symbol: string;
     interval: string;
+    timeoutHandle?: NodeJS.Timeout; // 保存超时 handle，用于清理
   }> = new Map();
   
   // 请求计数（用于主动重建连接，避免被 TradingView 踢）
@@ -172,6 +173,10 @@ export class TradingViewProvider extends WebSocketDataProvider {
    */
   private rejectAllPending(error: Error): void {
     for (const [chartSession, req] of this.pendingRequests.entries()) {
+      // 清理超时 handle（避免内存泄漏）
+      if (req.timeoutHandle) {
+        clearTimeout(req.timeoutHandle);
+      }
       this.pendingRequests.delete(chartSession);
       try {
         req.reject(error);
@@ -219,20 +224,32 @@ export class TradingViewProvider extends WebSocketDataProvider {
       const chartSession = `cs_${this.generateId()}`;
       this.chartSessions.set(symbol, chartSession);
       
-      // 存储待处理请求
+      const fail = (e: Error) => {
+        const req = this.pendingRequests.get(chartSession);
+        if (req?.timeoutHandle) {
+          clearTimeout(req.timeoutHandle);
+        }
+        this.pendingRequests.delete(chartSession);
+        this.chartSessions.delete(symbol);
+        reject(e);
+      };
+      
+      // 超时处理（3秒无响应视为失败）
+      const timeoutHandle = setTimeout(() => {
+        if (this.pendingRequests.has(chartSession)) {
+          fail(new Error(`获取 ${symbol} K线超时（3秒无响应）`));
+        }
+      }, 3000); // 3秒超时（用户建议）
+      
+      // 存储待处理请求（包含 timeout handle）
       this.pendingRequests.set(chartSession, {
         resolve,
         reject,
         klines: [],
         symbol,
-        interval
+        interval,
+        timeoutHandle
       });
-      
-      const fail = (e: Error) => {
-        this.pendingRequests.delete(chartSession);
-        this.chartSessions.delete(symbol);
-        reject(e);
-      };
 
       // 匿名模式需要先发送认证 token
       if (this.isAnonymous) {
@@ -259,14 +276,6 @@ export class TradingViewProvider extends WebSocketDataProvider {
           p: [chartSession, 's1', 's1', 'symbol_1', interval, limit, '']
         }, fail);
       }, 100);
-      
-      // 超时处理
-      setTimeout(() => {
-        if (this.pendingRequests.has(chartSession)) {
-          this.pendingRequests.delete(chartSession);
-          reject(new Error(`获取 ${symbol} K线超时`));
-        }
-      }, 30000); // 30秒超时
     });
   }
   
@@ -466,6 +475,10 @@ export class TradingViewProvider extends WebSocketDataProvider {
     const request = this.pendingRequests.get(chartSession);
     
     if (request) {
+      // 清理超时 handle（成功时也要清理）
+      if (request.timeoutHandle) {
+        clearTimeout(request.timeoutHandle);
+      }
       request.resolve(request.klines);
       this.pendingRequests.delete(chartSession);
     }
