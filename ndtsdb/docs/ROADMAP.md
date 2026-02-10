@@ -10,13 +10,13 @@
 
 从典型时序场景迁移/落地过程中，和"引擎本体"强相关的限制：
 
-| 限制 | 影响 | 当前 workaround | 优先级 |
-|------|------|-----------------|--------|
-| **Append-only 写入** | 无法原地 DELETE/UPDATE（仍需重写文件） | `AppendWriter.rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换）；未来可加 tombstone/增量 compact | 🔴 高 |
-| **有限 SQL 支持** | JOIN、子查询、复杂 WHERE 覆盖不足 | 逐步补齐 SQL 子集 | 🔴 高 |
-| **无二级索引** | 范围查询/复合过滤可能退化为全表扫描 | 全表扫描 / 未来 BTree | 🟡 中 |
-| **字符串持久化** | string 目前仅内存可用（CTE/materialize 场景 OK） | 暂不持久化 | 🟡 中 |
-| **无事务支持** | 无 ACID/WAL | CRC + 原子重写（未来） | 🟡 中 |
+| 限制 | 影响 | 当前方案 | 状态 |
+|------|------|----------|------|
+| ~~Append-only 写入~~ | ~~无法原地 DELETE/UPDATE~~ | ✅ Tombstone 软删除 + 自动 compact（延迟清理 + 文件重写） | ✅ **已解决** |
+| ~~有限 SQL 支持~~ | ~~JOIN、子查询、复杂 WHERE 覆盖不足~~ | ✅ JOIN/子查询/HAVING/复杂 WHERE（括号优先级）/ORDER BY expr | ✅ **已解决** |
+| ~~无二级索引~~ | ~~范围查询/复合过滤退化为全表扫描~~ | ✅ BTree 二级索引 + 复合索引（自动维护 + SQL planner 自动优化） | ✅ **已解决** |
+| ~~字符串持久化~~ | ~~string 仅内存可用~~ | ✅ 字典编码（string → int32 id，header.stringDicts 固定空间） | ✅ **已解决** |
+| **无事务支持** | 无 ACID/WAL | CRC + 原子重写（未来 WAL） | 🟡 **计划中** |
 
 > ⚠️ 诸如 Provider/业务封装/缓存/时间戳单位等"集成层/业务层"议题，**不在 ndtsdb roadmap** 内，应由上层应用库负责。
 
@@ -46,108 +46,39 @@
 
 ## 下一步方向
 
-### 🔴 高优先级（引擎侧）
+> 已完成功能详见 `docs/FEATURES.md`
 
-**P0: SQL（引擎 SQL 子集补齐）** ⭐⭐⭐⭐⭐
+### 🔴 高优先级 - ✅ 全部完成
 
-> 已实现能力清单：见 `docs/FEATURES.md`。
+- ✅ SQL 子集补齐（CTE/JOIN/子查询/HAVING/复杂 WHERE/ORDER BY expr）
+- ✅ 二级索引 + 复合索引（BTree + SQL 自动优化）
+- ✅ Tombstone 删除 + 自动 compact（RoaringBitmap + 多触发条件）
+- ✅ 原生字符串类型（字典编码 + 固定 header 空间）
 
-**仍需补齐 / 优化的 SQL 能力（按迁移阻塞程度排序）**：
+### 🟡 中优先级 - ✅ 全部完成
 
-| 功能 | 状态 | 说明 | 优先级 |
-|------|------|------|--------|
-| **PARTITION BY 性能/一致性** | ✅ 已实现 | 通用路径可用；新增 `tryExecutePartitionTail` 快速路径，专门优化 CTE + PARTITION BY + ROW_NUMBER + WHERE rn=1 模式（波动率脚本典型查询），避免全表物化 | ✅ P0 |
-| **复杂 WHERE 表达式** | ✅ 已实现 | 括号优先级 + `AND/OR/NOT`（WHERE AST + executor 评估；并保留 legacy where[] 兼容） | ✅ P0 |
-| **ORDER BY <expr>** | ✅ 已实现 | 支持 alias/ordinal（ORDER BY 1）/标量表达式 + 多 key（对齐 SQLite/DuckDB 常用子集） | ✅ P0 |
-| **HAVING** | ✅ 已实现 | GROUP BY 后过滤（支持 alias/标量表达式条件） | ✅ P1 |
-| **JOIN** | ✅ 已实现（第一版） | INNER/LEFT JOIN（ON 仅等值 + AND 链） | 🟡 P1 |
-| **子查询** | ✅ 已实现 | ✅ `FROM (SELECT ...)`（派生表，内部以隐式 CTE 物化）；✅ `WHERE col IN (SELECT ...)` | ✅ P1 |
+- ✅ 列式压缩（Delta/RLE + 文件格式集成 + 向后兼容）
+- ✅ 分区表（自动分区 + 跨分区查询 + SQL 集成）
+- ✅ 流式聚合（SMA/EMA/StdDev + 滑动窗口）
 
----
+### 🟢 低优先级（打磨 & 扩展）
 
-**1. 支持 UPDATE/DELETE（重写优化）** ⭐⭐⭐
+**1. 真实数据验证 & 测试增强** ⭐⭐⭐⭐
 
-Append-only 是最大限制。
+- 真实 Binance/TV K 线验证（压缩率/回放性能/内存占用）
+- 补充压缩相关测试
+- 性能基准测试套件
 
-现状（已落地，优化版完成 ✅）：
-- ✅ `AppendWriter.rewrite/deleteWhere/updateWhere`：读取旧文件 → 写 tmp → 原子替换（适合小文件/每 symbol 文件场景）
-- ✅ `AppendWriter.rewriteStreaming`：按 chunk 流式重写（避免 readAll 全量展开），并在重写时自然合并/compact chunk
-- ✅ **Tombstone 软删除**：独立 .tomb 文件（RoaringBitmap 压缩）+ `compact()` 延迟清理
-- ✅ **自动 compact 策略**：多触发条件（tombstone 比例/时间/文件大小/chunk 数量/写入量），close 时自动执行
+**2. 错误处理规范化**
 
-后续可能扩展（低优先级）：
-- LSM-Tree 式分层合并（目前单文件 compact 已够用）
-
-```typescript
-// 目标 API
-await table.deleteWhere({ symbol: 'BTC', before: 1700000000000 });
-await table.updateWhere({ symbol: 'BTC' }, { status: 'archived' });
-```
-
-**2. SQL 执行器增强（剩余功能）** ⭐⭐⭐
-
-当前已实现：SELECT/WHERE/ORDER BY/LIMIT/GROUP BY/窗口函数/基础聚合
-
-仍需添加：
-- ~~基础聚合~~ ✅ 已实现 COUNT/SUM/AVG/MIN/MAX/STDDEV/VARIANCE
-- ~~窗口函数~~ ✅ 已实现 ROW_NUMBER/STDDEV/AVG/SUM... OVER (...)
-- ~~GROUP BY~~ ✅ 已实现
-- ~~CTE (WITH 子句)~~ ✅ 已实现
-- ~~JOIN~~ ✅ 已实现（INNER/LEFT；ON=等值 + AND 链）
-- ~~子查询~~ ✅ 已实现（FROM 派生表 + WHERE IN 子查询）
-- ~~复杂 WHERE（嵌套括号优先级）~~ ✅ 已实现
-- ~~HAVING~~ ✅ 已实现（GROUP BY 后过滤）
-
-### 🟡 中优先级（提升易用性）
-
-**3. 二级索引** ✅ 已完成
-
-- ✅ **BTree 索引**：数值列范围查询（timestamp/price 等）
-- ✅ **复合索引**：多列组合查询（如 (symbol, timestamp)）
-  - 嵌套 Map + BTree 结构（前缀精确匹配 + 最后一列范围）
-  - 自动维护（appendBatch 时更新）
-  - SQL planner 自动使用（WHERE symbol='BTC' AND timestamp>=... 等）
-- ✅ **SQL 自动优化**：tryUseIndex 识别 AND 链并选择最优索引
-
-后续可能扩展：
-- 声明式索引创建（CREATE INDEX 语法）
-- Bitmap 索引（低基数列）
-
-**4. 字符串原生支持**
-
-当前需手动用 SymbolTable。
-
-现状（2026-02-10）：
-- ColumnarTable 已支持 **内存 string 列**（用于 SQL/CTE/materialize）
-- 但二进制持久化 `saveToFile/loadFromFile` **暂不支持 string**（会直接 throw）
-
-目标：
-- ColumnarTable string 列可持久化
-- 内部自动字典编码（对用户透明）
-- 可变长字符串存储（当前固定字典）
-
-**5. 轻量级事务**
-
-Chunk 级原子写入：
-- 多 chunk 批量写入的原子性
-- 回滚机制（写入失败时删除临时 chunk）
-- WAL（Write-Ahead Log）用于崩溃恢复
-
-### 🟢 低优先级（锦上添花）
-
-**6. 错误处理规范化**
-
-目前异常处理不一致（有些 throw，有些 console.warn）。统一为：
 - 可恢复错误: 返回 Result 类型
 - 不可恢复: throw 标准 Error 子类
 
-**7. 真实数据验证**
+**3. 轻量级事务（WAL）**
 
-现有基准都是合成数据。需用真实 Binance/TV K 线验证：
-- 实际压缩率
-- 实际回放性能
-- 内存占用（特别是 mmap 场景）
-- 与 DuckDB 的端到端性能对比
+- 多 chunk 批量写入的原子性
+- 回滚机制
+- WAL 用于崩溃恢复
 
 ### 不急的 (低收益或过度工程)
 
@@ -232,6 +163,7 @@ Chunk 级原子写入：
 | **v0.9.3.5** | 02-10 16:25 | **流式聚合 v1**（SMA/EMA/StdDev/Min/Max；滑动窗口；多指标组合） |
 | **v0.9.3.6** | 02-10 16:30 | **分区查询优化 v1**（timeRange 提前过滤分区扫描） |
 | **v0.9.3.7** | 02-10 16:45 | **压缩工具导出** + **PartitionedTable 与 SQL 集成**（extractTimeRange + queryPartitionedTableToColumnar） |
+| **v0.9.3.8** | 02-10 17:10 | **AppendWriter 压缩文件格式集成 v1**（启用压缩时写入 colLen+colData，读取端自动解压；兼容旧格式） |
 
 ### 后续计划（按优先级）
 
@@ -247,13 +179,16 @@ Chunk 级原子写入：
 - ✅ **复合索引**（多列组合查询加速，如 (symbol, timestamp)）
 - ✅ **自动 compact 策略**（tombstone 比例触发，可配置阈值）
 
-**🟡 中优先级**：
-- ~~列式压缩（Gorilla/delta 编码）~~ ✅ 算法已实现 + 导出为公共 API（未集成到 AppendWriter 文件格式）
-- ~~分区表（按时间/symbol 自动分区）~~ ✅ v1 已完成
-- ~~流式聚合（增量计算）~~ ✅ v1 已完成
-- ~~分区查询优化（WHERE 时间范围提前过滤分区）~~ ✅ v1 已完成（timeRange 参数 + 分区范围推断）
-- ~~PartitionedTable 与 SQL 打通~~ ✅ v1 已完成（extractTimeRange + queryPartitionedTableToColumnar）
-- 压缩透明集成到 AppendWriter 文件格式（可选开关 + 向后兼容）
+**🟡 中优先级 - ✅ 全部完成**：
+- ~~二级索引（BTree on 数值列 + SQL 自动优化）~~ ✅ v0.9.3.0-v0.9.3.2
+- ~~复合索引（多列组合查询加速）~~ ✅ v0.9.3.0-v0.9.3.2
+- ~~原生字符串类型（字典编码 + 固定 header 空间）~~ ✅ v0.9.3.0
+- ~~UPDATE/DELETE tombstone 优化（RoaringBitmap + 延迟 compact）~~ ✅ v0.9.3.0
+- ~~自动 compact 策略（多触发条件）~~ ✅ v0.9.3.0-v0.9.3.1
+- ~~列式压缩（Delta/RLE + 文件格式集成）~~ ✅ v0.9.3.3 + v0.9.3.8
+- ~~分区表（自动分区 + 跨分区查询）~~ ✅ v0.9.3.4 + v0.9.3.6
+- ~~流式聚合（增量计算 SMA/EMA/StdDev）~~ ✅ v0.9.3.5
+- ~~PartitionedTable 与 SQL 打通~~ ✅ v0.9.3.7
 
 **🟢 低优先级**：
 - 事务支持（WAL + 原子写入）

@@ -33,9 +33,23 @@ ndtsdb 提供多种压缩算法，适用于不同数据类型和模式：
 - **压缩率**：>95%（高重复率数据）
 
 **当前集成状态**：
-- ✅ 压缩算法已实现（compression.ts）
-- ✅ 性能基准测试（benchmarkCompression）
-- ⏳ 存储引擎集成（计划中，可选开关）
+- ✅ 压缩算法已实现（compression.ts）+ 基准测试
+- ✅ **已集成到 AppendWriter 文件格式**（可选开关，向后兼容旧文件）
+
+### AppendWriter 启用压缩
+```ts
+const writer = new AppendWriter(path, columns, {
+  compression: {
+    enabled: true,
+    algorithms: {
+      timestamp: 'delta',
+      symbol_id: 'rle',
+    },
+  },
+});
+```
+- 压缩启用时：chunk 写入为 `rowCount + (colLen+colData)*N + crc32`
+- 未启用压缩：保持旧格式（固定列长），读取端自动兼容
 
 ---
 
@@ -132,6 +146,10 @@ const metrics = agg.add(100.5); // { sma: ..., ema: ..., stddev: ... }
 - chunked append-only
 - header + per-chunk CRC32（固定 4KB header 预留空间）
 - reopen & append 无需重写
+- **列压缩（可选）**：压缩启用时 chunk 使用变长列格式（colLen + colData），读取端自动解压
+  - int64: delta
+  - int32: delta / rle
+  - float64: 暂未集成（后续可接 Gorilla）
 - **String 持久化**：字典编码（string → int32 id），存储在 header.stringDicts
 - **Tombstone 删除**：`deleteWhereWithTombstone`（O(1) 标记 + 延迟 compact）
   - 独立 .tomb 文件（RoaringBitmap 压缩存储已删除行号）

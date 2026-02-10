@@ -6,6 +6,7 @@
 import { openSync, closeSync, writeSync, readSync, fstatSync, existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import { dirname } from 'path';
 import { TombstoneManager } from './tombstone.js';
+import { DeltaEncoderInt64, DeltaEncoderInt32, RLEEncoder } from './compression.js';
 
 /**
  * CRC32 计算 (IEEE 802.3)
@@ -207,6 +208,11 @@ export class AppendWriter {
           this.stringDictsReverse.set(colName, revMap);
         }
       }
+
+      // 同步压缩配置（确保 append 使用与文件一致的格式）
+      if (header.compression) {
+        this.options.compression = header.compression;
+      }
     } else {
       // 新文件 — 写入 header
       this.fd = openSync(this.path, 'w+');
@@ -222,8 +228,9 @@ export class AppendWriter {
     if (rows.length === 0) return;
 
     const rowCount = rows.length;
+    const compressionEnabled = this.options.compression?.enabled ?? false;
 
-    // 构建 chunk: [rowCount(4)] + [col0 data] + [col1 data] + ... + [crc32(4)]
+    // 构建 chunk
     const parts: Buffer[] = [];
 
     // Row count
@@ -231,13 +238,14 @@ export class AppendWriter {
     rcBuf.writeUInt32LE(rowCount);
     parts.push(rcBuf);
 
-    // Column data
+    // Column data（先构建未压缩数据，再决定是否压缩）
     let dictDirty = false;
 
     for (const col of this.columns) {
       const byteLen = this.getByteLength(col.type);
       const buf = Buffer.allocUnsafe(byteLen * rowCount);
 
+      // 填充数据
       for (let i = 0; i < rowCount; i++) {
         const val = rows[i][col.name];
         switch (col.type) {
@@ -254,7 +262,6 @@ export class AppendWriter {
             buf.writeInt16LE(Number(val), i * 2);
             break;
           case 'string': {
-            // 字典编码
             const fwdMap = this.stringDicts.get(col.name)!;
             const revMap = this.stringDictsReverse.get(col.name)!;
             const str = String(val ?? '');
@@ -272,7 +279,28 @@ export class AppendWriter {
           }
         }
       }
-      parts.push(buf);
+
+      // 压缩（如果启用）
+      let finalBuf = buf;
+      if (compressionEnabled) {
+        const algorithm = this.options.compression!.algorithms?.[col.name] ?? this.autoSelectAlgorithm(col.type);
+        if (algorithm !== 'none') {
+          const compressed = this.compressColumn(buf, col.type, algorithm, rowCount);
+          if (!compressed) {
+            throw new Error(`Compression failed for column ${col.name} (${col.type}, ${algorithm})`);
+          }
+          // 压缩格式下：必须始终使用压缩后的字节（否则读取端无法判断是否需要解压）
+          finalBuf = compressed;
+        }
+      }
+
+      // 写入列数据（压缩格式需要col_len）
+      if (compressionEnabled) {
+        const lenBuf = Buffer.allocUnsafe(4);
+        lenBuf.writeUInt32LE(finalBuf.length);
+        parts.push(lenBuf);
+      }
+      parts.push(finalBuf);
     }
 
     // 合并计算 CRC
@@ -289,15 +317,131 @@ export class AppendWriter {
     // 更新 header
     this.totalRows += rowCount;
     this.chunkCount++;
-    this.writesSinceCompact += rowCount; // 跟踪写入量
+    this.writesSinceCompact += rowCount;
 
     // 字典更新时需要重写 header
     if (dictDirty) {
       this.updateHeader();
     } else {
-      // 快速更新（只改 totalRows + chunkCount，不重写整个 header）
       this.updateHeaderCountsOnly();
     }
+  }
+
+  /**
+   * 自动选择压缩算法
+   */
+  private autoSelectAlgorithm(type: string): 'delta' | 'rle' | 'gorilla' | 'none' {
+    switch (type) {
+      case 'int64':
+        return 'delta'; // 单调递增（如 timestamp）
+      case 'int32':
+        return 'delta'; // 默认 delta（若 RLE 更优可手动指定）
+      case 'float64':
+        return 'none'; // Gorilla 暂不集成
+      default:
+        return 'none';
+    }
+  }
+
+  /**
+   * 压缩列数据
+   */
+  private compressColumn(
+    buf: Buffer,
+    type: string,
+    algorithm: 'delta' | 'rle' | 'gorilla' | 'none',
+    rowCount: number
+  ): Buffer | null {
+    try {
+      switch (algorithm) {
+        case 'delta': {
+          if (type === 'int64') {
+            const arr = new BigInt64Array(buf.buffer, buf.byteOffset, rowCount);
+            const encoder = new DeltaEncoderInt64();
+            const compressed = encoder.compress(arr);
+            return Buffer.from(compressed);
+          } else if (type === 'int32') {
+            const arr = new Int32Array(buf.buffer, buf.byteOffset, rowCount);
+            const encoder = new DeltaEncoderInt32();
+            const compressed = encoder.compress(arr);
+            return Buffer.from(compressed);
+          }
+          break;
+        }
+
+        case 'rle': {
+          if (type === 'int32') {
+            const arr = new Int32Array(buf.buffer, buf.byteOffset, rowCount);
+            const encoder = new RLEEncoder();
+            const compressed = encoder.compress(arr);
+            return Buffer.from(compressed);
+          }
+          break;
+        }
+
+        case 'gorilla':
+          // TODO: Gorilla 压缩集成
+          return null;
+
+        case 'none':
+        default:
+          return null;
+      }
+    } catch (e) {
+      console.warn(`[Compression] Failed to compress column (${type}, ${algorithm}):`, e);
+      return null;
+    }
+
+    return null;
+  }
+
+  /**
+   * 解压列数据
+   */
+  static decompressColumn(
+    buf: Buffer,
+    type: string,
+    algorithm: 'delta' | 'rle' | 'gorilla' | 'none',
+    rowCount: number
+  ): Buffer | null {
+    try {
+      switch (algorithm) {
+        case 'delta': {
+          if (type === 'int64') {
+            const encoder = new DeltaEncoderInt64();
+            const decompressed = encoder.decompress(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          } else if (type === 'int32') {
+            const encoder = new DeltaEncoderInt32();
+            const decompressed = encoder.decompress(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          }
+          break;
+        }
+
+        case 'rle': {
+          if (type === 'int32') {
+            const encoder = new RLEEncoder();
+            const decompressed = encoder.decompress(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          }
+          break;
+        }
+
+        case 'gorilla':
+          // TODO: Gorilla 解压
+          return null;
+
+        case 'none':
+        default:
+          return null;
+      }
+    } catch (e) {
+      console.warn(`[Compression] Failed to decompress column (${type}, ${algorithm}):`, e);
+      return null;
+    }
+
+    return null;
   }
 
   /**
@@ -443,6 +587,15 @@ export class AppendWriter {
       totalRows: this.totalRows,
       chunkCount: this.chunkCount,
     };
+
+    // 保留/写入压缩配置
+    if (this.options.compression?.enabled) {
+      const algorithms: { [colName: string]: 'delta' | 'rle' | 'gorilla' | 'none' } =
+        this.options.compression.algorithms ??
+        Object.fromEntries(this.columns.map((c) => [c.name, this.autoSelectAlgorithm(c.type)]));
+      this.options.compression.algorithms = algorithms;
+      header.compression = { enabled: true, algorithms };
+    }
 
     // 序列化字典
     if (this.stringDicts.size > 0) {
@@ -594,7 +747,9 @@ export class AppendWriter {
     
     // 重写文件
     const tmpPath = options.tmpPath || this.path + '.tmp';
-    const writer = new AppendWriter(tmpPath, this.columns);
+    const writer = new AppendWriter(tmpPath, this.columns, {
+      compression: this.options.compression,
+    });
     writer.open();
 
     const batchSize = options.batchSize || 10000;
@@ -670,17 +825,14 @@ export class AppendWriter {
       }
     }
 
-    // 压缩配置
+    // 压缩配置（启用时：chunk 写入变为 "len + data" 格式）
     if (this.options.compression?.enabled) {
       const algorithms: { [colName: string]: 'delta' | 'rle' | 'gorilla' | 'none' } = {};
       for (const col of this.columns) {
-        // 自动选择算法（简化版：仅 int64 用 delta）
-        if (col.type === 'int64') {
-          algorithms[col.name] = this.options.compression.algorithms?.[col.name] ?? 'delta';
-        } else {
-          algorithms[col.name] = 'none';
-        }
+        algorithms[col.name] = this.options.compression.algorithms?.[col.name] ?? this.autoSelectAlgorithm(col.type);
       }
+      // 固化算法映射（确保 append/read 一致）
+      this.options.compression.algorithms = algorithms;
       header.compression = { enabled: true, algorithms };
     }
 
@@ -767,51 +919,77 @@ export class AppendWriter {
       const chunkRows = rcBuf.readUInt32LE();
       offset += 4;
 
-      // 读取列数据
-      for (const col of header.columns) {
-        let byteLen: number;
-        switch (col.type) {
-          case 'int64':
-          case 'float64':
-            byteLen = 8;
-            break;
-          case 'int32':
-          case 'string': // string 存储为 int32 id
-            byteLen = 4;
-            break;
-          case 'int16':
-            byteLen = 2;
-            break;
-          default:
-            byteLen = 8;
-        }
+      // 读取列数据（支持压缩）
+      const compressionEnabled = header.compression?.enabled ?? false;
 
-        const colBytes = byteLen * chunkRows;
-        const buf = Buffer.allocUnsafe(colBytes);
-        readSync(fd, buf, 0, colBytes, offset);
-        offset += colBytes;
+      for (const col of header.columns) {
+        let colData: Buffer;
+
+        if (compressionEnabled) {
+          // 新格式：读取 col_len + data
+          const lenBuf = Buffer.allocUnsafe(4);
+          readSync(fd, lenBuf, 0, 4, offset);
+          offset += 4;
+
+          const colLen = lenBuf.readUInt32LE();
+          const buf = Buffer.allocUnsafe(colLen);
+          readSync(fd, buf, 0, colLen, offset);
+          offset += colLen;
+
+          // 解压（如果需要）
+          const algorithm = header.compression.algorithms[col.name];
+          if (algorithm && algorithm !== 'none') {
+            const decompressed = AppendWriter.decompressColumn(buf, col.type, algorithm, chunkRows);
+            colData = decompressed ?? buf;
+          } else {
+            colData = buf;
+          }
+        } else {
+          // 旧格式：固定列长
+          let byteLen: number;
+          switch (col.type) {
+            case 'int64':
+            case 'float64':
+              byteLen = 8;
+              break;
+            case 'int32':
+            case 'string':
+              byteLen = 4;
+              break;
+            case 'int16':
+              byteLen = 2;
+              break;
+            default:
+              byteLen = 8;
+          }
+
+          const colBytes = byteLen * chunkRows;
+          const buf = Buffer.allocUnsafe(colBytes);
+          readSync(fd, buf, 0, colBytes, offset);
+          offset += colBytes;
+          colData = buf;
+        }
 
         // 复制到结果数组
         const targetArr = data.get(col.name)!;
         for (let i = 0; i < chunkRows; i++) {
           switch (col.type) {
             case 'int64':
-              targetArr[rowOffset + i] = buf.readBigInt64LE(i * 8);
+              targetArr[rowOffset + i] = colData.readBigInt64LE(i * 8);
               break;
             case 'float64':
-              targetArr[rowOffset + i] = buf.readDoubleLE(i * 8);
+              targetArr[rowOffset + i] = colData.readDoubleLE(i * 8);
               break;
             case 'int32':
-              targetArr[rowOffset + i] = buf.readInt32LE(i * 4);
+              targetArr[rowOffset + i] = colData.readInt32LE(i * 4);
               break;
             case 'int16':
-              targetArr[rowOffset + i] = buf.readInt16LE(i * 2);
+              targetArr[rowOffset + i] = colData.readInt16LE(i * 2);
               break;
             case 'string': {
-              // 反向映射：int32 id → string
               const dict = header.stringDicts?.[col.name];
               if (dict) {
-                const id = buf.readInt32LE(i * 4);
+                const id = colData.readInt32LE(i * 4);
                 targetArr[rowOffset + i] = dict[id] || '';
               } else {
                 targetArr[rowOffset + i] = '';
@@ -896,6 +1074,8 @@ export class AppendWriter {
       const RESERVED_HEADER_SIZE = 4096;
       let offset = RESERVED_HEADER_SIZE + 4;
 
+      const compressionEnabled = header.compression?.enabled ?? false;
+
       // 走到最后一个 chunk
       for (let c = 0; c < header.chunkCount; c++) {
         const rcBuf = Buffer.allocUnsafe(4);
@@ -908,47 +1088,81 @@ export class AppendWriter {
           const out: Record<string, any> = {};
 
           for (const col of header.columns) {
-            const byteLen = getByteLen(col.type);
-            const lastPos = offset + (chunkRows - 1) * byteLen;
-            const buf = Buffer.allocUnsafe(byteLen);
-            readSync(fd, buf, 0, byteLen, lastPos);
+            let colData: Buffer;
 
+            if (compressionEnabled) {
+              const lenBuf = Buffer.allocUnsafe(4);
+              readSync(fd, lenBuf, 0, 4, offset);
+              offset += 4;
+              const colLen = lenBuf.readUInt32LE();
+
+              const buf = Buffer.allocUnsafe(colLen);
+              readSync(fd, buf, 0, colLen, offset);
+              offset += colLen;
+
+              const alg = header.compression!.algorithms[col.name];
+              if (alg && alg !== 'none') {
+                colData = AppendWriter.decompressColumn(buf, col.type, alg, chunkRows) ?? buf;
+              } else {
+                colData = buf;
+              }
+            } else {
+              const byteLen = getByteLen(col.type);
+              const colBytes = byteLen * chunkRows;
+              const buf = Buffer.allocUnsafe(colBytes);
+              readSync(fd, buf, 0, colBytes, offset);
+              offset += colBytes;
+              colData = buf;
+            }
+
+            // 取最后一行值
+            const i = chunkRows - 1;
             switch (col.type) {
               case 'int64':
-                out[col.name] = buf.readBigInt64LE(0);
+                out[col.name] = colData.readBigInt64LE(i * 8);
                 break;
               case 'float64':
-                out[col.name] = buf.readDoubleLE(0);
+                out[col.name] = colData.readDoubleLE(i * 8);
                 break;
               case 'int32':
-                out[col.name] = buf.readInt32LE(0);
+                out[col.name] = colData.readInt32LE(i * 4);
                 break;
               case 'int16':
-                out[col.name] = buf.readInt16LE(0);
+                out[col.name] = colData.readInt16LE(i * 2);
                 break;
               case 'string': {
-                const id = buf.readInt32LE(0);
+                const id = colData.readInt32LE(i * 4);
                 const dict = header.stringDicts?.[col.name];
                 out[col.name] = dict ? (dict[id] || '') : '';
                 break;
               }
               default:
-                out[col.name] = buf.readDoubleLE(0);
+                out[col.name] = colData.readDoubleLE(i * 8);
             }
-
-            offset += byteLen * chunkRows;
           }
 
           return out;
         }
 
-        // 跳过当前 chunk：rowCount(4) + 每列数据 + CRC(4)
+        // 跳过当前 chunk
         offset += 4;
-        let chunkDataBytes = 0;
-        for (const col of header.columns) {
-          chunkDataBytes += getByteLen(col.type) * chunkRows;
+
+        if (compressionEnabled) {
+          for (const col of header.columns) {
+            const lenBuf = Buffer.allocUnsafe(4);
+            readSync(fd, lenBuf, 0, 4, offset);
+            offset += 4;
+            const colLen = lenBuf.readUInt32LE();
+            offset += colLen;
+          }
+        } else {
+          let chunkDataBytes = 0;
+          for (const col of header.columns) {
+            chunkDataBytes += getByteLen(col.type) * chunkRows;
+          }
+          offset += chunkDataBytes;
         }
-        offset += chunkDataBytes;
+
         offset += 4; // chunk CRC
       }
 
@@ -993,7 +1207,9 @@ export class AppendWriter {
         if (existsSync(backupPath)) rmSync(backupPath);
       } catch {}
 
-      const writer = new AppendWriter(tmpPath, header.columns);
+      const writer = new AppendWriter(tmpPath, header.columns, {
+        compression: header.compression,
+      });
       writer.open();
 
       let deletedRows = 0;
@@ -1111,6 +1327,7 @@ export class AppendWriter {
       const header: AppendFileHeader = JSON.parse(headerBuf.toString());
 
       const beforeRows = header.totalRows;
+      const compressionEnabled = header.compression?.enabled ?? false;
 
       // Header 固定大小 4KB + 4 bytes CRC
       const RESERVED_HEADER_SIZE = 4096;
@@ -1127,7 +1344,9 @@ export class AppendWriter {
         if (existsSync(backupPath)) rmSync(backupPath);
       } catch {}
 
-      const writer = new AppendWriter(tmpPath, header.columns);
+      const writer = new AppendWriter(tmpPath, header.columns, {
+        compression: header.compression,
+      });
       writer.open();
 
       let deletedRows = 0;
@@ -1148,13 +1367,35 @@ export class AppendWriter {
 
         for (const col of header.columns) {
           const byteLen = getByteLen(col.type);
-          const buf = Buffer.allocUnsafe(byteLen * chunkRows);
-          if (buf.length > 0) {
-            readSync(fd, buf, 0, buf.length, offset);
+
+          if (compressionEnabled) {
+            const lenBuf2 = Buffer.allocUnsafe(4);
+            readSync(fd, lenBuf2, 0, 4, offset);
+            offset += 4;
+            const colLen = lenBuf2.readUInt32LE();
+
+            const buf = Buffer.allocUnsafe(colLen);
+            if (buf.length > 0) {
+              readSync(fd, buf, 0, buf.length, offset);
+            }
+            offset += buf.length;
+
+            const alg = header.compression!.algorithms[col.name];
+            const outBuf = alg && alg !== 'none'
+              ? (AppendWriter.decompressColumn(buf, col.type, alg, chunkRows) ?? buf)
+              : buf;
+
+            colBufs.push(outBuf);
+            colByteLens.push(byteLen);
+          } else {
+            const buf = Buffer.allocUnsafe(byteLen * chunkRows);
+            if (buf.length > 0) {
+              readSync(fd, buf, 0, buf.length, offset);
+            }
+            offset += buf.length;
+            colBufs.push(buf);
+            colByteLens.push(byteLen);
           }
-          offset += buf.length;
-          colBufs.push(buf);
-          colByteLens.push(byteLen);
         }
 
         // skip chunk CRC
@@ -1285,31 +1526,46 @@ export class AppendWriter {
       const header: AppendFileHeader = JSON.parse(headerBuf.toString());
 
       // 验证每个 chunk 的 CRC
+      const compressionEnabled = header.compression?.enabled ?? false;
+
       let offset = headerBlockSize + 4;
       for (let c = 0; c < header.chunkCount; c++) {
         const rcBuf = Buffer.allocUnsafe(4);
         readSync(fd, rcBuf, 0, 4, offset);
         const chunkRows = rcBuf.readUInt32LE();
 
-        let chunkDataSize = 4; // 包含 row count
-        for (const col of header.columns) {
-          let byteLen: number;
-          switch (col.type) {
-            case 'int64':
-            case 'float64':
-              byteLen = 8;
-              break;
-            case 'int32':
-            case 'string': // string 存储为 int32 id
-              byteLen = 4;
-              break;
-            case 'int16':
-              byteLen = 2;
-              break;
-            default:
-              byteLen = 8;
+        let chunkDataSize = 4; // row count
+
+        if (compressionEnabled) {
+          // 先读取每列长度以计算 chunkDataSize
+          let tmp = offset + 4;
+          for (const col of header.columns) {
+            const lenBuf2 = Buffer.allocUnsafe(4);
+            readSync(fd, lenBuf2, 0, 4, tmp);
+            const colLen = lenBuf2.readUInt32LE();
+            tmp += 4 + colLen;
+            chunkDataSize += 4 + colLen;
           }
-          chunkDataSize += byteLen * chunkRows;
+        } else {
+          for (const col of header.columns) {
+            let byteLen: number;
+            switch (col.type) {
+              case 'int64':
+              case 'float64':
+                byteLen = 8;
+                break;
+              case 'int32':
+              case 'string':
+                byteLen = 4;
+                break;
+              case 'int16':
+                byteLen = 2;
+                break;
+              default:
+                byteLen = 8;
+            }
+            chunkDataSize += byteLen * chunkRows;
+          }
         }
 
         const chunkBuf = Buffer.allocUnsafe(chunkDataSize);

@@ -1340,6 +1340,113 @@ describe('Partitioned Table + SQL Integration', () => {
   });
 });
 
+describe('Compression Integration (AppendWriter)', () => {
+  it('should write and read compressed int64 column', async () => {
+    const { rmSync } = require('fs');
+    const path = '/tmp/test-compress-int64-' + Date.now() + '.ndts';
+
+    // 写入（启用压缩）
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'timestamp', type: 'int64' }, { name: 'value', type: 'float64' }],
+      { compression: { enabled: true } }
+    );
+
+    writer.open();
+
+    // 单调递增序列（适合 delta 压缩）
+    const rows = Array.from({ length: 100 }, (_, i) => ({
+      timestamp: BigInt(1000 + i),
+      value: 100 + i * 0.1,
+    }));
+
+    writer.append(rows);
+    await writer.close();
+
+    // 读取
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(100);
+    expect(result.header.compression?.enabled).toBe(true);
+
+    const timestamps = result.data.get('timestamp') as BigInt64Array;
+    expect(timestamps[0]).toBe(1000n);
+    expect(timestamps[99]).toBe(1099n);
+
+    const values = result.data.get('value') as Float64Array;
+    expect(values[0]).toBeCloseTo(100);
+    expect(values[99]).toBeCloseTo(109.9, 1);
+
+    // 清理
+    rmSync(path);
+  });
+
+  it('should write and read compressed int32 column with RLE', async () => {
+    const { rmSync } = require('fs');
+    const path = '/tmp/test-compress-rle-' + Date.now() + '.ndts';
+
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'symbol_id', type: 'int32' }, { name: 'price', type: 'float64' }],
+      { compression: { enabled: true, algorithms: { symbol_id: 'rle' } } }
+    );
+
+    writer.open();
+
+    // 大量重复值（适合 RLE）
+    const rows = Array.from({ length: 100 }, (_, i) => ({
+      symbol_id: Math.floor(i / 10), // 每 10 个值重复
+      price: 100 + i,
+    }));
+
+    writer.append(rows);
+    await writer.close();
+
+    // 读取
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(100);
+
+    const symbolIds = result.data.get('symbol_id') as Int32Array;
+    expect(symbolIds[0]).toBe(0);
+    expect(symbolIds[9]).toBe(0);
+    expect(symbolIds[10]).toBe(1);
+    expect(symbolIds[99]).toBe(9);
+
+    // 清理
+    rmSync(path);
+  });
+
+  it('should read uncompressed files for backward compatibility', async () => {
+    const { rmSync } = require('fs');
+    const path = '/tmp/test-no-compress-' + Date.now() + '.ndts';
+
+    // 写入（未压缩）
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'id', type: 'int32' }, { name: 'value', type: 'float64' }]
+      // 未指定 compression
+    );
+
+    writer.open();
+    writer.append([
+      { id: 1, value: 10.0 },
+      { id: 2, value: 20.0 },
+    ]);
+    await writer.close();
+
+    // 读取
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(2);
+    expect(result.header.compression).toBeUndefined();
+
+    const ids = result.data.get('id') as Int32Array;
+    expect(ids[0]).toBe(1);
+    expect(ids[1]).toBe(2);
+
+    // 清理
+    rmSync(path);
+  });
+});
+
 describe('Compression', () => {
   it('should compress and decompress int64 with Delta encoding', () => {
     const { DeltaEncoderInt64 } = require('../src/compression.js');
