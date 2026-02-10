@@ -20,6 +20,9 @@ const CONFIG = {
   priceOffset: 0.0005,
   postOnly: true,
   cooldownSec: 60,           // 60 秒冷却
+  maxOrderAgeSec: 300,        // 订单最长存活时间（超时撤单）
+  partialFillThreshold: 0.3,  // 部分成交达到 30% → 视为本格已成交（撤掉剩余）
+  dustFillThreshold: 0.05,    // <5% 的碎片成交 → 建议走清理逻辑（暂只记录）
   
   simMode: true,
 };
@@ -55,6 +58,11 @@ function loadState() {
       const obj = JSON.parse(saved);
       if (obj && typeof obj === 'object') {
         state = obj;
+        // 兼容旧状态缺字段
+        if (!state.openOrders) state.openOrders = [];
+        if (!state.tickCount) state.tickCount = 0;
+        if (!state.gridLevels) state.gridLevels = [];
+        if (!state.nextGridId) state.nextGridId = 1;
       }
     }
   } catch (e) {
@@ -81,6 +89,204 @@ function logWarn(msg) {
 
 function logDebug(msg) {
   bridge_log('debug', '[Gales] ' + msg);
+}
+
+// ================================
+// 订单管理（sim + 真实共用）
+// ================================
+
+function getOpenOrder(orderId) {
+  if (!orderId) return null;
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (o.orderId === orderId) return o;
+  }
+  return null;
+}
+
+function removeOpenOrder(orderId) {
+  if (!orderId) return;
+  state.openOrders = state.openOrders.filter(function(o) { return o.orderId !== orderId; });
+}
+
+function updatePositionFromFill(side, fillQty, fillPrice) {
+  const notional = fillQty * fillPrice;
+  if (side === 'Buy') state.positionNotional += notional;
+  else state.positionNotional -= notional;
+}
+
+// 统一入口：订单状态更新（未来接 WebSocket 时也走这里）
+function onOrderUpdate(order) {
+  const local = getOpenOrder(order.orderId);
+  if (!local) return;
+
+  // 增量成交处理（避免重复累计）
+  const prevCum = local.cumQty || 0;
+  const nextCum = order.cumQty || 0;
+  const delta = nextCum - prevCum;
+
+  local.status = order.status;
+  local.cumQty = nextCum;
+  local.avgPrice = order.avgPrice || local.avgPrice || local.price;
+  local.updatedAt = Date.now();
+
+  if (delta > 0) {
+    updatePositionFromFill(local.side, delta, local.avgPrice);
+    logInfo('[成交增量] orderId=' + local.orderId + ' +' + delta.toFixed(4) + ' @ ' + local.avgPrice.toFixed(4) + ' | 仓位Notional=' + state.positionNotional.toFixed(2));
+  }
+}
+
+/**
+ * simMode: 模拟成交（用于在 paper trade 中验证部分成交策略）
+ */
+function simulateFillsIfNeeded() {
+  if (!CONFIG.simMode) return;
+  if (!state.openOrders || state.openOrders.length === 0) return;
+
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o || o.status === 'Filled' || o.status === 'Canceled') continue;
+
+    // 限价单成交条件：
+    // Buy: 市价 <= 限价
+    // Sell: 市价 >= 限价
+    const canFill = (o.side === 'Buy')
+      ? (state.lastPrice <= o.price)
+      : (state.lastPrice >= o.price);
+
+    if (!canFill) continue;
+
+    // 每次心跳最多成交 40% 剩余量（模拟“部分成交”）
+    const remaining = o.qty - (o.cumQty || 0);
+    if (remaining <= 0) continue;
+
+    const fillQty = Math.min(remaining, o.qty * 0.4);
+    const nextCum = (o.cumQty || 0) + fillQty;
+    const status = nextCum >= o.qty ? 'Filled' : 'PartiallyFilled';
+
+    onOrderUpdate({
+      orderId: o.orderId,
+      status: status,
+      cumQty: nextCum,
+      avgPrice: o.price,
+    });
+  }
+}
+
+function findGridById(gridId) {
+  for (let i = 0; i < state.gridLevels.length; i++) {
+    if (state.gridLevels[i].id === gridId) return state.gridLevels[i];
+  }
+  return null;
+}
+
+function recordFill(grid, order, reason) {
+  const fillPct = order.qty > 0 ? ((order.cumQty || 0) / order.qty) : 0;
+  grid.lastFillPct = fillPct;
+  grid.lastFillQty = order.cumQty || 0;
+  grid.lastFillPrice = order.avgPrice || order.price;
+  grid.lastFillReason = reason;
+  grid.lastFillAt = Date.now();
+}
+
+// ACTIVE 网格的风险/策略处理：超时、脱离、部分成交决策
+function applyActiveOrderPolicy(grid, distance) {
+  const order = getOpenOrder(grid.orderId);
+  if (!order) {
+    // 订单丢失：直接回到 IDLE
+    grid.state = 'IDLE';
+    grid.orderId = undefined;
+    return;
+  }
+
+  // 订单已完全成交：记录并释放网格（允许后续再次交易）
+  if (order.status === 'Filled') {
+    recordFill(grid, order, 'filled');
+    logInfo('[完全成交] gridId=' + grid.id + ' fillQty=' + (order.cumQty || 0).toFixed(4) + ' @ ' + (order.avgPrice || order.price).toFixed(4));
+    removeOpenOrder(order.orderId);
+    grid.state = 'IDLE';
+    grid.orderId = undefined;
+    grid.orderLinkId = undefined;
+    grid.orderPrice = undefined;
+    return;
+  }
+
+  // 超时撤单
+  const ageSec = (Date.now() - (order.createdAt || Date.now())) / 1000;
+  if (ageSec > CONFIG.maxOrderAgeSec) {
+    const fillPct = order.qty > 0 ? ((order.cumQty || 0) / order.qty) : 0;
+    logWarn('[订单超时] gridId=' + grid.id + ' ageSec=' + ageSec.toFixed(0) + ' fillPct=' + (fillPct * 100).toFixed(1) + '%');
+
+    // 超时：有部分成交也撤掉剩余
+    cancelOrder(grid);
+    removeOpenOrder(order.orderId);
+
+    if (order.cumQty > 0) {
+      recordFill(grid, order, 'timeout');
+      // 关键：是否“视为完全成交”？用 partialFillThreshold 判定
+      if (fillPct >= CONFIG.partialFillThreshold) {
+        logInfo('[超时-部分成交视为完成] gridId=' + grid.id + ' fillPct=' + (fillPct * 100).toFixed(1) + '%');
+      } else {
+        logWarn('[超时-碎片成交] gridId=' + grid.id + ' fillPct=' + (fillPct * 100).toFixed(1) + '%（建议后续做碎片清理单）');
+      }
+    }
+
+    return;
+  }
+
+  // 价格脱离撤单（包含“部分成交 + 脱离”的关键场景）
+  if (distance > CONFIG.cancelDistance) {
+    const fillPct = order.qty > 0 ? ((order.cumQty || 0) / order.qty) : 0;
+
+    if ((order.cumQty || 0) > 0) {
+      logWarn('[价格脱离+部分成交] gridId=' + grid.id +
+        ' dist=' + (distance * 100).toFixed(2) + '% fillPct=' + (fillPct * 100).toFixed(1) + '%');
+
+      // 决策：撤掉剩余（避免长期挂单）
+      cancelOrder(grid);
+      removeOpenOrder(order.orderId);
+      recordFill(grid, order, 'drift');
+
+      // 是否把“这一条 gale”视为完全成交？
+      if (fillPct >= CONFIG.partialFillThreshold) {
+        logInfo('[部分成交视为完成] gridId=' + grid.id + ' fillPct=' + (fillPct * 100).toFixed(1) + '%');
+      } else if (fillPct < CONFIG.dustFillThreshold) {
+        logWarn('[碎片成交] gridId=' + grid.id + ' fillPct=' + (fillPct * 100).toFixed(1) + '%（建议后续做碎片清理单）');
+      } else {
+        logWarn('[部分成交不足阈值] gridId=' + grid.id + ' fillPct=' + (fillPct * 100).toFixed(1) + '%（不追剩余，后续由其他网格/对冲处理）');
+      }
+    } else {
+      // 无成交：直接撤单
+      logInfo('价格偏离，取消订单 gridId=' + grid.id);
+      cancelOrder(grid);
+      removeOpenOrder(order.orderId);
+    }
+  }
+}
+
+/**
+ * 订单推送回调（为实盘预留：WebSocket 收到订单更新时调用）
+ */
+function st_onOrderUpdate(orderJson) {
+  try {
+    const order = (typeof orderJson === 'string') ? JSON.parse(orderJson) : orderJson;
+    if (!order || !order.orderId) return;
+
+    onOrderUpdate(order);
+
+    // 同步 grid 状态（如果能定位到 grid）
+    if (order.gridId) {
+      const grid = findGridById(order.gridId);
+      if (grid && grid.orderId === order.orderId) {
+        // 让 policy 在下一次 heartbeat 统一处理
+        grid.lastExternalUpdateAt = Date.now();
+      }
+    }
+
+    saveState();
+  } catch (e) {
+    logWarn('st_onOrderUpdate parse failed: ' + e);
+  }
 }
 
 /**
@@ -147,10 +353,6 @@ function printGridStatus() {
   logInfo('取消距离: ' + (CONFIG.cancelDistance * 100).toFixed(2) + '%');
 }
 
-function logWarn(msg) {
-  bridge_log('warn', '[Gales] ' + msg);
-}
-
 // ================================
 // 生命周期函数
 // ================================
@@ -194,6 +396,9 @@ function st_heartbeat(tickJson) {
   if (state.tickCount % 10 === 0) {
     logHeartbeat();
   }
+
+  // simMode: 先模拟成交，方便在 paper trade 中验证“部分成交”策略
+  simulateFillsIfNeeded();
   
   // 检查网格
   for (let i = 0; i < state.gridLevels.length; i++) {
@@ -205,10 +410,7 @@ function st_heartbeat(tickJson) {
         placeOrder(grid);
       }
     } else if (grid.state === 'ACTIVE') {
-      if (distance > CONFIG.cancelDistance) {
-        logInfo('价格偏离，取消订单 gridId=' + grid.id);
-        cancelOrder(grid);
-      }
+      applyActiveOrderPolicy(grid, distance);
     }
   }
 }
@@ -369,11 +571,33 @@ function placeOrder(grid) {
   logInfo((CONFIG.simMode ? '[SIM] ' : '') + '挂单 gridId=' + grid.id + ' ' + grid.side + ' ' + quantity.toFixed(4) + ' @ ' + orderPrice.toFixed(4));
   
   if (CONFIG.simMode) {
+    const orderId = 'sim-' + grid.id + '-' + Date.now();
+
+    const order = {
+      orderId: orderId,
+      orderLinkId: orderLinkId,
+      gridId: grid.id,
+      side: grid.side,
+      price: orderPrice,
+      qty: quantity,
+      status: 'New',
+      cumQty: 0,
+      avgPrice: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    state.openOrders.push(order);
+
     grid.state = 'ACTIVE';
-    grid.orderId = 'sim-' + grid.id;
+    grid.orderId = orderId;
     grid.orderLinkId = orderLinkId;
     grid.orderPrice = orderPrice;
-    grid.createdAt = Date.now();
+    grid.orderQty = quantity;
+    grid.cumQty = 0;
+    grid.avgFillPrice = 0;
+    grid.createdAt = order.createdAt;
+
     saveState();
     return;
   }
@@ -395,7 +619,25 @@ function placeOrder(grid) {
     grid.orderId = order.orderId;
     grid.orderLinkId = orderLinkId;
     grid.orderPrice = orderPrice;
+    grid.orderQty = quantity;
+    grid.cumQty = 0;
+    grid.avgFillPrice = 0;
     grid.createdAt = Date.now();
+
+    // 记录到 openOrders（后续由 st_onOrderUpdate 更新状态）
+    state.openOrders.push({
+      orderId: grid.orderId,
+      orderLinkId: orderLinkId,
+      gridId: grid.id,
+      side: grid.side,
+      price: orderPrice,
+      qty: quantity,
+      status: 'New',
+      cumQty: 0,
+      avgPrice: 0,
+      createdAt: grid.createdAt,
+      updatedAt: grid.createdAt,
+    });
     
     logInfo('✅ 挂单成功 orderId=' + grid.orderId);
     saveState();
@@ -407,10 +649,20 @@ function placeOrder(grid) {
 
 function cancelOrder(grid) {
   if (!grid.orderId) return;
+
+  const orderId = grid.orderId;
   
   grid.state = 'CANCELING';
   
   if (CONFIG.simMode) {
+    // 标记订单取消
+    const o = getOpenOrder(orderId);
+    if (o) {
+      o.status = 'Canceled';
+      o.updatedAt = Date.now();
+    }
+    removeOpenOrder(orderId);
+
     grid.state = 'IDLE';
     grid.orderId = undefined;
     grid.orderLinkId = undefined;
@@ -421,8 +673,10 @@ function cancelOrder(grid) {
   
   // TODO: 真实撤单（通过 bridge_cancelOrder）
   try {
-    bridge_cancelOrder(grid.orderId);
-    logInfo('✅ 取消订单成功 orderId=' + grid.orderId);
+    bridge_cancelOrder(orderId);
+    logInfo('✅ 取消订单成功 orderId=' + orderId);
+
+    removeOpenOrder(orderId);
     
     grid.state = 'IDLE';
     grid.orderId = undefined;
