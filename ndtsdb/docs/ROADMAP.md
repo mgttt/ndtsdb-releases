@@ -227,7 +227,7 @@ Chunk 级原子写入：
 
 ### 后续计划（按优先级）
 
-**🔴 高优先级**：
+**🔴 高优先级（全部完成 ✅）**：
 - ✅ **SQL CTE (WITH) + 多列 IN + `||` + ROUND/SQRT**
 - ✅ **Inline Window + PARTITION BY fast-path 统一**
 - ✅ **复杂 WHERE（括号优先级 / AND-OR-NOT）**
@@ -236,11 +236,13 @@ Chunk 级原子写入：
 - ✅ **二级索引（BTree on 数值列 + SQL 自动优化）**
 - ✅ **UPDATE/DELETE tombstone 优化**（独立 .tomb 文件 + RoaringBitmap 压缩 + 延迟 compact）
 - ✅ **原生字符串类型**（字典编码 + 固定 header 空间，透明存储为 int32 id）
+- ✅ **复合索引**（多列组合查询加速，如 (symbol, timestamp)）
+- ✅ **自动 compact 策略**（tombstone 比例触发，可配置阈值）
 
 **🟡 中优先级**：
-- 复合索引（多列组合，如 `(symbol, timestamp)`）
-- 自动 compact 策略（时间窗口 / 文件大小触发）
 - 列式压缩（Gorilla/delta 编码，减少磁盘占用）
+- 分区表（按时间/symbol 自动分区）
+- 流式聚合（增量计算）
 
 **🟢 低优先级**：
 - 事务支持（WAL + 原子写入）

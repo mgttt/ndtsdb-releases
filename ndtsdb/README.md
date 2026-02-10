@@ -206,16 +206,16 @@ KEY (symbol, interval, timestamp);
 
 如果您觉得 ndtsdb 对您有帮助，欢迎通过以下方式支持项目发展：
 
-**TON 链钱包**: `UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG`
+**TON 链钱包**: `UQC9Q9NuCkI8Wmuk5l_flSWfNf21XToXmVbJikw3P9MflhzG`
 
 > 💎 支持赞助 <a href="https://www.tradingview.com/symbols/XUSDT/markets/" target="_blank">**$X**</a>（金额随意）  
 > 🔗 这是 [TON 链](https://ton.foundation/) 的钱包地址
 
-**扫码支付** (Telegram 钱包 → 选择 **TON** 或 **$X**):
+**扫码支付** (Telegram Wallet):
 
-<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=UQAFzEKdDYIOlIyUs3X6BDF8jHAK3P_hpSmcJNq4lDq_EEmG" alt="TON Wallet Address QR" width="200" />
+<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=UQC9Q9NuCkI8Wmuk5l_flSWfNf21XToXmVbJikw3P9MflhzG" alt="TON Wallet Address QR" width="200" />
 
-> 扫码后选择发送 **$X** (X Empire) 或 **TON**
+> 📱 扫码后点击「**切换币种**」→ 选择 **$X** (X Empire) 或 **TON**
 
 ---
 

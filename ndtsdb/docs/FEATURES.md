@@ -17,6 +17,10 @@
   - 独立 .tomb 文件（RoaringBitmap 压缩存储已删除行号）
   - `compact()` 清理 tombstone + 重写文件
   - `readAllFiltered()` 自动过滤已删除行
+- **自动 compact**：可配置 tombstone 比例阈值，close 时自动清理
+  - `autoCompact`: true/false（默认 false）
+  - `compactThreshold`: 0.2 = 20%（默认）
+  - `compactMinRows`: 1000（最小行数阈值）
 - **rewrite/compact**：`rewrite/deleteWhere/updateWhere`（写 tmp + 原子替换，向后兼容）
 
 ### ColumnarTable
@@ -85,12 +89,11 @@
 ## 5. Index（索引）
 
 - **BTree 索引**：数值列（timestamp/price 等）范围查询加速
-- **自动维护**：appendBatch / append 时自动更新索引
+- **复合索引**：多列组合查询加速（如 (symbol, timestamp)）
+  - 嵌套 Map + BTree 结构
+  - 支持前缀精确匹配 + 最后一列范围查询
+  - 自动维护（appendBatch 时更新）
 - **SQL 自动优化**：WHERE 条件自动使用索引（> / < / >= / <= / =）
-- **API**：createIndex / dropIndex / queryIndex / hasIndex
-
-## 6. Not Yet (Planned)
-
-- 复合索引（多列组合，如 `(symbol, timestamp)`）
-- tombstone/增量 compact（避免全量重写；可选）
-- string 持久化（透明字典编码/变长编码）
+- **API**：
+  - 单列：createIndex / dropIndex / queryIndex / hasIndex
+  - 复合：createCompositeIndex / dropCompositeIndex / queryCompositeIndex / hasCompositeIndex

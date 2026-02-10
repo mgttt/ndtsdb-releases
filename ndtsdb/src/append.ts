@@ -299,13 +299,47 @@ export class AppendWriter {
   /**
    * 关闭文件
    */
-  close(): void {
+  async close(): Promise<void> {
     if (this.fd !== -1) {
       closeSync(this.fd);
       this.fd = -1;
     }
     // 保存 tombstone
     this.tombstone.save();
+
+    // 自动 compact 检查
+    if (this.options.autoCompact) {
+      await this.checkAndCompact();
+    }
+  }
+
+  /**
+   * 检查并执行自动 compact
+   */
+  private async checkAndCompact(): Promise<void> {
+    const deletedCount = this.tombstone.getDeletedCount();
+    const totalRows = this.totalRows; // 当前文件中的总行数（包含已删除的）
+
+    // 检查触发条件
+    if (totalRows < this.options.compactMinRows!) {
+      return; // 表太小，不 compact
+    }
+
+    const deletedRatio = deletedCount / totalRows;
+    if (deletedRatio >= this.options.compactThreshold!) {
+      console.log(`[AutoCompact] Triggering compact: ${deletedCount}/${totalRows} deleted (${(deletedRatio * 100).toFixed(1)}%)`);
+      
+      // 重新打开文件
+      this.open();
+      try {
+        await this.compact();
+      } finally {
+        if (this.fd !== -1) {
+          closeSync(this.fd);
+          this.fd = -1;
+        }
+      }
+    }
   }
 
   // ... 其他方法保持不变

@@ -829,6 +829,63 @@ describe('Index', () => {
     expect(rows.sort()).toEqual([0, 2]);
   });
 
+  it('should auto-compact when threshold reached', async () => {
+    const path = '/tmp/test-autocompact-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'id', type: 'int32' }],
+      { autoCompact: true, compactThreshold: 0.3, compactMinRows: 5 }
+    );
+
+    writer.open();
+    writer.append([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }, { id: 6 }, { id: 7 }, { id: 8 }, { id: 9 }, { id: 10 }]);
+    
+    // 删除 3 行（30% 达到阈值）
+    writer.deleteWhereWithTombstone((row) => row.id <= 3);
+    expect(writer.getDeletedCount()).toBe(3);
+
+    // Close 时应自动 compact
+    await writer.close();
+
+    // 验证 compact 结果
+    const result = AppendWriter.readAll(path);
+    expect(result.header.totalRows).toBe(7); // 10 - 3 = 7
+    const ids = result.data.get('id') as Int32Array;
+    expect(ids[0]).toBe(4);
+    expect(ids[6]).toBe(10);
+
+    rmSync(path);
+    rmSync(path + '.tomb', { force: true });
+  });
+
+  it('should not auto-compact if below threshold', async () => {
+    const path = '/tmp/test-no-autocompact-' + Date.now() + '.ndts';
+    const writer = new AppendWriter(
+      path,
+      [{ name: 'id', type: 'int32' }],
+      { autoCompact: true, compactThreshold: 0.5, compactMinRows: 5 }
+    );
+
+    writer.open();
+    writer.append([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }]);
+    
+    // 删除 2 行（40% 未达到 50% 阈值）
+    writer.deleteWhereWithTombstone((row) => row.id <= 2);
+    expect(writer.getDeletedCount()).toBe(2);
+
+    // Close 时不应 compact
+    await writer.close();
+
+    // 验证 tombstone 仍在
+    const writer2 = new AppendWriter(path, [{ name: 'id', type: 'int32' }]);
+    writer2.open();
+    expect(writer2.getDeletedCount()).toBe(2); // tombstone 未清理
+    writer2.close();
+
+    rmSync(path);
+    rmSync(path + '.tomb', { force: true });
+  });
+
   it('should add and check RoaringBitmap', () => {
     const bitmap = new RoaringBitmap();
     bitmap.add(1);
