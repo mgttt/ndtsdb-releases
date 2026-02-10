@@ -1,8 +1,25 @@
 # ndtsdb Features
 
-> ndtsdb 的 scope / non-goals：见 `docs/SCOPE.md`。
+> **版本**: v0.9.3.10 (2026-02-10)  
+> **Scope / Non-goals**: 见 `docs/SCOPE.md`
 
 本文档列出 **ndtsdb 引擎本体**已具备的主要能力（用于发布仓库/产品说明）。
+
+---
+
+## 🎯 核心特性概览
+
+| 特性 | 状态 | 性能 |
+|------|------|------|
+| **列式存储** | ✅ | 6.9M writes/s |
+| **增量写入** | ✅ | 3.3M rows/s |
+| **压缩算法** | ✅ | Delta/RLE/Gorilla |
+| **SQL 引擎** | ✅ | JOIN/子查询/聚合/窗口函数 |
+| **索引** | ✅ | BTree + 复合索引 |
+| **分区表** | ✅ | 时间/哈希/范围分区 |
+| **流式聚合** | ✅ | SMA/EMA/StdDev/Min/Max |
+| **C SIMD** | ✅ | 143M rows/s (8 平台) |
+| **测试覆盖** | ✅ | 79/79 tests pass |
 
 ---
 
@@ -209,6 +226,22 @@ const metrics = agg.add(100.5); // { sma: ..., ema: ..., stddev: ... }
 - 运算符：`+ - * / %`、括号
 - 字符串拼接：`||`
 - 常用函数：`ROUND/SQRT/ABS/LN/LOG/EXP/POW(MIN/MAX)`
+
+### 2.2.1 聚合函数
+
+**支持的聚合函数**：
+- `COUNT(*)` / `COUNT(column)` - 统计行数
+- `SUM(column)` - 求和
+- `AVG(column)` - 平均值
+- `MIN(column)` / `MAX(column)` - 最小/最大值
+- `STDDEV(column)` / `VARIANCE(column)` - 标准差/方差
+- `FIRST(column)` / `LAST(column)` - 首/末值
+
+**使用场景**：
+1. **GROUP BY 聚合**：`SELECT symbol, AVG(close) FROM ticks GROUP BY symbol`
+2. **整体聚合**（v0.9.3.10 新增）：`SELECT AVG(close), SUM(volume) FROM ticks`
+   - 无 GROUP BY 时，自动将所有行作为一个组进行聚合
+   - 返回单行结果
 
 ### 2.3 窗口函数
 
