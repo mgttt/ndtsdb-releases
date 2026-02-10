@@ -24,6 +24,7 @@
     "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {
+    "@moltbaby/workpool-lib": "file:../workpool-lib",
     "quant-lib": "file:../quant-lib",
     "quickjs-emscripten": "^0.29.0",
     "undici": "^6.20.1"

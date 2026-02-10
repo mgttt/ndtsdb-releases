@@ -295,6 +295,11 @@ class QuickJSStrategyEngine {
     this.lastPrice = ticker.lastPrice;
 
     this.tickCount++;
+    
+    // 每 10 次心跳输出一次状态
+    if (this.tickCount % 10 === 0) {
+      console.log(`[QuickJS] 心跳 #${this.tickCount} - 价格: ${this.lastPrice}`);
+    }
 
     // 构造 tick
     const tick = {
