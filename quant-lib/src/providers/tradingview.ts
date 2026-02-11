@@ -63,9 +63,9 @@ export class TradingViewProvider extends WebSocketDataProvider {
     timeoutHandle?: NodeJS.Timeout; // 保存超时 handle，用于清理
   }> = new Map();
   
-  // 请求计数（用于主动重建连接，避免被 TradingView 踢）
+  // 请求计数（监控用，不触发主动重建）
   private requestCount = 0;
-  private readonly REQUEST_LIMIT = 4; // 每4个请求重建（TradingView 限制约5个）
+  private readonly REQUEST_LIMIT = 999; // 禁用主动重建（让TradingView决定何时断开）
   private isRebuilding = false; // 重建锁（防止并发重建）
   private connectPromise: Promise<void> | null = null; // 连接Promise（防止重复连接）
   
@@ -215,7 +215,7 @@ export class TradingViewProvider extends WebSocketDataProvider {
   }
   
   /**
-   * 重建连接（带锁机制，避免并发重建）
+   * 重建连接（原子性操作，确保完全断开再连接）
    */
   private async rebuildConnection(): Promise<void> {
     // 如果已经在重建中，等待当前重建完成
@@ -232,20 +232,79 @@ export class TradingViewProvider extends WebSocketDataProvider {
     try {
       console.log(`🔄 主动重建连接（已完成 ${this.requestCount} 个请求）`);
       
-      // 1. 断开连接（会自动调用rejectAllPending）
+      // 1. 完全断开（原子性操作）
       this.shouldReconnect = false;
-      await this.disconnect();
+      if (this.ws) {
+        // 确保WebSocket完全关闭
+        await new Promise<void>((resolve) => {
+          if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+            resolve();
+            return;
+          }
+          
+          const onClose = () => {
+            this.ws?.removeAllListeners?.();
+            resolve();
+          };
+          
+          this.ws.once('close', onClose);
+          this.ws.close();
+          
+          // 2秒超时保护
+          setTimeout(() => {
+            if (this.ws) {
+              this.ws.removeAllListeners?.();
+              this.ws = null;
+            }
+            resolve();
+          }, 2000);
+        });
+      }
       
-      // 2. 等待足够长的时间让Bun清理资源（避免segfault）
-      await this.delay(1000); // 1秒延迟（原来是500ms）
+      this.ws = null;
+      this.isConnected = false;
       
-      // 3. 重新连接（重新启用自动重连）
+      // 2. 等待Bun完全清理资源
+      await this.delay(1500); // 增加到1.5秒
+      
+      // 3. 重新连接（原子性操作，带验证）
       this.shouldReconnect = true;
       await this.connect();
       
-      // 4. 重置计数
+      // 4. 验证连接完全ready
+      await new Promise<void>((resolve, reject) => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          reject(new Error('重建后连接未就绪'));
+          return;
+        }
+        
+        // 发送一个测试心跳，确认连接可用
+        try {
+          this.send({ m: '~h~1' });
+          // 等待50ms确保没有立即崩溃
+          setTimeout(() => {
+            if (this.isConnected && this.ws?.readyState === WebSocket.OPEN) {
+              resolve();
+            } else {
+              reject(new Error('重建后连接不稳定'));
+            }
+          }, 50);
+        } catch (e) {
+          reject(e);
+        }
+      });
+      
+      // 5. 重置计数
       this.requestCount = 0;
       
+      console.log('✅ 连接重建完成，已验证可用');
+      
+    } catch (error: any) {
+      console.error('❌ 连接重建失败:', error.message);
+      // 重建失败，清理状态
+      this.isConnected = false;
+      this.ws = null;
+      throw error;
     } finally {
       this.isRebuilding = false;
     }
@@ -264,14 +323,25 @@ export class TradingViewProvider extends WebSocketDataProvider {
   }
   
   /**
-   * 获取 K线数据
+   * 获取 K线数据（promisified，原子性操作）
    */
   async getKlines(query: KlineQuery): Promise<Kline[]> {
-    // 主动重建连接（避免被 TradingView 踢）
-    if (this.requestCount > 0 && this.requestCount % this.REQUEST_LIMIT === 0 && !this.isRebuilding) {
-      await this.rebuildConnection();
-    } else if (!this.isConnected) {
-      await this.ensureConnected();
+    // 1. 确保连接完全ready（promisified）
+    try {
+      // 检查是否需要重建（避免被TradingView踢）
+      if (this.requestCount > 0 && this.requestCount % this.REQUEST_LIMIT === 0 && !this.isRebuilding) {
+        await this.rebuildConnection();
+      } else if (!this.isConnected) {
+        await this.ensureConnected();
+      }
+      
+      // 再次验证连接状态（防止重建失败）
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        throw new Error('WebSocket未就绪，无法发送请求');
+      }
+      
+    } catch (error: any) {
+      throw new Error(`连接准备失败: ${error.message}`);
     }
     
     this.requestCount++; // 请求计数+1
