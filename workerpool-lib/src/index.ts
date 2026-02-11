@@ -14,3 +14,11 @@ export { MemoryStore } from './store/MemoryStore';
 
 // TreeEngine 别名（向后兼容）
 export { Engine as TreeEngine } from './engine/Engine';
+
+// Phase 1 - 进程管理
+export * from './process';
+export * from './log';
+export * from './adapters/ProcessAdapter';
+
+// Phase 2 - Daemon & IPC
+export * from './daemon';
