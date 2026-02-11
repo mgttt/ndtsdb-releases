@@ -17,6 +17,10 @@ const CONFIG = {
 
   magnetDistance: 0.005,     // 0.5%
   cancelDistance: 0.01,      // 1%
+
+  // magnetDistance 的补强：默认按 gridSpacing 的比例给一个“相对磁铁范围”，避免长期擦边不触发
+  magnetRelativeToGrid: true,
+  magnetGridRatio: 0.7,      // magnetDistance 至少达到 gridSpacing*ratio（比如 gridSpacing=1% → magnet≥0.7%）
   priceOffset: 0.0005,
   postOnly: true,
   cooldownSec: 60,           // 60 秒冷却
@@ -52,6 +56,8 @@ if (typeof ctx !== 'undefined' && ctx && ctx.strategy && ctx.strategy.params) {
   if (p.maxPosition) CONFIG.maxPosition = p.maxPosition;
   if (p.magnetDistance) CONFIG.magnetDistance = p.magnetDistance;
   if (p.cancelDistance) CONFIG.cancelDistance = p.cancelDistance;
+  if (p.magnetRelativeToGrid !== undefined) CONFIG.magnetRelativeToGrid = p.magnetRelativeToGrid;
+  if (p.magnetGridRatio) CONFIG.magnetGridRatio = p.magnetGridRatio;
   if (p.cooldownSec) CONFIG.cooldownSec = p.cooldownSec;
   if (p.maxActiveOrders) CONFIG.maxActiveOrders = p.maxActiveOrders;
 
@@ -730,6 +736,14 @@ function st_onParamsUpdate(newParamsJson) {
     CONFIG.magnetDistance = newParams.magnetDistance;
     logInfo('[Gales] 磁铁距离: ' + CONFIG.magnetDistance);
   }
+  if (newParams.magnetRelativeToGrid !== undefined) {
+    CONFIG.magnetRelativeToGrid = newParams.magnetRelativeToGrid;
+    logInfo('[Gales] 相对磁铁: ' + CONFIG.magnetRelativeToGrid);
+  }
+  if (newParams.magnetGridRatio !== undefined) {
+    CONFIG.magnetGridRatio = newParams.magnetGridRatio;
+    logInfo('[Gales] 磁铁比例: ' + CONFIG.magnetGridRatio);
+  }
   if (newParams.cancelDistance !== undefined) {
     CONFIG.cancelDistance = newParams.cancelDistance;
     logInfo('[Gales] 取消距离: ' + CONFIG.cancelDistance);
@@ -839,11 +853,28 @@ function initializeGrids() {
   logInfo('生成网格: ' + state.gridLevels.length + ' 个档位');
 }
 
+function getEffectiveMagnetDistance() {
+  let d = CONFIG.magnetDistance;
+
+  if (CONFIG.magnetRelativeToGrid) {
+    const rel = CONFIG.gridSpacing * (CONFIG.magnetGridRatio || 0);
+    if (rel > d) d = rel;
+  }
+
+  // 避免 magnet >= cancelDistance（否则会出现触发后立刻进入撤单区的尴尬）
+  if (CONFIG.cancelDistance && d >= CONFIG.cancelDistance) {
+    d = CONFIG.cancelDistance * 0.9;
+  }
+
+  return d;
+}
+
 function shouldPlaceOrder(grid, distance) {
   const distancePct = (distance * 100).toFixed(2);
 
   // 1. 磁铁检查（双向）
-  if (distance > CONFIG.magnetDistance) {
+  const magnet = getEffectiveMagnetDistance();
+  if (distance > magnet) {
     return false;  // 距离太远
   }
 
