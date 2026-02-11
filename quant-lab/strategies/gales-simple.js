@@ -55,6 +55,17 @@ let state = {
   tickCount: 0,
 };
 
+// 运行时状态（不持久化）
+let runtime = {
+  // 仓位超限告警：只在“首次进入超限”时提醒，并做时间节流
+  posLimit: {
+    buyOver: false,
+    sellOver: false,
+    lastWarnAtBuy: 0,
+    lastWarnAtSell: 0,
+  },
+};
+
 // 加载状态
 function loadState() {
   try {
@@ -96,6 +107,26 @@ function logDebug(msg) {
   bridge_log('debug', '[Gales] ' + msg);
 }
 
+function warnPositionLimit(side, gridId, currentNotional, afterFillNotional) {
+  const now = Date.now();
+  const intervalMs = 5 * 60 * 1000; // 5 分钟提醒一次足够了
+
+  if (side === 'Buy') {
+    if (runtime.posLimit.buyOver && (now - runtime.posLimit.lastWarnAtBuy) < intervalMs) return;
+    runtime.posLimit.buyOver = true;
+    runtime.posLimit.lastWarnAtBuy = now;
+    logWarn('买单 #' + gridId + ' 仓位将超限 (当前=' + currentNotional.toFixed(2) + ' 成交后=' + afterFillNotional.toFixed(2) + ')');
+    return;
+  }
+
+  if (side === 'Sell') {
+    if (runtime.posLimit.sellOver && (now - runtime.posLimit.lastWarnAtSell) < intervalMs) return;
+    runtime.posLimit.sellOver = true;
+    runtime.posLimit.lastWarnAtSell = now;
+    logWarn('卖单 #' + gridId + ' 仓位将超限 (当前=' + currentNotional.toFixed(2) + ' 成交后=' + afterFillNotional.toFixed(2) + ')');
+  }
+}
+
 // ================================
 // 订单管理（sim + 真实共用）
 // ================================
@@ -112,6 +143,64 @@ function getOpenOrder(orderId) {
 function removeOpenOrder(orderId) {
   if (!orderId) return;
   state.openOrders = state.openOrders.filter(function(o) { return o.orderId !== orderId; });
+}
+
+function findActiveOrderByGridId(gridId) {
+  if (!gridId) return null;
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o) continue;
+    if (o.gridId !== gridId) continue;
+    if (o.status === 'Filled' || o.status === 'Canceled') continue;
+    return o;
+  }
+  return null;
+}
+
+function syncGridFromOrder(grid, order) {
+  if (!grid || !order) return;
+  grid.state = 'ACTIVE';
+  grid.orderId = order.orderId;
+  grid.orderLinkId = order.orderLinkId;
+  grid.orderPrice = order.price;
+  grid.orderQty = order.qty;
+  grid.cumQty = order.cumQty || 0;
+  grid.avgFillPrice = order.avgPrice || 0;
+  grid.createdAt = order.createdAt || grid.createdAt || Date.now();
+}
+
+// 修复/对齐 grid <-> openOrders 的一致性，避免重复挂单
+function reconcileGridOrderLinks() {
+  if (!state.gridLevels || state.gridLevels.length === 0) return;
+
+  // 1) 如果 openOrders 里存在活跃订单，但 grid 却是 IDLE，则纠正为 ACTIVE
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o || !o.gridId) continue;
+    if (o.status === 'Filled' || o.status === 'Canceled') continue;
+
+    const g = findGridById(o.gridId);
+    if (!g) continue;
+    if (g.state !== 'ACTIVE' || g.orderId !== o.orderId) {
+      syncGridFromOrder(g, o);
+    }
+  }
+
+  // 2) 如果 grid 标记 ACTIVE 但找不到订单，则回收为 IDLE
+  for (let i = 0; i < state.gridLevels.length; i++) {
+    const g = state.gridLevels[i];
+    if (!g) continue;
+    if (g.state !== 'ACTIVE') continue;
+
+    const o = getOpenOrder(g.orderId);
+    if (!o || o.status === 'Filled' || o.status === 'Canceled') {
+      g.state = 'IDLE';
+      g.orderId = undefined;
+      g.orderLinkId = undefined;
+      g.orderPrice = undefined;
+      g.orderQty = undefined;
+    }
+  }
 }
 
 function updatePositionFromFill(side, fillQty, fillPrice) {
@@ -473,8 +562,14 @@ function st_heartbeat(tickJson) {
     logHeartbeat();
   }
 
+  // 修复 grid/openOrders 不一致（避免重复挂单/状态漂移）
+  reconcileGridOrderLinks();
+
   // simMode: 先模拟成交，方便在 paper trade 中验证"部分成交"策略
   simulateFillsIfNeeded();
+
+  // 成交/状态更新后再对齐一次
+  reconcileGridOrderLinks();
 
   // 检查网格
   for (let i = 0; i < state.gridLevels.length; i++) {
@@ -489,6 +584,9 @@ function st_heartbeat(tickJson) {
       applyActiveOrderPolicy(grid, distance);
     }
   }
+
+  // 心跳末尾持久化（确保部分成交/对冲/撤单等状态不丢）
+  saveState();
 }
 
 /**
@@ -604,27 +702,33 @@ function shouldPlaceOrder(grid, distance) {
     }
   }
 
-  // 3. 仓位检查（考虑订单全量成交后的仓位）
+  // 3. 防重复：如果该 grid 已存在活跃订单（但 grid 状态丢了），则修复并跳过
+  const existing = findActiveOrderByGridId(grid.id);
+  if (existing) {
+    syncGridFromOrder(grid, existing);
+    return false;
+  }
+
+  // 4. 仓位检查（考虑订单全量成交后的仓位）
   const orderNotional = CONFIG.orderSize; // 订单名义价值
-  
+
   if (grid.side === 'Buy') {
     const afterFill = state.positionNotional + orderNotional;
     if (afterFill > CONFIG.maxPosition) {
-      if (state.tickCount % 50 === 0) { // 避免刷屏
-        logWarn('买单 #' + grid.id + ' 仓位将超限 (当前=' + state.positionNotional.toFixed(2) + ' 成交后=' + afterFill.toFixed(2) + ')');
-      }
+      warnPositionLimit('Buy', grid.id, state.positionNotional, afterFill);
       return false;
     }
+    // 回到安全区后，允许下次“再次进入超限”时报警
+    runtime.posLimit.buyOver = false;
   }
-  
+
   if (grid.side === 'Sell') {
     const afterFill = state.positionNotional - orderNotional;
     if (afterFill < -CONFIG.maxPosition) {
-      if (state.tickCount % 50 === 0) { // 避免刷屏
-        logWarn('卖单 #' + grid.id + ' 仓位将超限 (当前=' + state.positionNotional.toFixed(2) + ' 成交后=' + afterFill.toFixed(2) + ')');
-      }
+      warnPositionLimit('Sell', grid.id, state.positionNotional, afterFill);
       return false;
     }
+    runtime.posLimit.sellOver = false;
   }
 
   // 4. 通过所有检查，可以触发
@@ -633,6 +737,13 @@ function shouldPlaceOrder(grid, distance) {
 }
 
 function placeOrder(grid) {
+  // 双保险：避免重复挂单（grid 状态丢失时常见）
+  const existing = findActiveOrderByGridId(grid.id);
+  if (existing) {
+    syncGridFromOrder(grid, existing);
+    return;
+  }
+
   grid.state = 'PLACING';
   grid.attempts++;
   grid.lastTriggerTime = Date.now();
