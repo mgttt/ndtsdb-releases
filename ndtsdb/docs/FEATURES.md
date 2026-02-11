@@ -1,6 +1,6 @@
 # ndtsdb Features
 
-> **版本**: v0.9.3.10 (2026-02-10)  
+> **版本**: v0.9.4.2 (2026-02-11)  
 > **Scope / Non-goals**: 见 `docs/SCOPE.md`
 
 本文档列出 **ndtsdb 引擎本体**已具备的主要能力（用于发布仓库/产品说明）。
@@ -170,7 +170,96 @@ const metrics = agg.add(100.5); // { sma: ..., ema: ..., stddev: ... }
 
 ---
 
-## 4. Storage Engine
+## 4. High-Performance Queries
+
+### getMax() API + 内存索引缓存
+
+**问题**：查询最新时间戳等聚合值时需要全表扫描（O(n)）
+
+**解决方案**：
+1. **内存索引缓存**（哈希分区专用）
+   - 结构：`partitionLabel → hashValue → column → maxValue`
+   - 写入时自动维护（O(1) 更新）
+   - 查询时 O(1) 返回缓存值
+
+2. **partitionHint 定位**
+   - 哈希分区：直接定位到对应 bucket
+   - 时间分区：只扫描最新分区
+
+**性能**：
+- 30个symbol查询最新时间戳：**300秒 → 0.37ms**（810,000x 加速）
+- 单次查询：**10秒 → 0.01ms**（1,000,000x 加速）
+
+**使用示例**：
+```typescript
+// PartitionedTable API
+const maxValue = table.getMax(
+  'timestamp',                    // 列名
+  row => row.symbol_id === 123,   // 过滤条件
+  { symbol_id: 123 }              // partitionHint（定位 bucket）
+);
+
+// KlineDatabase API
+const maxTs = await db.getMaxTimestamp('BTC/USDT', '1m');
+// 性能：~0.01ms（O(1) 查询）
+```
+
+**索引一致性**：
+```typescript
+// 插入后立即查询，自动更新索引
+await db.insertKlines([newKline]);
+const ts = await db.getMaxTimestamp(symbol, interval);
+// ts === newKline.timestamp ✅
+```
+
+---
+
+### query() 提前退出优化
+
+**问题**：全表扫描，即使 `limit=1` 也遍历所有行
+
+**解决方案**：
+1. **limit 参数**：找到 N 条后立即返回
+2. **reverse 参数**：倒序扫描（查最新数据更高效）
+3. **跨分区提前退出**：达到 limit 后停止扫描
+
+**性能**：
+- `limit=10`：**3.7x 加速**
+- `reverse+limit=1`（查最新）：**4.4x 加速**
+
+**使用示例**：
+```typescript
+// 查询最新 10 条
+const latest = table.query(
+  row => row.symbol_id === 123,
+  { reverse: true, limit: 10 }
+);
+
+// 查询最新一条（最常用）
+const latest = table.query(
+  row => row.symbol_id === 123,
+  { reverse: true, limit: 1 }
+);
+
+// 时间范围 + limit
+const rows = table.query(
+  row => row.symbol_id === 123,
+  {
+    timeRange: { min: startTs, max: endTs },
+    limit: 100
+  }
+);
+```
+
+**应用场景**：
+- 增量数据拉取（查最新时间戳）
+- 实时监控（查最新状态）
+- 分页查询
+- Top-N 查询
+
+---
+
+## 5. Storage Engine
 
 ### AppendWriter (DLv2)
 - chunked append-only
