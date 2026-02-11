@@ -279,6 +279,8 @@ export abstract class WebSocketDataProvider extends DataProvider {
 
     this.stopHeartbeat();
     if (this.ws) {
+      // ⚡ 关键修复：移除所有监听器（防止内存泄漏）
+      this.ws.removeAllListeners();
       this.ws.close();
       this.ws = null;
     }

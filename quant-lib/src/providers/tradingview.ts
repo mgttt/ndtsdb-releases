@@ -130,6 +130,12 @@ export class TradingViewProvider extends WebSocketDataProvider {
         options.agent = proxyUrl; // ws 库的代理配置
       }
       
+      // ⚡ 关键修复：创建新连接前，先清理旧连接的监听器（防止内存泄漏）
+      if (this.ws) {
+        this.ws.removeAllListeners();
+        this.ws = null;
+      }
+      
       this.ws = new WebSocket(this.wsUrl, options);
       
       this.ws.on('open', () => {
