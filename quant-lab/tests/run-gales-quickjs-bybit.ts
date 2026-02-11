@@ -72,7 +72,20 @@ class BybitClient {
     });
   }
 
-  private async request(method: string, endpoint: string, params: Record<string, any>): Promise<any> {
+  async getOpenOrders(symbol?: string): Promise<any[]> {
+    const params: Record<string, any> = {
+      category: 'linear',
+      openOnly: 0, // 0=all, 1=open only
+      limit: 50,
+    };
+    
+    if (symbol) params.symbol = symbol;
+    
+    const result = await this.request('GET', '/v5/order/realtime', params);
+    return result.result?.list || [];
+  }
+
+  private async request(method: string, endpoint: string, params: Record<string, any>, retries = 3): Promise<any> {
     const timestamp = Date.now().toString();
     const recvWindow = '5000';
 
@@ -113,14 +126,35 @@ class BybitClient {
     if (this.proxy) args.push('-x', this.proxy);
     if (body && method !== 'GET') args.push('--data', body);
 
-    const out = execFileSync('curl', args, { encoding: 'utf8' });
-    const result = JSON.parse(out);
+    // P0 修复：指数退避重试
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const out = execFileSync('curl', args, { encoding: 'utf8' });
+        const result = JSON.parse(out);
 
-    if (result.retCode !== 0) {
-      throw new Error(`Bybit API error: ${result.retMsg}`);
+        if (result.retCode !== 0) {
+          throw new Error(`Bybit API error: ${result.retMsg}`);
+        }
+
+        return result;
+      } catch (error: any) {
+        const isLastAttempt = attempt === retries;
+        const isNetworkError = error.message.includes('timeout') || 
+                              error.message.includes('SSL') ||
+                              error.message.includes('EOF') ||
+                              error.message.includes('proxy');
+        
+        if (isNetworkError && !isLastAttempt) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 10000); // 1s, 2s, 4s, 8s, 10s
+          console.warn(`[Bybit] 网络错误（${error.message.slice(0, 50)}），${delay}ms 后重试 (${attempt + 1}/${retries})...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw error;
+        }
+      }
     }
 
-    return result;
+    throw new Error('Unreachable');
   }
 }
 
@@ -137,10 +171,19 @@ class QuickJSStrategyEngine {
   private running = false;
   private state = new Map<string, any>();
   private tickCount = 0;
+  
+  // P0 修复：订单 ID 映射与状态管理
+  private orderIdMap = new Map<string, string>(); // pending → real orderId
+  private orderSymbolMap = new Map<string, string>(); // orderId → symbol
+  private openOrders = new Map<string, any>(); // orderId → order info
+  private dryRun: boolean; // Paper Trade 模式
 
-  constructor(client: BybitClient, strategyFile: string) {
+  constructor(client: BybitClient, strategyFile: string, dryRun = false) {
     this.client = client;
     this.strategyFile = strategyFile;
+    this.dryRun = dryRun;
+    
+    console.log(`[QuickJS] 模式: ${dryRun ? 'Paper Trade (DRY RUN)' : 'Live Trading'}`);
   }
 
   async initialize() {
@@ -211,29 +254,108 @@ class QuickJSStrategyEngine {
     this.ctx.setProp(this.ctx.global, 'bridge_getPrice', bridge_getPrice);
     bridge_getPrice.dispose();
 
-    // bridge_placeOrder
+    // bridge_placeOrder（P0 修复：支持 DRY_RUN + 订单 ID 映射）
     const bridge_placeOrder = this.ctx.newFunction('bridge_placeOrder', (paramsHandle: any) => {
       const paramsJson = this.ctx.getString(paramsHandle);
       const params = JSON.parse(paramsJson);
-      console.log(`[bridge] placeOrder:`, params);
       
-      // 异步下单（不阻塞策略）
-      this.client.placeOrder(params)
-        .then(result => console.log(`[bridge] 下单成功:`, result))
-        .catch(err => console.error(`[bridge] 下单失败:`, err.message));
+      const pendingId = 'pending-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
       
-      return this.ctx.newString(JSON.stringify({ orderId: 'pending-' + Date.now(), status: 'pending' }));
+      if (this.dryRun) {
+        // Paper Trade 模式：不调用真实 API
+        console.log(`[bridge][DRY RUN] placeOrder:`, params);
+        
+        // 模拟订单（保存到 openOrders）
+        const simulatedOrder = {
+          orderId: pendingId,
+          symbol: params.symbol,
+          side: params.side,
+          price: params.price,
+          qty: params.qty,
+          status: 'New',
+          createdAt: Date.now(),
+        };
+        
+        this.openOrders.set(pendingId, simulatedOrder);
+        this.orderSymbolMap.set(pendingId, params.symbol);
+        
+        return this.ctx.newString(JSON.stringify({ orderId: pendingId, status: 'New' }));
+      } else {
+        // Live 模式：调用真实 API
+        console.log(`[bridge][LIVE] placeOrder:`, params);
+        
+        // 异步下单（不阻塞策略）
+        this.client.placeOrder(params)
+          .then(result => {
+            console.log(`[bridge] 下单成功:`, result);
+            
+            // 映射 pending → real orderId
+            this.orderIdMap.set(pendingId, result.orderId);
+            this.orderSymbolMap.set(result.orderId, params.symbol);
+            
+            // 保存订单信息
+            this.openOrders.set(result.orderId, {
+              orderId: result.orderId,
+              symbol: params.symbol,
+              side: params.side,
+              price: params.price,
+              qty: params.qty,
+              status: 'New',
+              createdAt: Date.now(),
+            });
+          })
+          .catch(err => console.error(`[bridge] 下单失败:`, err.message));
+        
+        return this.ctx.newString(JSON.stringify({ orderId: pendingId, status: 'pending' }));
+      }
     });
     this.ctx.setProp(this.ctx.global, 'bridge_placeOrder', bridge_placeOrder);
     bridge_placeOrder.dispose();
 
-    // bridge_cancelOrder
+    // bridge_cancelOrder（P0 修复：支持 orderId → symbol 映射）
     const bridge_cancelOrder = this.ctx.newFunction('bridge_cancelOrder', (orderIdHandle: any) => {
       const orderId = this.ctx.getString(orderIdHandle);
-      console.log(`[bridge] cancelOrder:`, orderId);
       
-      // 异步撤单（不阻塞策略）
-      // TODO: 需要 symbol 参数
+      // 解析 orderId（可能是 pending-* 或真实 orderId）
+      let realOrderId = orderId;
+      if (orderId.startsWith('pending-')) {
+        // 查找映射的真实 orderId
+        realOrderId = this.orderIdMap.get(orderId) || orderId;
+      }
+      
+      // 查找 symbol
+      const symbol = this.orderSymbolMap.get(realOrderId);
+      if (!symbol) {
+        console.error(`[bridge] cancelOrder 失败: 找不到 symbol (orderId=${orderId})`);
+        return this.ctx.newString(JSON.stringify({ success: false, error: 'symbol not found' }));
+      }
+      
+      if (this.dryRun) {
+        // Paper Trade 模式：不调用真实 API
+        console.log(`[bridge][DRY RUN] cancelOrder: ${realOrderId} (${symbol})`);
+        
+        // 从 openOrders 移除
+        this.openOrders.delete(realOrderId);
+        this.orderSymbolMap.delete(realOrderId);
+        
+        return this.ctx.newString(JSON.stringify({ success: true, orderId: realOrderId }));
+      } else {
+        // Live 模式：调用真实 API
+        console.log(`[bridge][LIVE] cancelOrder: ${realOrderId} (${symbol})`);
+        
+        // 异步撤单（不阻塞策略）
+        this.client.cancelOrder(symbol, realOrderId)
+          .then(() => {
+            console.log(`[bridge] 撤单成功: ${realOrderId}`);
+            
+            // 从 openOrders 移除
+            this.openOrders.delete(realOrderId);
+            this.orderSymbolMap.delete(realOrderId);
+          })
+          .catch(err => console.error(`[bridge] 撤单失败:`, err.message));
+        
+        return this.ctx.newString(JSON.stringify({ success: true, orderId: realOrderId }));
+      }
     });
     this.ctx.setProp(this.ctx.global, 'bridge_cancelOrder', bridge_cancelOrder);
     bridge_cancelOrder.dispose();
@@ -261,6 +383,15 @@ class QuickJSStrategyEngine {
     this.running = true;
     console.log('[QuickJS] 策略启动...');
 
+    // 启动订单状态轮询（每 10 秒）
+    const pollInterval = setInterval(() => {
+      if (this.running) {
+        this.pollOrderStatus().catch(err => 
+          console.error('[QuickJS] 订单轮询错误:', err.message)
+        );
+      }
+    }, 10000);
+
     while (this.running) {
       try {
         await this.heartbeat();
@@ -273,6 +404,8 @@ class QuickJSStrategyEngine {
         await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
+    
+    clearInterval(pollInterval);
   }
 
   stop() {
@@ -313,6 +446,78 @@ class QuickJSStrategyEngine {
     await this.callFunction('st_heartbeat', tick);
   }
 
+  /**
+   * P0 修复：轮询订单状态并回推到策略
+   */
+  private async pollOrderStatus() {
+    if (this.dryRun) {
+      // Paper Trade 模式：模拟成交（价格触及 → FILLED）
+      for (const [orderId, order] of this.openOrders.entries()) {
+        const priceMatch = (order.side === 'Buy' && this.lastPrice <= order.price) ||
+                          (order.side === 'Sell' && this.lastPrice >= order.price);
+        
+        if (priceMatch && order.status === 'New') {
+          console.log(`[QuickJS][DRY RUN] 模拟成交: ${orderId} @ ${order.price}`);
+          
+          order.status = 'Filled';
+          order.filledAt = Date.now();
+          
+          // 调用 st_onOrderUpdate
+          await this.callFunction('st_onOrderUpdate', {
+            orderId,
+            status: 'Filled',
+            symbol: order.symbol,
+            side: order.side,
+            price: order.price,
+            qty: order.qty,
+            filledQty: order.qty,
+          });
+          
+          // 从 openOrders 移除
+          this.openOrders.delete(orderId);
+          this.orderSymbolMap.delete(orderId);
+        }
+      }
+    } else {
+      // Live 模式：查询真实订单状态
+      try {
+        const orders = await this.client.getOpenOrders('MYXUSDT');
+        
+        for (const apiOrder of orders) {
+          const orderId = apiOrder.orderId;
+          const status = apiOrder.orderStatus;
+          
+          // 检查是否有状态变化
+          const localOrder = this.openOrders.get(orderId);
+          if (localOrder && localOrder.status !== status) {
+            console.log(`[QuickJS][LIVE] 订单状态变化: ${orderId} ${localOrder.status} → ${status}`);
+            
+            localOrder.status = status;
+            
+            // 调用 st_onOrderUpdate
+            await this.callFunction('st_onOrderUpdate', {
+              orderId,
+              status,
+              symbol: apiOrder.symbol,
+              side: apiOrder.side,
+              price: parseFloat(apiOrder.price),
+              qty: parseFloat(apiOrder.qty),
+              filledQty: parseFloat(apiOrder.cumExecQty || '0'),
+            });
+            
+            // 如果订单完成，从 openOrders 移除
+            if (status === 'Filled' || status === 'Cancelled') {
+              this.openOrders.delete(orderId);
+              this.orderSymbolMap.delete(orderId);
+            }
+          }
+        }
+      } catch (error: any) {
+        console.error(`[QuickJS] 订单轮询失败:`, error.message);
+      }
+    }
+  }
+
   private async callFunction(name: string, ...args: any[]): Promise<any> {
     if (!this.ctx) return;
 
@@ -348,9 +553,21 @@ class QuickJSStrategyEngine {
 // ============================================================
 
 async function main() {
+  // P0 修复：明确 Paper Trade 模式
+  const dryRun = process.env.DRY_RUN !== 'false'; // 默认 true（Paper Trade）
+  const mode = dryRun ? 'Paper Trade (DRY RUN)' : 'Live Trading';
+  
   console.log('='.repeat(70));
-  console.log('   Gales 策略 - QuickJS 沙箱 + Bybit Paper Trade');
+  console.log(`   Gales 策略 - QuickJS 沙箱 + Bybit ${mode}`);
   console.log('='.repeat(70));
+  console.log();
+  
+  if (dryRun) {
+    console.log('🛡️  [DRY RUN] Paper Trade 模式：不会调用真实下单 API');
+  } else {
+    console.log('⚠️  [LIVE] 真实交易模式：将调用真实下单 API');
+    console.log('⚠️  设置 DRY_RUN=true 切换到 Paper Trade 模式');
+  }
   console.log();
 
   // 加载账号
@@ -375,17 +592,17 @@ async function main() {
     proxy: account.proxy,
   });
 
-  // 创建策略引擎
+  // 创建策略引擎（传递 dryRun 参数）
   const engine = new QuickJSStrategyEngine(
     client,
-    './strategies/gales-simple.js'
+    './strategies/gales-simple.js',
+    dryRun
   );
 
   // 初始化
   await engine.initialize();
 
   console.log();
-  console.log('⚠️  [Paper Trade] 模拟模式（策略内 simMode=false，但未真实下单）');
   console.log('[按 Ctrl+C 停止]');
   console.log();
 

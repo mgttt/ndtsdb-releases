@@ -15,19 +15,29 @@ const CONFIG = {
   orderSize: 10,
   maxPosition: 100,
 
-  magnetDistance: 0.005,     // 0.5%（扩大 2.5 倍）
+  magnetDistance: 0.005,     // 0.5%
   cancelDistance: 0.01,      // 1%
   priceOffset: 0.0005,
   postOnly: true,
   cooldownSec: 60,           // 60 秒冷却
-  maxOrderAgeSec: 300,        // 订单最长存活时间（超时撤单）
-  minOrderLifeSec: 30,        // 订单最短存活时间（避免瞬时波动撤单）
-  driftConfirmCount: 2,       // 连续 N 次脱离才撤单（防止误撤）
+  maxOrderAgeSec: 300,       // 订单最长存活时间（超时撤单）
+  minOrderLifeSec: 30,       // 订单最短存活时间（避免瞬时波动撤单）
+  driftConfirmCount: 2,      // 连续 N 次脱离才撤单（防止误撤）
 
-  partialFillThreshold: 0.3,  // 部分成交达到 30% → 视为本格已成交（撤掉剩余）
-  dustFillThreshold: 0.05,    // <5% 的碎片成交 → 建议走清理逻辑（暂只记录）
-  hedgeDustFills: true,       // 自动对冲残余风险（不足阈值但有成交）
-  maxHedgeSlippagePct: 0.005, // 对冲最大滑点容忍 0.5%
+  // 运行时治理
+  maxActiveOrders: 5,        // 同时活跃订单上限（防止极端情况下挂满）
+
+  // “不交易”自愈：中心价漂移太远且一段时间无下单时，自动重心
+  autoRecenter: true,
+  recenterDistance: 0.03,    // 3% 漂移才触发
+  recenterCooldownSec: 600,  // 10 分钟最多重心一次
+  recenterMinIdleTicks: 30,  // 至少连续 30 个 tick 没有下单行为才允许重心（5s 心跳≈150s）
+
+  // 部分成交处理
+  partialFillThreshold: 0.3, // 部分成交达到 30% → 视为本格已成交（撤掉剩余）
+  dustFillThreshold: 0.05,   // <5% 的碎片成交 → 建议走清理逻辑（暂只记录）
+  hedgeDustFills: true,      // 自动对冲残余风险（不足阈值但有成交）
+  maxHedgeSlippagePct: 0.005,// 对冲最大滑点容忍 0.5%
 
   simMode: true,
 };
@@ -37,6 +47,19 @@ if (typeof ctx !== 'undefined' && ctx && ctx.strategy && ctx.strategy.params) {
   const p = ctx.strategy.params;
   if (p.symbol) CONFIG.symbol = p.symbol;
   if (p.gridCount) CONFIG.gridCount = p.gridCount;
+  if (p.gridSpacing) CONFIG.gridSpacing = p.gridSpacing;
+  if (p.orderSize) CONFIG.orderSize = p.orderSize;
+  if (p.maxPosition) CONFIG.maxPosition = p.maxPosition;
+  if (p.magnetDistance) CONFIG.magnetDistance = p.magnetDistance;
+  if (p.cancelDistance) CONFIG.cancelDistance = p.cancelDistance;
+  if (p.cooldownSec) CONFIG.cooldownSec = p.cooldownSec;
+  if (p.maxActiveOrders) CONFIG.maxActiveOrders = p.maxActiveOrders;
+
+  if (p.autoRecenter !== undefined) CONFIG.autoRecenter = p.autoRecenter;
+  if (p.recenterDistance) CONFIG.recenterDistance = p.recenterDistance;
+  if (p.recenterCooldownSec) CONFIG.recenterCooldownSec = p.recenterCooldownSec;
+  if (p.recenterMinIdleTicks) CONFIG.recenterMinIdleTicks = p.recenterMinIdleTicks;
+
   if (p.simMode !== undefined) CONFIG.simMode = p.simMode;
 }
 
@@ -53,6 +76,11 @@ let state = {
   nextGridId: 1,
   openOrders: [],
   tickCount: 0,
+
+  // 运行统计/自愈相关（持久化）
+  lastPlaceTick: 0,        // 上次尝试挂单的 tick（用于判断长期不交易）
+  lastRecenterAtMs: 0,     // 上次重心时间
+  lastRecenterTick: 0,     // 上次重心发生的 tick
 };
 
 // 运行时状态（不持久化）
@@ -63,6 +91,11 @@ let runtime = {
     sellOver: false,
     lastWarnAtBuy: 0,
     lastWarnAtSell: 0,
+  },
+
+  // 活跃单上限告警
+  activeOrders: {
+    lastWarnAt: 0,
   },
 };
 
@@ -79,6 +112,9 @@ function loadState() {
         if (!state.tickCount) state.tickCount = 0;
         if (!state.gridLevels) state.gridLevels = [];
         if (!state.nextGridId) state.nextGridId = 1;
+        if (!state.lastPlaceTick) state.lastPlaceTick = 0;
+        if (!state.lastRecenterAtMs) state.lastRecenterAtMs = 0;
+        if (!state.lastRecenterTick) state.lastRecenterTick = 0;
       }
     }
   } catch (e) {
@@ -143,6 +179,39 @@ function getOpenOrder(orderId) {
 function removeOpenOrder(orderId) {
   if (!orderId) return;
   state.openOrders = state.openOrders.filter(function(o) { return o.orderId !== orderId; });
+}
+
+function countActiveOrders() {
+  if (!state.openOrders) return 0;
+  let n = 0;
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o) continue;
+    if (o.status === 'Filled' || o.status === 'Canceled') continue;
+    n++;
+  }
+  return n;
+}
+
+function calcPendingNotional(side) {
+  if (!state.openOrders) return 0;
+  let sum = 0;
+
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o) continue;
+    if (o.status === 'Filled' || o.status === 'Canceled') continue;
+    if (o.side !== side) continue;
+
+    const qty = o.qty || 0;
+    const cum = o.cumQty || 0;
+    const remaining = Math.max(0, qty - cum);
+    const px = o.price || o.avgPrice || 0;
+
+    sum += remaining * px;
+  }
+
+  return sum;
 }
 
 function findActiveOrderByGridId(gridId) {
@@ -551,6 +620,7 @@ function st_heartbeat(tickJson) {
     state.centerPrice = tick.price;
     initializeGrids();
     state.initialized = true;
+    state.lastPlaceTick = state.tickCount;
     logInfo('网格初始化完成，中心价格: ' + state.centerPrice);
     printGridStatus();
     saveState();
@@ -564,6 +634,48 @@ function st_heartbeat(tickJson) {
 
   // 修复 grid/openOrders 不一致（避免重复挂单/状态漂移）
   reconcileGridOrderLinks();
+
+  // ================================
+  // Auto Recenter：中心漂移太远且长时间无交易时自动重心
+  // ================================
+  if (CONFIG.autoRecenter) {
+    const center = state.centerPrice || state.lastPrice;
+    const drift = Math.abs(state.lastPrice - center) / center;
+    const idleTicks = (state.tickCount || 0) - (state.lastPlaceTick || 0);
+    const cooldownOk = (Date.now() - (state.lastRecenterAtMs || 0)) >= (CONFIG.recenterCooldownSec * 1000);
+    const noActiveOrders = countActiveOrders() === 0;
+
+    if (drift >= CONFIG.recenterDistance && idleTicks >= CONFIG.recenterMinIdleTicks && cooldownOk && noActiveOrders) {
+      logWarn('[自动重心] drift=' + (drift * 100).toFixed(2) + '% idleTicks=' + idleTicks + ' center=' + center.toFixed(4) + ' -> ' + state.lastPrice.toFixed(4));
+
+      // 撤掉所有活跃订单（尽力而为；simMode 会真正清掉）
+      for (let i = 0; i < state.gridLevels.length; i++) {
+        const g = state.gridLevels[i];
+        if (!g) continue;
+        if (g.state === 'ACTIVE' && g.orderId) {
+          cancelOrder(g);
+          removeOpenOrder(g.orderId);
+        }
+      }
+
+      state.openOrders = state.openOrders.filter(function(o) {
+        if (!o) return false;
+        return o.status !== 'Filled' && o.status !== 'Canceled';
+      });
+
+      // 重心并重建网格
+      state.centerPrice = state.lastPrice;
+      initializeGrids();
+      state.lastRecenterAtMs = Date.now();
+      state.lastRecenterTick = state.tickCount;
+
+      // 视为“有动作”，避免重心后马上再次重心
+      state.lastPlaceTick = state.tickCount;
+
+      saveState();
+      return;
+    }
+  }
 
   // simMode: 先模拟成交，方便在 paper trade 中验证"部分成交"策略
   simulateFillsIfNeeded();
@@ -606,6 +718,14 @@ function st_onParamsUpdate(newParamsJson) {
     CONFIG.gridSpacing = newParams.gridSpacing;
     logInfo('[Gales] 网格间距: ' + CONFIG.gridSpacing);
   }
+  if (newParams.orderSize !== undefined) {
+    CONFIG.orderSize = newParams.orderSize;
+    logInfo('[Gales] 单笔名义: ' + CONFIG.orderSize);
+  }
+  if (newParams.maxPosition !== undefined) {
+    CONFIG.maxPosition = newParams.maxPosition;
+    logInfo('[Gales] 最大仓位: ' + CONFIG.maxPosition);
+  }
   if (newParams.magnetDistance !== undefined) {
     CONFIG.magnetDistance = newParams.magnetDistance;
     logInfo('[Gales] 磁铁距离: ' + CONFIG.magnetDistance);
@@ -613,6 +733,31 @@ function st_onParamsUpdate(newParamsJson) {
   if (newParams.cancelDistance !== undefined) {
     CONFIG.cancelDistance = newParams.cancelDistance;
     logInfo('[Gales] 取消距离: ' + CONFIG.cancelDistance);
+  }
+  if (newParams.cooldownSec !== undefined) {
+    CONFIG.cooldownSec = newParams.cooldownSec;
+    logInfo('[Gales] 冷却秒数: ' + CONFIG.cooldownSec);
+  }
+  if (newParams.maxActiveOrders !== undefined) {
+    CONFIG.maxActiveOrders = newParams.maxActiveOrders;
+    logInfo('[Gales] 最大活跃单: ' + CONFIG.maxActiveOrders);
+  }
+
+  if (newParams.autoRecenter !== undefined) {
+    CONFIG.autoRecenter = newParams.autoRecenter;
+    logInfo('[Gales] 自动重心: ' + CONFIG.autoRecenter);
+  }
+  if (newParams.recenterDistance !== undefined) {
+    CONFIG.recenterDistance = newParams.recenterDistance;
+    logInfo('[Gales] 重心触发距离: ' + CONFIG.recenterDistance);
+  }
+  if (newParams.recenterCooldownSec !== undefined) {
+    CONFIG.recenterCooldownSec = newParams.recenterCooldownSec;
+    logInfo('[Gales] 重心冷却秒数: ' + CONFIG.recenterCooldownSec);
+  }
+  if (newParams.recenterMinIdleTicks !== undefined) {
+    CONFIG.recenterMinIdleTicks = newParams.recenterMinIdleTicks;
+    logInfo('[Gales] 重心最小空闲 ticks: ' + CONFIG.recenterMinIdleTicks);
   }
 
   // 重新初始化网格（保持当前价格）
@@ -630,6 +775,15 @@ function st_onParamsUpdate(newParamsJson) {
       bridge_cancelOrder(order.orderId);
     });
     state.openOrders = [];
+  }
+
+  // 如果要求立刻重心
+  if (newParams.forceRecenter) {
+    logWarn('[Gales] forceRecenter=true，立即重心');
+    state.centerPrice = state.lastPrice;
+    initializeGrids();
+    state.lastRecenterAtMs = Date.now();
+    state.lastRecenterTick = state.tickCount || 0;
   }
 
   saveState();
@@ -693,7 +847,18 @@ function shouldPlaceOrder(grid, distance) {
     return false;  // 距离太远
   }
 
-  // 2. 冷却时间检查（防止重复触发）
+  // 2. 活跃订单上限（治理）
+  const active = countActiveOrders();
+  if (CONFIG.maxActiveOrders > 0 && active >= CONFIG.maxActiveOrders) {
+    const now = Date.now();
+    if (now - (runtime.activeOrders.lastWarnAt || 0) > 5 * 60 * 1000) {
+      runtime.activeOrders.lastWarnAt = now;
+      logWarn('[活跃单上限] active=' + active + ' max=' + CONFIG.maxActiveOrders + '，暂停新挂单');
+    }
+    return false;
+  }
+
+  // 3. 冷却时间检查（防止重复触发）
   if (grid.lastTriggerTime) {
     const cooldownMs = CONFIG.cooldownSec * 1000;
     const elapsed = Date.now() - grid.lastTriggerTime;
@@ -702,20 +867,21 @@ function shouldPlaceOrder(grid, distance) {
     }
   }
 
-  // 3. 防重复：如果该 grid 已存在活跃订单（但 grid 状态丢了），则修复并跳过
+  // 4. 防重复：如果该 grid 已存在活跃订单（但 grid 状态丢了），则修复并跳过
   const existing = findActiveOrderByGridId(grid.id);
   if (existing) {
     syncGridFromOrder(grid, existing);
     return false;
   }
 
-  // 4. 仓位检查（考虑订单全量成交后的仓位）
+  // 5. 仓位检查（考虑“已持仓 + 未成交挂单”的最坏情况）
   const orderNotional = CONFIG.orderSize; // 订单名义价值
 
   if (grid.side === 'Buy') {
-    const afterFill = state.positionNotional + orderNotional;
+    const pendingBuy = calcPendingNotional('Buy');
+    const afterFill = state.positionNotional + pendingBuy + orderNotional;
     if (afterFill > CONFIG.maxPosition) {
-      warnPositionLimit('Buy', grid.id, state.positionNotional, afterFill);
+      warnPositionLimit('Buy', grid.id, state.positionNotional + pendingBuy, afterFill);
       return false;
     }
     // 回到安全区后，允许下次“再次进入超限”时报警
@@ -723,15 +889,16 @@ function shouldPlaceOrder(grid, distance) {
   }
 
   if (grid.side === 'Sell') {
-    const afterFill = state.positionNotional - orderNotional;
+    const pendingSell = calcPendingNotional('Sell');
+    const afterFill = state.positionNotional - pendingSell - orderNotional;
     if (afterFill < -CONFIG.maxPosition) {
-      warnPositionLimit('Sell', grid.id, state.positionNotional, afterFill);
+      warnPositionLimit('Sell', grid.id, state.positionNotional - pendingSell, afterFill);
       return false;
     }
     runtime.posLimit.sellOver = false;
   }
 
-  // 4. 通过所有检查，可以触发
+  // 6. 通过所有检查，可以触发
   logInfo('✨ 触发网格 #' + grid.id + ' ' + grid.side + ' @ ' + grid.price.toFixed(4) + ' (距离 ' + distancePct + '%)');
   return true;
 }
@@ -768,6 +935,9 @@ function placeOrder(grid) {
 
   const quantity = CONFIG.orderSize / orderPrice;
   const orderLinkId = 'gales-' + grid.id + '-' + grid.side;
+
+  // 记录“有下单行为”（用于 autoRecenter 判断）
+  state.lastPlaceTick = state.tickCount || 0;
 
   logInfo((CONFIG.simMode ? '[SIM] ' : '') + '挂单 gridId=' + grid.id + ' ' + grid.side + ' ' + quantity.toFixed(4) + ' @ ' + orderPrice.toFixed(4));
 
