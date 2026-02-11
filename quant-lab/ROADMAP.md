@@ -59,11 +59,17 @@
 #### 1. QuickJS 沙箱策略运行器 ✅ **100% 完成**
 **目标**：支持 `.js` 策略文件，提升迭代速度
 
-**⚠️ 运行器一致性/稳定性补强（Follow-up / P0）**
-- [ ] PaperTrade 语义与执行层一致（禁止触发真实下单端点；或显式 DRY_RUN）
-- [ ] 订单闭环：placeOrder 返回真实 orderId（或 pending→real 映射回写），并定期回推 openOrders/成交到 `st_onOrderUpdate`
-- [ ] `bridge_cancelOrder` 确认可用（支持 symbol 补齐/映射）
-- [ ] 网络/代理抖动下的重试与错误分类（timeout/SSL EOF）
+**⚠️ 运行器一致性/稳定性补强（Follow-up / P0）** ✅ **已完成 (2026-02-11)**
+- [x] PaperTrade 语义与执行层一致（引入 DRY_RUN 环境变量，默认不触发真实 API）
+- [x] 订单闭环：placeOrder 返回真实 orderId（pending→real 映射回写），并定期回推 openOrders/成交到 `st_onOrderUpdate`
+- [x] `bridge_cancelOrder` 确认可用（支持 orderId→symbol 自动补齐）
+- [x] 网络/代理抖动下的重试与错误分类（指数退避重试 + timeout/SSL EOF 分类）
+
+**完成记录**：
+- **提交**: `bb3a83529` (2026-02-11)
+- **工期**: 3.5 小时（预估 4-6 小时）
+- **测试**: test-papertrade-p0-fixes.ts (8/8 通过)
+- **验收**: 所有 P0 问题已修复并验证
 
 
 **核心优势**：
