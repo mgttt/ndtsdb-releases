@@ -203,7 +203,7 @@ function hedgeResidual(grid, order) {
 
   const residualQty = order.cumQty;
   const hedgeSide = (order.side === 'Buy') ? 'Sell' : 'Buy';
-  
+
   logInfo('[对冲残余] gridId=' + grid.id + ' side=' + hedgeSide + ' qty=' + residualQty.toFixed(4) + ' @ market');
 
   if (CONFIG.simMode) {
@@ -221,7 +221,7 @@ function hedgeResidual(grid, order) {
       qty: residualQty,
       orderType: 'Market',
     };
-    
+
     const result = bridge_placeOrder(JSON.stringify(hedgeParams));
     logInfo('✅ 对冲成功: ' + result);
   } catch (e) {
@@ -291,7 +291,7 @@ function applyActiveOrderPolicy(grid, distance) {
 
     // 增强 1: 连续脱离计数
     grid.driftCount = (grid.driftCount || 0) + 1;
-    
+
     if (grid.driftCount < CONFIG.driftConfirmCount) {
       // 还未达到连续脱离次数，不撤单
       logDebug('[价格脱离 ' + grid.driftCount + '/' + CONFIG.driftConfirmCount + '] gridId=' + grid.id + ' dist=' + (distance * 100).toFixed(2) + '%');
@@ -604,15 +604,27 @@ function shouldPlaceOrder(grid, distance) {
     }
   }
 
-  // 3. 仓位检查
-  if (grid.side === 'Buy' && state.positionNotional >= CONFIG.maxPosition) {
-    logWarn('买单 #' + grid.id + ' 仓位已达上限');
-    return false;
+  // 3. 仓位检查（考虑订单全量成交后的仓位）
+  const orderNotional = CONFIG.orderSize; // 订单名义价值
+  
+  if (grid.side === 'Buy') {
+    const afterFill = state.positionNotional + orderNotional;
+    if (afterFill > CONFIG.maxPosition) {
+      if (state.tickCount % 50 === 0) { // 避免刷屏
+        logWarn('买单 #' + grid.id + ' 仓位将超限 (当前=' + state.positionNotional.toFixed(2) + ' 成交后=' + afterFill.toFixed(2) + ')');
+      }
+      return false;
+    }
   }
-
-  if (grid.side === 'Sell' && state.positionNotional <= -CONFIG.maxPosition) {
-    logWarn('卖单 #' + grid.id + ' 仓位已达下限');
-    return false;
+  
+  if (grid.side === 'Sell') {
+    const afterFill = state.positionNotional - orderNotional;
+    if (afterFill < -CONFIG.maxPosition) {
+      if (state.tickCount % 50 === 0) { // 避免刷屏
+        logWarn('卖单 #' + grid.id + ' 仓位将超限 (当前=' + state.positionNotional.toFixed(2) + ' 成交后=' + afterFill.toFixed(2) + ')');
+      }
+      return false;
+    }
   }
 
   // 4. 通过所有检查，可以触发
