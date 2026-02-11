@@ -36,6 +36,7 @@ let mode: 'random-walk' | 'sine' | 'trend' | 'scenario' = 'scenario';
 let scenarioName = 'range-then-dump';
 let speed = 100;
 let stepMode = false;
+let onceMode = false;
 let startPrice = 100;
 let volatility = 0.01;
 let amplitude = 0.03;
@@ -55,6 +56,8 @@ for (let i = 1; i < args.length; i++) {
     i++;
   } else if (args[i] === '--step') {
     stepMode = true;
+  } else if (args[i] === '--once') {
+    onceMode = true;
   } else if (args[i] === '--price' && i + 1 < args.length) {
     startPrice = parseFloat(args[i + 1]);
     i++;
@@ -351,6 +354,7 @@ async function main() {
     startPrice,
     speed: `${speed}x`,
     stepMode,
+    onceMode,
   });
   console.log();
 
@@ -369,6 +373,21 @@ async function main() {
 
   // 启动
   await engine.start();
+
+  // onceMode: 场景完成后自动停止
+  if (onceMode) {
+    let completedTicks = 0;
+    const maxTicks = 1000; // 最多运行 1000 ticks
+    
+    provider.onPrice(() => {
+      completedTicks++;
+      if (completedTicks >= maxTicks) {
+        console.log('\n[场景完成] 自动停止...');
+        engine.stop();
+        process.exit(0);
+      }
+    });
+  }
 
   // 优雅停止
   process.on('SIGINT', () => {
@@ -393,6 +412,7 @@ function showHelp() {
   --price <number>     起始价格（默认: 100）
   --volatility <num>   波动率（random-walk 模式，默认: 0.01）
   --step               单步调试模式
+  --once               场景完成后自动停止（不循环）
 
 内置场景:
   ${Object.keys(SCENARIOS).map(k => `  ${k.padEnd(20)} - ${SCENARIOS[k].description}`).join('\n  ')}

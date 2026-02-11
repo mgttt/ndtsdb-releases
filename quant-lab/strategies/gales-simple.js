@@ -18,7 +18,7 @@ const CONFIG = {
   magnetDistance: 0.005,     // 0.5%
   cancelDistance: 0.01,      // 1%
 
-  // magnetDistance 的补强：默认按 gridSpacing 的比例给一个“相对磁铁范围”，避免长期擦边不触发
+  // magnetDistance 的补强：默认按 gridSpacing 的比例给一个"相对磁铁范围"，避免长期擦边不触发
   magnetRelativeToGrid: true,
   magnetGridRatio: 0.7,      // magnetDistance 至少达到 gridSpacing*ratio（比如 gridSpacing=1% → magnet≥0.7%）
   priceOffset: 0.0005,
@@ -31,7 +31,7 @@ const CONFIG = {
   // 运行时治理
   maxActiveOrders: 5,        // 同时活跃订单上限（防止极端情况下挂满）
 
-  // “不交易”自愈：中心价漂移太远且一段时间无下单时，自动重心
+  // "不交易"自愈：中心价漂移太远且一段时间无下单时，自动重心
   autoRecenter: true,
   recenterDistance: 0.03,    // 3% 漂移才触发
   recenterCooldownSec: 600,  // 10 分钟最多重心一次
@@ -42,6 +42,12 @@ const CONFIG = {
   dustFillThreshold: 0.05,   // <5% 的碎片成交 → 建议走清理逻辑（暂只记录）
   hedgeDustFills: true,      // 自动对冲残余风险（不足阈值但有成交）
   maxHedgeSlippagePct: 0.005,// 对冲最大滑点容忍 0.5%
+
+  // 策略方向: 'long' | 'short' | 'neutral'
+  // long: 只做多，卖单仅记账（虚仓）
+  // short: 只做空，买单仅记账（虚仓）
+  // neutral: 双向交易
+  direction: 'neutral',
 
   simMode: true,
 };
@@ -67,6 +73,7 @@ if (typeof ctx !== 'undefined' && ctx && ctx.strategy && ctx.strategy.params) {
   if (p.recenterMinIdleTicks) CONFIG.recenterMinIdleTicks = p.recenterMinIdleTicks;
 
   if (p.simMode !== undefined) CONFIG.simMode = p.simMode;
+  if (p.direction) CONFIG.direction = p.direction;
 }
 
 // ================================
@@ -91,7 +98,7 @@ let state = {
 
 // 运行时状态（不持久化）
 let runtime = {
-  // 仓位超限告警：只在“首次进入超限”时提醒，并做时间节流
+  // 仓位超限告警：只在"首次进入超限"时提醒，并做时间节流
   posLimit: {
     buyOver: false,
     sellOver: false,
@@ -280,6 +287,32 @@ function reconcileGridOrderLinks() {
 
 function updatePositionFromFill(side, fillQty, fillPrice) {
   const notional = fillQty * fillPrice;
+
+  // 方向模式处理
+  if (CONFIG.direction === 'long') {
+    // 做多模式：Buy 增加仓位，Sell 只是虚仓（对冲/减仓）
+    if (side === 'Buy') {
+      state.positionNotional += notional;
+    } else {
+      // Sell 成交只是对冲，记录虚仓但不减少实际仓位
+      // 实际由操盘手跨产品对冲
+      logDebug('[虚仓] long 模式下 Sell 成交仅记账: -' + notional.toFixed(2));
+    }
+    return;
+  }
+
+  if (CONFIG.direction === 'short') {
+    // 做空模式：Sell 增加仓位（负向），Buy 只是虚仓
+    if (side === 'Sell') {
+      state.positionNotional -= notional;
+    } else {
+      // Buy 成交只是对冲
+      logDebug('[虚仓] short 模式下 Buy 成交仅记账: +' + notional.toFixed(2));
+    }
+    return;
+  }
+
+  // neutral 模式：双向都影响仓位
   if (side === 'Buy') state.positionNotional += notional;
   else state.positionNotional -= notional;
 }
@@ -575,6 +608,7 @@ function findNearestGrid() {
  */
 function printGridStatus() {
   logInfo('=== 网格档位 ===');
+  logInfo('方向: ' + CONFIG.direction + (CONFIG.direction === 'neutral' ? '' : ' (虚仓仅记账)'));
 
   const buyGrids = state.gridLevels.filter(function(g) { return g.side === 'Buy'; });
   const sellGrids = state.gridLevels.filter(function(g) { return g.side === 'Sell'; });
@@ -604,6 +638,7 @@ function st_init() {
   logInfo('策略初始化...');
   logInfo('Symbol: ' + CONFIG.symbol);
   logInfo('GridCount: ' + CONFIG.gridCount);
+  logInfo('Direction: ' + CONFIG.direction);
   logInfo('SimMode: ' + CONFIG.simMode);
 
   loadState();
@@ -675,7 +710,7 @@ function st_heartbeat(tickJson) {
       state.lastRecenterAtMs = Date.now();
       state.lastRecenterTick = state.tickCount;
 
-      // 视为“有动作”，避免重心后马上再次重心
+      // 视为"有动作"，避免重心后马上再次重心
       state.lastPlaceTick = state.tickCount;
 
       saveState();
@@ -772,6 +807,10 @@ function st_onParamsUpdate(newParamsJson) {
   if (newParams.recenterMinIdleTicks !== undefined) {
     CONFIG.recenterMinIdleTicks = newParams.recenterMinIdleTicks;
     logInfo('[Gales] 重心最小空闲 ticks: ' + CONFIG.recenterMinIdleTicks);
+  }
+  if (newParams.direction !== undefined) {
+    CONFIG.direction = newParams.direction;
+    logInfo('[Gales] 策略方向: ' + CONFIG.direction);
   }
 
   // 重新初始化网格（保持当前价格）
@@ -905,26 +944,42 @@ function shouldPlaceOrder(grid, distance) {
     return false;
   }
 
-  // 5. 仓位检查（考虑“已持仓 + 未成交挂单”的最坏情况）
+  // 5. 方向检查
+  if (CONFIG.direction === 'long' && grid.side === 'Sell') {
+    // 做多模式：卖单仅记账，不实际限制
+    logDebug('[方向限制] long 模式下 Sell 仅记账 gridId=' + grid.id);
+  }
+  if (CONFIG.direction === 'short' && grid.side === 'Buy') {
+    // 做空模式：买单仅记账，不实际限制
+    logDebug('[方向限制] short 模式下 Buy 仅记账 gridId=' + grid.id);
+  }
+
+  // 6. 仓位检查（考虑"已持仓 + 未成交挂单"的最坏情况）
   const orderNotional = CONFIG.orderSize; // 订单名义价值
 
   if (grid.side === 'Buy') {
-    const pendingBuy = calcPendingNotional('Buy');
-    const afterFill = state.positionNotional + pendingBuy + orderNotional;
-    if (afterFill > CONFIG.maxPosition) {
-      warnPositionLimit('Buy', grid.id, state.positionNotional + pendingBuy, afterFill);
-      return false;
+    // short 模式下，Buy 只是虚仓，不限制
+    if (CONFIG.direction !== 'short') {
+      const pendingBuy = calcPendingNotional('Buy');
+      const afterFill = state.positionNotional + pendingBuy + orderNotional;
+      if (afterFill > CONFIG.maxPosition) {
+        warnPositionLimit('Buy', grid.id, state.positionNotional + pendingBuy, afterFill);
+        return false;
+      }
     }
-    // 回到安全区后，允许下次“再次进入超限”时报警
+    // 回到安全区后，允许下次"再次进入超限"时报警
     runtime.posLimit.buyOver = false;
   }
 
   if (grid.side === 'Sell') {
-    const pendingSell = calcPendingNotional('Sell');
-    const afterFill = state.positionNotional - pendingSell - orderNotional;
-    if (afterFill < -CONFIG.maxPosition) {
-      warnPositionLimit('Sell', grid.id, state.positionNotional - pendingSell, afterFill);
-      return false;
+    // long 模式下，Sell 只是虚仓，不限制
+    if (CONFIG.direction !== 'long') {
+      const pendingSell = calcPendingNotional('Sell');
+      const afterFill = state.positionNotional - pendingSell - orderNotional;
+      if (afterFill < -CONFIG.maxPosition) {
+        warnPositionLimit('Sell', grid.id, state.positionNotional - pendingSell, afterFill);
+        return false;
+      }
     }
     runtime.posLimit.sellOver = false;
   }
@@ -967,7 +1022,7 @@ function placeOrder(grid) {
   const quantity = CONFIG.orderSize / orderPrice;
   const orderLinkId = 'gales-' + grid.id + '-' + grid.side;
 
-  // 记录“有下单行为”（用于 autoRecenter 判断）
+  // 记录"有下单行为"（用于 autoRecenter 判断）
   state.lastPlaceTick = state.tickCount || 0;
 
   logInfo((CONFIG.simMode ? '[SIM] ' : '') + '挂单 gridId=' + grid.id + ' ' + grid.side + ' ' + quantity.toFixed(4) + ' @ ' + orderPrice.toFixed(4));

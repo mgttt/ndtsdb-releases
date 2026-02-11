@@ -1,4 +1,10 @@
-# ndtsdb Scope / Non-Goals
+# [ARCHIVED] ndtsdb Scope / Non-Goals
+
+> **归档日期**: 2026-02-11
+> **原因**: 内容已合并到 ROADMAP.md
+> **最新状态见**: docs/ROADMAP.md
+
+---
 
 ndtsdb 是一个**高性能多维时序数据库**，目标是：
 - 以极低依赖与高吞吐写入（append-only）保存时序数据
@@ -29,17 +35,4 @@ ndtsdb 是一个**高性能多维时序数据库**，目标是：
 - 缓存策略、增量拉取策略、采集调度
 - 各交易所/数据源 Provider（Binance/Bybit/Futu/TradingView…）
 
-### B) 数据模型语义
-- timestamp 单位/语义的统一（秒 vs 毫秒）
-- interval/bucket 的业务含义（1m/15m/1d 的定义、交易日/时区等）
-- symbol 规范化（BTC/USDT vs BTCUSDT、AAPL/USD 等）
-
-### C) 运维与产品化套件
-- 任务调度（cron/systemd timers）
-- CI/CD、发布流水线
-- "一键迁移工具链"（从 DuckDB 等外部 DB 导入/导出）的产品化
-
-## 边界原则
-
-- ndtsdb 应保持"底座"属性：**小而硬**、接口稳定、避免引入业务耦合。
-- 上层库可以自由封装出更符合业务的 API；但该封装不应回灌到 ndtsdb。
+*[原文档已归档]*
