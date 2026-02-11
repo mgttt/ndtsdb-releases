@@ -24,6 +24,9 @@ export interface PartitionMeta {
   maxValue?: bigint | number; // 分区最大值
   rows: number; // 分区行数
   createdAt: number; // 创建时间
+  
+  // 列最大值缓存（用于优化 getMax 查询）
+  columnMaxCache?: Map<string, Map<any, bigint | number>>; // column → (filterKey → maxValue)
 }
 
 /**
@@ -36,6 +39,10 @@ export class PartitionedTable {
   private options?: AppendWriterOptions;
   private partitions: Map<string, PartitionMeta> = new Map();
   private writers: Map<string, AppendWriter> = new Map();
+  
+  // 分组最大值索引（仅哈希分区）
+  // 结构: partitionLabel → hashValue → column → maxValue
+  private groupMaxIndex: Map<string, Map<any, Map<string, bigint | number>>> = new Map();
 
   constructor(
     basePath: string,
@@ -191,6 +198,61 @@ export class PartitionedTable {
       // 更新元数据
       const meta = this.partitions.get(label)!;
       meta.rows += partitionRows.length;
+      
+      // 更新分组最大值索引（仅哈希分区）
+      if (this.strategy.type === 'hash') {
+        this.updateGroupMaxIndex(label, partitionRows);
+      }
+    }
+  }
+  
+  /**
+   * 更新分组最大值索引（哈希分区专用）
+   */
+  private updateGroupMaxIndex(label: string, rows: Record<string, any>[]): void {
+    if (this.strategy.type !== 'hash') return;
+    
+    const hashColumn = this.strategy.column;
+    
+    // 确保分区索引存在
+    if (!this.groupMaxIndex.has(label)) {
+      this.groupMaxIndex.set(label, new Map());
+    }
+    const partitionIndex = this.groupMaxIndex.get(label)!;
+    
+    // 遍历行，更新每个 hashValue 的最大值
+    for (const row of rows) {
+      const hashValue = row[hashColumn];
+      if (hashValue === undefined || hashValue === null) continue;
+      
+      // 确保 hashValue 的索引存在
+      if (!partitionIndex.has(hashValue)) {
+        partitionIndex.set(hashValue, new Map());
+      }
+      const groupIndex = partitionIndex.get(hashValue)!;
+      
+      // 更新每个列的最大值
+      for (const col of this.columns) {
+        const value = row[col.name];
+        if (value === undefined || value === null) continue;
+        
+        // 只为数值列建立索引
+        if (typeof value !== 'number' && typeof value !== 'bigint') continue;
+        
+        const currentMax = groupIndex.get(col.name);
+        if (currentMax === undefined) {
+          groupIndex.set(col.name, value);
+        } else {
+          // 比较并更新
+          if (typeof value === 'bigint' && typeof currentMax === 'bigint') {
+            if (value > currentMax) groupIndex.set(col.name, value);
+          } else {
+            const v1 = typeof currentMax === 'bigint' ? Number(currentMax) : currentMax;
+            const v2 = typeof value === 'bigint' ? Number(value) : value;
+            if (v2 > v1) groupIndex.set(col.name, value);
+          }
+        }
+      }
     }
   }
 
@@ -303,7 +365,7 @@ export class PartitionedTable {
    * 
    * 优化策略：
    * 1. 时间分区：只扫描最新分区
-   * 2. 哈希分区 + partitionHint：只扫描对应 bucket
+   * 2. 哈希分区 + partitionHint：先查索引（O(1)），缓存未命中再扫描
    * 3. 范围分区：需要扫描所有分区
    * 
    * @param column 列名
@@ -322,22 +384,34 @@ export class PartitionedTable {
     }
 
     let partitionsToScan: PartitionMeta[];
+    let targetLabel: string | undefined;
 
     // 优化 1：时间分区只扫描最新分区
     if (this.strategy.type === 'time') {
       partitionsToScan = this.getLatestPartitions(1);
       if (partitionsToScan.length === 0) return null;
     }
-    // 优化 2：哈希分区 + partitionHint → 只扫描对应 bucket
+    // 优化 2：哈希分区 + partitionHint → 先查索引，缓存未命中再扫描
     else if (this.strategy.type === 'hash' && partitionHint) {
       const label = this.getPartitionLabel(partitionHint);
       const partition = this.partitions.get(label);
       
-      if (partition) {
-        partitionsToScan = [partition];
-      } else {
+      if (!partition) {
         // 分区不存在（可能是新数据），返回 null
         return null;
+      }
+      
+      partitionsToScan = [partition];
+      targetLabel = label;
+      
+      // 尝试从索引中查询
+      const hashValue = partitionHint[this.strategy.column];
+      if (hashValue !== undefined && hashValue !== null) {
+        const cachedMax = this.getFromGroupMaxIndex(label, hashValue, column);
+        if (cachedMax !== undefined) {
+          // 索引命中，直接返回
+          return cachedMax;
+        }
       }
     }
     // 默认：扫描所有分区
@@ -390,9 +464,53 @@ export class PartitionedTable {
       }
     }
 
+    // 缓存结果到索引（仅哈希分区 + partitionHint）
+    if (
+      this.strategy.type === 'hash' &&
+      targetLabel &&
+      partitionHint &&
+      maxValue !== null
+    ) {
+      const hashValue = partitionHint[this.strategy.column];
+      if (hashValue !== undefined && hashValue !== null) {
+        this.setGroupMaxIndex(targetLabel, hashValue, column, maxValue);
+      }
+    }
+
     return maxValue;
   }
 
+  /**
+   * 从分组最大值索引中查询（O(1)）
+   */
+  private getFromGroupMaxIndex(label: string, hashValue: any, column: string): bigint | number | undefined {
+    const partitionIndex = this.groupMaxIndex.get(label);
+    if (!partitionIndex) return undefined;
+    
+    const groupIndex = partitionIndex.get(hashValue);
+    if (!groupIndex) return undefined;
+    
+    return groupIndex.get(column);
+  }
+  
+  /**
+   * 设置分组最大值索引
+   */
+  private setGroupMaxIndex(label: string, hashValue: any, column: string, value: bigint | number): void {
+    // 确保索引结构存在
+    if (!this.groupMaxIndex.has(label)) {
+      this.groupMaxIndex.set(label, new Map());
+    }
+    const partitionIndex = this.groupMaxIndex.get(label)!;
+    
+    if (!partitionIndex.has(hashValue)) {
+      partitionIndex.set(hashValue, new Map());
+    }
+    const groupIndex = partitionIndex.get(hashValue)!;
+    
+    groupIndex.set(column, value);
+  }
+  
   /**
    * 获取最新的 N 个分区（按标签排序）
    */
