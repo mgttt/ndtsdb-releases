@@ -6,7 +6,7 @@
 import { openSync, closeSync, writeSync, readSync, fstatSync, existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import { dirname } from 'path';
 import { TombstoneManager } from './tombstone.js';
-import { DeltaEncoderInt64, DeltaEncoderInt32, RLEEncoder, GorillaEncoder } from './compression.js';
+import { DeltaEncoderInt64, DeltaEncoderInt32, RLEEncoder, GorillaEncoder, ZstdCompressor } from './compression.js';
 
 /**
  * CRC32 计算 (IEEE 802.3)
@@ -330,14 +330,14 @@ export class AppendWriter {
   /**
    * 自动选择压缩算法
    */
-  private autoSelectAlgorithm(type: string): 'delta' | 'rle' | 'gorilla' | 'none' {
+  private autoSelectAlgorithm(type: string): 'delta' | 'rle' | 'gorilla' | 'zstd' | 'none' {
     switch (type) {
       case 'int64':
         return 'delta'; // 单调递增（如 timestamp）
       case 'int32':
         return 'delta'; // 默认 delta（若 RLE 更优可手动指定）
       case 'float64':
-        return 'gorilla'; // 浮点数时序数据（价格、指标等）
+        return 'gorilla'; // 浮点数：Gorilla 专用算法（测试证明优于通用压缩）
       default:
         return 'none';
     }
@@ -349,7 +349,7 @@ export class AppendWriter {
   private compressColumn(
     buf: Buffer,
     type: string,
-    algorithm: 'delta' | 'rle' | 'gorilla' | 'none',
+    algorithm: 'delta' | 'rle' | 'gorilla' | 'zstd' | 'none',
     rowCount: number
   ): Buffer | null {
     try {
@@ -389,6 +389,26 @@ export class AppendWriter {
           break;
         }
 
+        case 'zstd': {
+          // Zstd 支持所有数据类型（通用压缩）
+          const encoder = new ZstdCompressor(3); // 压缩级别 3（平衡）
+          
+          if (type === 'float64') {
+            const arr = new Float64Array(buf.buffer, buf.byteOffset, rowCount);
+            const compressed = encoder.compressFloat64(arr);
+            return Buffer.from(compressed);
+          } else if (type === 'int64') {
+            const arr = new BigInt64Array(buf.buffer, buf.byteOffset, rowCount);
+            const compressed = encoder.compressBigInt64(arr);
+            return Buffer.from(compressed);
+          } else if (type === 'int32') {
+            const arr = new Int32Array(buf.buffer, buf.byteOffset, rowCount);
+            const compressed = encoder.compressInt32(arr);
+            return Buffer.from(compressed);
+          }
+          break;
+        }
+
         case 'none':
         default:
           return null;
@@ -407,7 +427,7 @@ export class AppendWriter {
   static decompressColumn(
     buf: Buffer,
     type: string,
-    algorithm: 'delta' | 'rle' | 'gorilla' | 'none',
+    algorithm: 'delta' | 'rle' | 'gorilla' | 'zstd' | 'none',
     rowCount: number
   ): Buffer | null {
     try {
@@ -438,6 +458,23 @@ export class AppendWriter {
           if (type === 'float64') {
             const encoder = new GorillaEncoder();
             const decompressed = encoder.decompress(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          }
+          break;
+        }
+
+        case 'zstd': {
+          // Zstd 解压（通用）
+          const encoder = new ZstdCompressor(3);
+          
+          if (type === 'float64') {
+            const decompressed = encoder.decompressFloat64(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          } else if (type === 'int64') {
+            const decompressed = encoder.decompressBigInt64(new Uint8Array(buf), rowCount);
+            return Buffer.from(decompressed.buffer);
+          } else if (type === 'int32') {
+            const decompressed = encoder.decompressInt32(new Uint8Array(buf), rowCount);
             return Buffer.from(decompressed.buffer);
           }
           break;

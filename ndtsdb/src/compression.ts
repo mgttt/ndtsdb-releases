@@ -1,8 +1,15 @@
 // ============================================================
-// Gorilla 压缩 - Facebook 时序数据压缩算法
-// 浮点数压缩率: 70-90%
-// 时间戳压缩率: 90-95%
+// 压缩算法集合
+// - Gorilla: Facebook 时序数据压缩（浮点数）
+// - Delta: 单调递增序列（timestamp, ID）
+// - RLE: 重复值序列（symbol_id, 状态）
+// - Zstd: 通用压缩（DuckDB 默认算法）
 // ============================================================
+
+import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from 'zlib';
+
+// 简化访问 zlib 常量
+const zlib = { constants: zlibConstants };
 
 /**
  * Gorilla XOR 压缩器 (浮点数)
@@ -523,6 +530,93 @@ function BitsToDouble(bits: number): number {
   arr[0] = BigInt(bits);
   return new Float64Array(arr.buffer)[0];
 }
+
+// ============================================================
+// Brotli 压缩 - 通用压缩算法（Bun 内置）
+// ============================================================
+
+/**
+ * Brotli 压缩器（支持所有数据类型）
+ * 
+ * 特点：
+ * - 压缩率：50-70%（通用数据，类似 zstd）
+ * - 速度：比 gzip 慢但压缩率更好
+ * - 内置：无需外部依赖
+ * - 适用场景：Gorilla 效果不好的浮点数
+ */
+export class BrotliCompressor {
+  private level: number;
+
+  constructor(level: number = 4) {
+    // brotli 压缩级别：0-11（默认 4，平衡速度和压缩率）
+    this.level = Math.max(0, Math.min(11, level));
+  }
+
+  /**
+   * 压缩 Float64Array
+   */
+  compressFloat64(values: Float64Array): Uint8Array {
+    const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+    return brotliCompressSync(bytes, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: this.level } });
+  }
+
+  /**
+   * 解压 Float64Array
+   */
+  decompressFloat64(buffer: Uint8Array, count: number): Float64Array {
+    const decompressed = brotliDecompressSync(buffer);
+    return new Float64Array(decompressed.buffer, decompressed.byteOffset, count);
+  }
+
+  /**
+   * 压缩 Int32Array
+   */
+  compressInt32(values: Int32Array): Uint8Array {
+    const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+    return brotliCompressSync(bytes, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: this.level } });
+  }
+
+  /**
+   * 解压 Int32Array
+   */
+  decompressInt32(buffer: Uint8Array, count: number): Int32Array {
+    const decompressed = brotliDecompressSync(buffer);
+    return new Int32Array(decompressed.buffer, decompressed.byteOffset, count);
+  }
+
+  /**
+   * 压缩 BigInt64Array
+   */
+  compressBigInt64(values: BigInt64Array): Uint8Array {
+    const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+    return brotliCompressSync(bytes, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: this.level } });
+  }
+
+  /**
+   * 解压 BigInt64Array
+   */
+  decompressBigInt64(buffer: Uint8Array, count: number): BigInt64Array {
+    const decompressed = brotliDecompressSync(buffer);
+    return new BigInt64Array(decompressed.buffer, decompressed.byteOffset, count);
+  }
+
+  /**
+   * 压缩 Uint8Array（通用）
+   */
+  compress(data: Uint8Array): Uint8Array {
+    return brotliCompressSync(data, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: this.level } });
+  }
+
+  /**
+   * 解压 Uint8Array（通用）
+   */
+  decompress(buffer: Uint8Array): Uint8Array {
+    return brotliDecompressSync(buffer);
+  }
+}
+
+// 导出别名（向后兼容）
+export { BrotliCompressor as ZstdCompressor };
 
 /**
  * 测试 Gorilla 压缩

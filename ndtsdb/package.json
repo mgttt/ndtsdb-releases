@@ -1,9 +1,14 @@
 {
   "name": "ndtsdb",
   "version": "0.9.4.4",
-  "description": "High-performance N-dimensional time-series database inspired by QuestDB",
   "main": "src/index.ts",
-  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "description": "High-performance N-dimensional time-series database inspired by QuestDB",
   "scripts": {
     "test": "bun test tests/ndtsdb.test.ts",
     "test:smoke": "bun tests/smoke-test.ts",
@@ -13,11 +18,5 @@
     "benchmark:3000": "bun tests/benchmark-3000.ts --full",
     "example": "bun tests/example.ts"
   },
-  "dependencies": {},
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5.0.0"
-  }
+  "type": "module"
 }
