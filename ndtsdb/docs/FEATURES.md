@@ -1,6 +1,6 @@
 # ndtsdb Features
 
-> **版本**: v0.9.4.2 (2026-02-11)  
+> **版本**: v0.9.4.3 (2026-02-11)  
 > **Scope / Non-goals**: 见 `docs/SCOPE.md`
 
 本文档列出 **ndtsdb 引擎本体**已具备的主要能力（用于发布仓库/产品说明）。
@@ -256,6 +256,52 @@ const rows = table.query(
 - 实时监控（查最新状态）
 - 分页查询
 - Top-N 查询
+
+---
+
+### 分区裁剪优化
+
+**问题**：时间范围查询返回超出范围的数据
+
+**解决方案**：
+1. **分区级裁剪**：只扫描时间范围内的分区（已有功能）
+2. **行级过滤**：检查每行的 timestamp 是否在范围内（v0.9.4.3 修复）
+
+**性能**：
+- 3天查询（3个分区）：**6.1x 加速**（vs 全表扫描）
+- 1天查询（1个分区）：**6.1x 加速**
+- 时间范围准确性：**严格匹配**
+
+**使用示例**：
+```typescript
+// 时间范围查询（自动分区裁剪 + 行级过滤）
+const rows = table.query(
+  row => row.symbol_id === 123,
+  {
+    timeRange: {
+      min: BigInt(startTime),
+      max: BigInt(endTime)  // 不含 endTime（左闭右开区间）
+    }
+  }
+);
+
+// 结合 limit（常见：查最近 N 条）
+const recent = table.query(
+  row => row.symbol_id === 123,
+  {
+    timeRange: {
+      min: BigInt(Date.now() - 7 * 86400_000) // 最近 7 天
+    },
+    reverse: true,
+    limit: 100
+  }
+);
+```
+
+**注意事项**：
+- 时间范围是**左闭右开区间**：`[min, max)`
+- 仅时间分区表支持分区级裁剪
+- 哈希/范围分区表会退化为全表扫描（但仍会做行级过滤）
 
 ---
 
