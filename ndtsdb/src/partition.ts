@@ -275,18 +275,24 @@ export class PartitionedTable {
     const results: Array<Record<string, any>> = [];
     const limit = options?.limit;
     const reverse = options?.reverse || false;
+    const timeRange = options?.timeRange;
 
     // 智能分区过滤（仅扫描时间范围内的分区）
     let partitionsToScan = Array.from(this.partitions.values());
 
-    if (options?.timeRange && this.strategy.type === 'time') {
-      partitionsToScan = this.filterPartitionsByTimeRange(options.timeRange);
+    if (timeRange && this.strategy.type === 'time') {
+      partitionsToScan = this.filterPartitionsByTimeRange(timeRange);
     }
 
     // 倒序扫描时反转分区顺序
     if (reverse) {
       partitionsToScan.reverse();
     }
+
+    // 时间范围过滤（行级）
+    const timeMin = timeRange?.min ? Number(timeRange.min) : -Infinity;
+    const timeMax = timeRange?.max ? Number(timeRange.max) : Infinity;
+    const timeColumn = this.strategy.type === 'time' ? this.strategy.column : null;
 
     // 扫描分区
     for (const meta of partitionsToScan) {
@@ -301,6 +307,14 @@ export class PartitionedTable {
         const row: Record<string, any> = {};
         for (const [colName, colData] of data) {
           row[colName] = (colData as any)[i];
+        }
+
+        // 行级 timeRange 过滤（时间分区专用）
+        if (timeRange && timeColumn) {
+          const rowTime = Number(row[timeColumn]);
+          if (rowTime < timeMin || rowTime >= timeMax) {
+            continue; // 跳过不在时间范围内的行
+          }
         }
 
         if (!filter || filter(row)) {
@@ -333,14 +347,18 @@ export class PartitionedTable {
     const min = timeRange.min ? Number(timeRange.min) : -Infinity;
     const max = timeRange.max ? Number(timeRange.max) : Infinity;
 
-    return Array.from(this.partitions.values()).filter((meta) => {
+    const filtered = Array.from(this.partitions.values()).filter((meta) => {
       // 从分区标签推断时间范围
       const partitionTime = this.getPartitionTimeRange(meta.label);
       if (!partitionTime) return true; // 无法推断，保留
 
       // 检查分区时间范围是否与查询范围重叠
-      return !(partitionTime.max < min || partitionTime.min > max);
+      const overlaps = !(partitionTime.max < min || partitionTime.min > max);
+      
+      return overlaps;
     });
+
+    return filtered;
   }
 
   /**
