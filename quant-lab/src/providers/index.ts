@@ -16,3 +16,9 @@ export type { CoinExProviderConfig } from './coinex';
 
 export { HTXProvider } from './htx';
 export type { HTXProviderConfig } from './htx';
+
+export { SimulatedProvider } from './simulated';
+export type { SimulatedProviderConfig } from './simulated';
+
+export { SCENARIOS } from './simulated/scenarios';
+export type { Scenario, ScenarioPhase } from './simulated/scenarios';
