@@ -66,7 +66,8 @@ export class TradingViewProvider extends WebSocketDataProvider {
   // 请求计数（用于主动重建连接，避免被 TradingView 踢）
   private requestCount = 0;
   private readonly REQUEST_LIMIT = 4; // 每4个请求重建（TradingView 限制约5个）
-  private isRebuilding = false;
+  private isRebuilding = false; // 重建锁（防止并发重建）
+  private connectPromise: Promise<void> | null = null; // 连接Promise（防止重复连接）
   
   constructor(config: TradingViewProviderConfig = {}) {
     super({
@@ -189,6 +190,62 @@ export class TradingViewProvider extends WebSocketDataProvider {
   }
 
   /**
+   * 确保连接（等待连接完全建立）
+   */
+  private async ensureConnected(): Promise<void> {
+    // 如果正在连接中，等待连接完成
+    if (this.connectPromise) {
+      await this.connectPromise;
+      return;
+    }
+    
+    // 如果未连接，发起新连接
+    if (!this.isConnected) {
+      this.connectPromise = this.connect().finally(() => {
+        this.connectPromise = null;
+      });
+      await this.connectPromise;
+    }
+  }
+  
+  /**
+   * 重建连接（带锁机制，避免并发重建）
+   */
+  private async rebuildConnection(): Promise<void> {
+    // 如果已经在重建中，等待当前重建完成
+    if (this.isRebuilding) {
+      console.log('⏳ 等待当前重建完成...');
+      while (this.isRebuilding) {
+        await this.delay(100);
+      }
+      return;
+    }
+    
+    this.isRebuilding = true;
+    
+    try {
+      console.log(`🔄 主动重建连接（已完成 ${this.requestCount} 个请求）`);
+      
+      // 1. 断开连接（会自动调用rejectAllPending）
+      this.shouldReconnect = false;
+      await this.disconnect();
+      
+      // 2. 等待足够长的时间让Bun清理资源（避免segfault）
+      await this.delay(1000); // 1秒延迟（原来是500ms）
+      
+      // 3. 重新连接（重新启用自动重连）
+      this.shouldReconnect = true;
+      await this.connect();
+      
+      // 4. 重置计数
+      this.requestCount = 0;
+      
+    } finally {
+      this.isRebuilding = false;
+    }
+  }
+  
+  /**
    * 发送消息；若连接已断开则立即 reject 对应请求
    */
   private sendOrReject(chartSession: string, message: any, reject: (e: Error) => void): boolean {
@@ -205,16 +262,10 @@ export class TradingViewProvider extends WebSocketDataProvider {
    */
   async getKlines(query: KlineQuery): Promise<Kline[]> {
     // 主动重建连接（避免被 TradingView 踢）
-    if (this.requestCount > 0 && this.requestCount % this.REQUEST_LIMIT === 0) {
-      console.log(`🔄 主动重建连接（已完成 ${this.requestCount} 个请求）`);
-      // 先标记为不自动重连，防止 disconnect 触发的 attemptReconnect 和我们的 connect 竞争
-      this.shouldReconnect = false;
-      await this.disconnect();
-      await this.delay(500);  // 等待连接完全关闭
-      await this.connect();
-      this.requestCount = 0; // 重置计数
+    if (this.requestCount > 0 && this.requestCount % this.REQUEST_LIMIT === 0 && !this.isRebuilding) {
+      await this.rebuildConnection();
     } else if (!this.isConnected) {
-      await this.connect();
+      await this.ensureConnected();
     }
     
     this.requestCount++; // 请求计数+1

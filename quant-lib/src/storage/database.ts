@@ -227,26 +227,25 @@ export class KlineDatabase {
   }
 
   /**
-   * 获取最新一根 K线
+   * 获取最新一根 K线（优化：利用 reverse + limit=1）
    */
   async getLatestKline(symbol: string, interval: string): Promise<Kline | null> {
     const symbolId = this.symbols.getId(symbol);
     if (symbolId === undefined) return null;
 
     const table = this.getTable(interval);
-    const rows = table.query(row => row.symbol_id === symbolId);
+    
+    // 优化：倒序扫描 + limit=1（只查一条）
+    const rows = table.query(
+      row => row.symbol_id === symbolId,
+      { reverse: true, limit: 1 }
+    );
 
     if (rows.length === 0) return null;
 
-    // 找 timestamp 最大的
-    let latest = rows[0];
-    for (const row of rows) {
-      if (Number(row.timestamp) > Number(latest.timestamp)) {
-        latest = row;
-      }
-    }
-
+    const latest = rows[0];
     const [baseCurrency, quoteCurrency] = symbol.split('/');
+    
     return {
       symbol,
       exchange: 'OTHER',

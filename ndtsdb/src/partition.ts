@@ -259,26 +259,45 @@ export class PartitionedTable {
   /**
    * 查询（跨分区）
    * @param filter 行过滤函数
-   * @param timeRange 时间范围过滤（可选，用于优化分区扫描）
+   * @param options 查询选项
+   *   - timeRange: 时间范围过滤（用于分区裁剪）
+   *   - limit: 最大返回行数（提前退出优化）
+   *   - reverse: 倒序扫描（查最新数据时从尾部开始）
    */
   query(
     filter?: (row: Record<string, any>) => boolean,
-    timeRange?: { min?: number | bigint; max?: number | bigint }
+    options?: {
+      timeRange?: { min?: number | bigint; max?: number | bigint };
+      limit?: number;
+      reverse?: boolean;
+    }
   ): Array<Record<string, any>> {
     const results: Array<Record<string, any>> = [];
+    const limit = options?.limit;
+    const reverse = options?.reverse || false;
 
     // 智能分区过滤（仅扫描时间范围内的分区）
     let partitionsToScan = Array.from(this.partitions.values());
 
-    if (timeRange && this.strategy.type === 'time') {
-      partitionsToScan = this.filterPartitionsByTimeRange(timeRange);
+    if (options?.timeRange && this.strategy.type === 'time') {
+      partitionsToScan = this.filterPartitionsByTimeRange(options.timeRange);
+    }
+
+    // 倒序扫描时反转分区顺序
+    if (reverse) {
+      partitionsToScan.reverse();
     }
 
     // 扫描分区
     for (const meta of partitionsToScan) {
       const { header, data } = AppendWriter.readAll(meta.path);
 
-      for (let i = 0; i < header.totalRows; i++) {
+      // 确定扫描顺序
+      const startIdx = reverse ? header.totalRows - 1 : 0;
+      const endIdx = reverse ? -1 : header.totalRows;
+      const step = reverse ? -1 : 1;
+
+      for (let i = startIdx; reverse ? i > endIdx : i < endIdx; i += step) {
         const row: Record<string, any> = {};
         for (const [colName, colData] of data) {
           row[colName] = (colData as any)[i];
@@ -286,7 +305,17 @@ export class PartitionedTable {
 
         if (!filter || filter(row)) {
           results.push(row);
+
+          // 提前退出优化
+          if (limit && results.length >= limit) {
+            return results;
+          }
         }
+      }
+
+      // 提前退出（跨分区）
+      if (limit && results.length >= limit) {
+        return results;
       }
     }
 
