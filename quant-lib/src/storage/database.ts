@@ -194,7 +194,11 @@ export class KlineDatabase {
   }
 
   /**
-   * 获取最新 timestamp
+   * 获取最新 timestamp（高效实现，避免全表扫描）
+   * 
+   * 优化：使用 PartitionedTable.getMax() API + partitionHint
+   * - 哈希分区：只扫描 symbol_id 对应的 bucket（~100x 加速）
+   * - 时间分区：只扫描最新分区
    */
   async getLatestTimestamp(symbol: string, interval: string): Promise<number | null> {
     const symbolId = this.symbols.getId(symbol);
@@ -202,19 +206,24 @@ export class KlineDatabase {
 
     const table = this.getTable(interval);
 
-    // 查询该 symbol 的所有数据
-    const rows = table.query(row => row.symbol_id === symbolId);
+    // 使用高效的 getMax API（传递 partitionHint 定位 bucket）
+    const maxTs = table.getMax(
+      'timestamp',
+      row => row.symbol_id === symbolId,
+      { symbol_id: symbolId } // partitionHint：直接定位到对应 bucket
+    );
 
-    if (rows.length === 0) return null;
+    if (maxTs === null) return null;
 
-    // 找最大 timestamp
-    let maxTs = 0;
-    for (const row of rows) {
-      const ts = Number(row.timestamp);
-      if (ts > maxTs) maxTs = ts;
-    }
+    // 转换 bigint → number
+    return typeof maxTs === 'bigint' ? Number(maxTs) : maxTs;
+  }
 
-    return maxTs;
+  /**
+   * 别名：getMaxTimestamp
+   */
+  async getMaxTimestamp(symbol: string, interval: string): Promise<number | null> {
+    return this.getLatestTimestamp(symbol, interval);
   }
 
   /**

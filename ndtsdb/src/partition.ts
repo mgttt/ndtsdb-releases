@@ -299,6 +299,111 @@ export class PartitionedTable {
   }
 
   /**
+   * 获取指定列的最大值（高效实现，避免全表扫描）
+   * 
+   * 优化策略：
+   * 1. 时间分区：只扫描最新分区
+   * 2. 哈希分区 + partitionHint：只扫描对应 bucket
+   * 3. 范围分区：需要扫描所有分区
+   * 
+   * @param column 列名
+   * @param filter 可选过滤条件（如 symbol_id 过滤）
+   * @param partitionHint 分区提示（用于哈希分区优化，如 { symbol_id: 123 }）
+   * @returns 最大值（bigint/number）或 null（无数据）
+   */
+  getMax(
+    column: string,
+    filter?: (row: Record<string, any>) => boolean,
+    partitionHint?: Record<string, any>
+  ): bigint | number | null {
+    // 验证列存在
+    if (!this.columns.find(c => c.name === column)) {
+      throw new Error(`Column ${column} not found`);
+    }
+
+    let partitionsToScan: PartitionMeta[];
+
+    // 优化 1：时间分区只扫描最新分区
+    if (this.strategy.type === 'time') {
+      partitionsToScan = this.getLatestPartitions(1);
+      if (partitionsToScan.length === 0) return null;
+    }
+    // 优化 2：哈希分区 + partitionHint → 只扫描对应 bucket
+    else if (this.strategy.type === 'hash' && partitionHint) {
+      const label = this.getPartitionLabel(partitionHint);
+      const partition = this.partitions.get(label);
+      
+      if (partition) {
+        partitionsToScan = [partition];
+      } else {
+        // 分区不存在（可能是新数据），返回 null
+        return null;
+      }
+    }
+    // 默认：扫描所有分区
+    else {
+      partitionsToScan = Array.from(this.partitions.values());
+    }
+
+    let maxValue: bigint | number | null = null;
+
+    for (const meta of partitionsToScan) {
+      try {
+        const { header, data } = AppendWriter.readAll(meta.path);
+        const columnData = data.get(column);
+        if (!columnData) continue;
+
+        // 优化：提前获取所有需要的列数据（避免重复 data.get）
+        const filterColumns = filter ? Array.from(data.keys()) : [];
+        const filterColumnData = filter
+          ? new Map(filterColumns.map(colName => [colName, data.get(colName)!]))
+          : new Map();
+
+        for (let i = 0; i < header.totalRows; i++) {
+          // 构造行用于过滤（仅在需要时）
+          if (filter) {
+            const row: Record<string, any> = {};
+            for (const [colName, colData] of filterColumnData) {
+              row[colName] = (colData as any)[i];
+            }
+            if (!filter(row)) continue;
+          }
+
+          const value = (columnData as any)[i];
+          if (value === null || value === undefined) continue;
+
+          if (maxValue === null) {
+            maxValue = value;
+          } else {
+            // 处理 bigint 和 number 的比较
+            if (typeof maxValue === 'bigint' && typeof value === 'bigint') {
+              if (value > maxValue) maxValue = value;
+            } else {
+              const v1 = typeof maxValue === 'bigint' ? Number(maxValue) : maxValue;
+              const v2 = typeof value === 'bigint' ? Number(value) : value;
+              if (v2 > v1) maxValue = value;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`Failed to read partition ${meta.label}:`, e);
+      }
+    }
+
+    return maxValue;
+  }
+
+  /**
+   * 获取最新的 N 个分区（按标签排序）
+   */
+  private getLatestPartitions(count: number): PartitionMeta[] {
+    const sorted = Array.from(this.partitions.values())
+      .sort((a, b) => b.label.localeCompare(a.label)); // 降序
+
+    return sorted.slice(0, count);
+  }
+
+  /**
    * 关闭所有打开的 writer
    */
   async closeAll(): Promise<void> {
