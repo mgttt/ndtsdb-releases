@@ -11,8 +11,15 @@
 const CONFIG = {
   symbol: 'MYXUSDT',
   gridCount: 5,
-  gridSpacing: 0.01,
-  orderSize: 10,
+  gridSpacing: 0.01,           // 默认网格间距（向后兼容）
+  orderSize: 10,               // 默认订单大小（向后兼容）
+
+  // 非对称网格支持（可选，不传时使用 gridSpacing/orderSize）
+  gridSpacingUp: null,         // 升方向（Sell）网格间距，如 0.02
+  gridSpacingDown: null,       // 跌方向（Buy）网格间距，如 0.04
+  orderSizeUp: null,           // 升方向（Sell）订单大小，如 50
+  orderSizeDown: null,         // 跌方向（Buy）订单大小，如 100
+
   maxPosition: 100,
 
   magnetDistance: 0.005,     // 0.5%
@@ -58,7 +65,11 @@ if (typeof ctx !== 'undefined' && ctx && ctx.strategy && ctx.strategy.params) {
   if (p.symbol) CONFIG.symbol = p.symbol;
   if (p.gridCount) CONFIG.gridCount = p.gridCount;
   if (p.gridSpacing) CONFIG.gridSpacing = p.gridSpacing;
+  if (p.gridSpacingUp !== undefined) CONFIG.gridSpacingUp = p.gridSpacingUp;
+  if (p.gridSpacingDown !== undefined) CONFIG.gridSpacingDown = p.gridSpacingDown;
   if (p.orderSize) CONFIG.orderSize = p.orderSize;
+  if (p.orderSizeUp !== undefined) CONFIG.orderSizeUp = p.orderSizeUp;
+  if (p.orderSizeDown !== undefined) CONFIG.orderSizeDown = p.orderSizeDown;
   if (p.maxPosition) CONFIG.maxPosition = p.maxPosition;
   if (p.magnetDistance) CONFIG.magnetDistance = p.magnetDistance;
   if (p.cancelDistance) CONFIG.cancelDistance = p.cancelDistance;
@@ -610,6 +621,21 @@ function printGridStatus() {
   logInfo('=== 网格档位 ===');
   logInfo('方向: ' + CONFIG.direction + (CONFIG.direction === 'neutral' ? '' : ' (虚仓仅记账)'));
 
+  // 显示非对称参数
+  const spacingDown = CONFIG.gridSpacingDown !== null ? CONFIG.gridSpacingDown : CONFIG.gridSpacing;
+  const spacingUp = CONFIG.gridSpacingUp !== null ? CONFIG.gridSpacingUp : CONFIG.gridSpacing;
+  const orderSizeDown = CONFIG.orderSizeDown !== null ? CONFIG.orderSizeDown : CONFIG.orderSize;
+  const orderSizeUp = CONFIG.orderSizeUp !== null ? CONFIG.orderSizeUp : CONFIG.orderSize;
+
+  const isAsymmetric = (CONFIG.gridSpacingDown !== null || CONFIG.gridSpacingUp !== null ||
+                        CONFIG.orderSizeDown !== null || CONFIG.orderSizeUp !== null);
+
+  if (isAsymmetric) {
+    logInfo('非对称模式:');
+    logInfo('  跌方向: 间距 ' + (spacingDown * 100).toFixed(2) + '%, 单量 ' + orderSizeDown);
+    logInfo('  升方向: 间距 ' + (spacingUp * 100).toFixed(2) + '%, 单量 ' + orderSizeUp);
+  }
+
   const buyGrids = state.gridLevels.filter(function(g) { return g.side === 'Buy'; });
   const sellGrids = state.gridLevels.filter(function(g) { return g.side === 'Sell'; });
 
@@ -759,9 +785,25 @@ function st_onParamsUpdate(newParamsJson) {
     CONFIG.gridSpacing = newParams.gridSpacing;
     logInfo('[Gales] 网格间距: ' + CONFIG.gridSpacing);
   }
+  if (newParams.gridSpacingUp !== undefined) {
+    CONFIG.gridSpacingUp = newParams.gridSpacingUp;
+    logInfo('[Gales] 升方向网格间距: ' + CONFIG.gridSpacingUp);
+  }
+  if (newParams.gridSpacingDown !== undefined) {
+    CONFIG.gridSpacingDown = newParams.gridSpacingDown;
+    logInfo('[Gales] 跌方向网格间距: ' + CONFIG.gridSpacingDown);
+  }
   if (newParams.orderSize !== undefined) {
     CONFIG.orderSize = newParams.orderSize;
     logInfo('[Gales] 单笔名义: ' + CONFIG.orderSize);
+  }
+  if (newParams.orderSizeUp !== undefined) {
+    CONFIG.orderSizeUp = newParams.orderSizeUp;
+    logInfo('[Gales] 升方向订单大小: ' + CONFIG.orderSizeUp);
+  }
+  if (newParams.orderSizeDown !== undefined) {
+    CONFIG.orderSizeDown = newParams.orderSizeDown;
+    logInfo('[Gales] 跌方向订单大小: ' + CONFIG.orderSizeDown);
   }
   if (newParams.maxPosition !== undefined) {
     CONFIG.maxPosition = newParams.maxPosition;
@@ -859,9 +901,13 @@ function initializeGrids() {
   state.gridLevels = [];
   const center = state.centerPrice;
 
-  // 买单网格
+  // 非对称间距（向后兼容：不传时使用 gridSpacing）
+  const spacingDown = CONFIG.gridSpacingDown !== null ? CONFIG.gridSpacingDown : CONFIG.gridSpacing;
+  const spacingUp = CONFIG.gridSpacingUp !== null ? CONFIG.gridSpacingUp : CONFIG.gridSpacing;
+
+  // 买单网格（跌方向）
   for (let i = 1; i <= CONFIG.gridCount; i++) {
-    const price = center * (1 - CONFIG.gridSpacing * i);
+    const price = center * (1 - spacingDown * i);
     state.gridLevels.push({
       id: state.nextGridId++,
       price: price,
@@ -874,9 +920,9 @@ function initializeGrids() {
     });
   }
 
-  // 卖单网格
+  // 卖单网格（升方向）
   for (let i = 1; i <= CONFIG.gridCount; i++) {
-    const price = center * (1 + CONFIG.gridSpacing * i);
+    const price = center * (1 + spacingUp * i);
     state.gridLevels.push({
       id: state.nextGridId++,
       price: price,
@@ -890,6 +936,8 @@ function initializeGrids() {
   }
 
   logInfo('生成网格: ' + state.gridLevels.length + ' 个档位');
+  logInfo('  跌方向间距: ' + (spacingDown * 100).toFixed(2) + '%');
+  logInfo('  升方向间距: ' + (spacingUp * 100).toFixed(2) + '%');
 }
 
 function getEffectiveMagnetDistance() {
@@ -1019,7 +1067,12 @@ function placeOrder(grid) {
     }
   }
 
-  const quantity = CONFIG.orderSize / orderPrice;
+  // 非对称订单大小（向后兼容：不传时使用 orderSize）
+  const orderSize = grid.side === 'Buy'
+    ? (CONFIG.orderSizeDown !== null ? CONFIG.orderSizeDown : CONFIG.orderSize)
+    : (CONFIG.orderSizeUp !== null ? CONFIG.orderSizeUp : CONFIG.orderSize);
+
+  const quantity = orderSize / orderPrice;
   const orderLinkId = 'gales-' + grid.id + '-' + grid.side;
 
   // 记录"有下单行为"（用于 autoRecenter 判断）
