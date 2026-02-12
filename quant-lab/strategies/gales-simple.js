@@ -56,6 +56,18 @@ const CONFIG = {
   // neutral: 双向交易
   direction: 'neutral',
 
+  // 熔断机制 (P0 修复)
+  circuitBreaker: {
+    enabled: true,
+    maxDrawdown: 0.30,          // 最大回撤 30%
+    maxPositionRatio: 0.90,     // 仓位使用率 90%
+    maxPriceDrift: 0.50,        // 价格偏离中心 50%
+    cooldownAfterTrip: 600,     // 熔断后冷却 10 分钟
+  },
+
+  // 应急方向切换 (P0 修复)
+  emergencyDirection: 'auto',  // auto/long/short/neutral
+
   simMode: true,
 };
 
@@ -124,6 +136,14 @@ let runtime = {
   },
 };
 
+// 熔断状态 (P0 修复)
+let circuitBreakerState = {
+  tripped: false,
+  reason: '',
+  tripAt: 0,
+  highWaterMark: 0,  // 最高权益（用于计算回撤）
+};
+
 // 加载状态
 function loadState() {
   try {
@@ -185,6 +205,168 @@ function warnPositionLimit(side, gridId, currentNotional, afterFillNotional) {
     runtime.posLimit.sellOver = true;
     runtime.posLimit.lastWarnAtSell = now;
     logWarn('卖单 #' + gridId + ' 仓位将超限 (当前=' + currentNotional.toFixed(2) + ' 成交后=' + afterFillNotional.toFixed(2) + ')');
+  }
+}
+
+// ================================
+// P0 修复：辅助函数
+// ================================
+
+function hasOnlyActiveSellOrders() {
+  if (!state.openOrders || state.openOrders.length === 0) return false;
+  let hasActive = false;
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o || o.status === 'Filled' || o.status === 'Canceled') continue;
+    if (o.side === 'Buy') return false;  // 有买单，不是纯卖单
+    hasActive = true;
+  }
+  return hasActive;
+}
+
+function hasOnlyActiveBuyOrders() {
+  if (!state.openOrders || state.openOrders.length === 0) return false;
+  let hasActive = false;
+  for (let i = 0; i < state.openOrders.length; i++) {
+    const o = state.openOrders[i];
+    if (!o || o.status === 'Filled' || o.status === 'Canceled') continue;
+    if (o.side === 'Sell') return false;  // 有卖单，不是纯买单
+    hasActive = true;
+  }
+  return hasActive;
+}
+
+function cancelAllOrders() {
+  logWarn('[撤销所有订单] 活跃订单数: ' + countActiveOrders());
+  
+  for (let i = 0; i < state.gridLevels.length; i++) {
+    const g = state.gridLevels[i];
+    if (!g) continue;
+    if (g.state === 'ACTIVE' && g.orderId) {
+      cancelOrder(g);
+    }
+  }
+  
+  // 清理已撤销订单（保留成交记录）
+  state.openOrders = state.openOrders.filter(function(o) {
+    if (!o) return false;
+    return o.status !== 'Canceled';
+  });
+}
+
+// ================================
+// P0 修复：熔断检查
+// ================================
+
+function checkCircuitBreaker() {
+  if (!CONFIG.circuitBreaker || !CONFIG.circuitBreaker.enabled) return false;
+  
+  const now = Date.now();
+  const cb = CONFIG.circuitBreaker;
+  
+  // 冷却期内不重复检查
+  if (circuitBreakerState.tripped) {
+    const elapsed = (now - circuitBreakerState.tripAt) / 1000;
+    if (elapsed < cb.cooldownAfterTrip) {
+      return true;  // 仍在冷却期
+    }
+    
+    // 冷却期结束，重置熔断
+    logWarn('[熔断恢复] 冷却期结束，恢复交易');
+    circuitBreakerState.tripped = false;
+    circuitBreakerState.reason = '';
+    return false;
+  }
+  
+  // 1. 回撤熔断
+  if (circuitBreakerState.highWaterMark === 0) {
+    circuitBreakerState.highWaterMark = CONFIG.maxPosition;
+  }
+  
+  const equity = Math.abs(state.positionNotional);
+  if (equity > circuitBreakerState.highWaterMark) {
+    circuitBreakerState.highWaterMark = equity;
+  }
+  
+  const drawdown = (circuitBreakerState.highWaterMark - equity) / circuitBreakerState.highWaterMark;
+  if (drawdown > cb.maxDrawdown) {
+    circuitBreakerState.tripped = true;
+    circuitBreakerState.reason = '回撤熔断';
+    circuitBreakerState.tripAt = now;
+    
+    logWarn('[熔断触发] 回撤熔断 drawdown=' + (drawdown * 100).toFixed(2) + '%');
+    
+    // 撤销所有订单
+    cancelAllOrders();
+    
+    return true;
+  }
+  
+  // 2. 仓位熔断
+  const positionRatio = Math.abs(state.positionNotional) / CONFIG.maxPosition;
+  if (positionRatio > cb.maxPositionRatio) {
+    circuitBreakerState.tripped = true;
+    circuitBreakerState.reason = '仓位熔断';
+    circuitBreakerState.tripAt = now;
+    
+    logWarn('[熔断触发] 仓位熔断 positionRatio=' + (positionRatio * 100).toFixed(2) + '%');
+    
+    // 撤销所有订单
+    cancelAllOrders();
+    
+    return true;
+  }
+  
+  // 3. 价格偏离熔断
+  if (state.centerPrice > 0) {
+    const drift = Math.abs(state.lastPrice - state.centerPrice) / state.centerPrice;
+    if (drift > cb.maxPriceDrift) {
+      circuitBreakerState.tripped = true;
+      circuitBreakerState.reason = '价格偏离熔断';
+      circuitBreakerState.tripAt = now;
+      
+      logWarn('[熔断触发] 价格偏离熔断 drift=' + (drift * 100).toFixed(2) + '%');
+      
+      // 不撤单（价格可能快速恢复），但停止新下单
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// ================================
+// P0 修复：应急方向切换
+// ================================
+
+function checkEmergencyDirectionSwitch() {
+  if (CONFIG.emergencyDirection !== 'auto') return;
+  
+  // 买满仓 → 强制切换到 long 模式（只做多）
+  if (state.positionNotional >= CONFIG.maxPosition * 0.9) {
+    if (CONFIG.direction !== 'long') {
+      logWarn('[应急切换] 买满仓 → long 模式');
+      CONFIG.direction = 'long';
+      saveState();
+    }
+  }
+  
+  // 卖满仓 → 强制切换到 short 模式（只做空）
+  if (state.positionNotional <= -CONFIG.maxPosition * 0.9) {
+    if (CONFIG.direction !== 'short') {
+      logWarn('[应急切换] 卖满仓 → short 模式');
+      CONFIG.direction = 'short';
+      saveState();
+    }
+  }
+  
+  // 仓位回到安全区 → 恢复 neutral
+  if (Math.abs(state.positionNotional) < CONFIG.maxPosition * 0.5) {
+    if (CONFIG.direction !== 'neutral' && CONFIG.emergencyDirection === 'auto') {
+      logInfo('[应急切换] 仓位安全 → neutral 模式');
+      CONFIG.direction = 'neutral';
+      saveState();
+    }
   }
 }
 
@@ -695,6 +877,22 @@ function st_heartbeat(tickJson) {
     return;
   }
 
+  // ================================
+  // P0 修复：熔断检查（最高优先级）
+  // ================================
+  if (checkCircuitBreaker()) {
+    // 熔断中，跳过所有交易逻辑
+    if (state.tickCount % 60 === 0) {  // 每 5 分钟提醒一次
+      logWarn('[熔断中] 原因: ' + circuitBreakerState.reason + ' | 仓位: ' + state.positionNotional.toFixed(2));
+    }
+    return;
+  }
+
+  // ================================
+  // P0 修复：应急方向切换
+  // ================================
+  checkEmergencyDirectionSwitch();
+
   // 每 10 次心跳输出一次状态（避免刷屏）
   if (state.tickCount % 10 === 0) {
     logHeartbeat();
@@ -704,7 +902,7 @@ function st_heartbeat(tickJson) {
   reconcileGridOrderLinks();
 
   // ================================
-  // Auto Recenter：中心漂移太远且长时间无交易时自动重心
+  // P0 修复：Auto Recenter + 满仓死锁修复
   // ================================
   if (CONFIG.autoRecenter) {
     const center = state.centerPrice || state.lastPrice;
@@ -712,24 +910,26 @@ function st_heartbeat(tickJson) {
     const idleTicks = (state.tickCount || 0) - (state.lastPlaceTick || 0);
     const cooldownOk = (Date.now() - (state.lastRecenterAtMs || 0)) >= (CONFIG.recenterCooldownSec * 1000);
     const noActiveOrders = countActiveOrders() === 0;
+    
+    // P0 修复：满仓时允许重心
+    const fullPositionStuck = (
+      (state.positionNotional >= CONFIG.maxPosition && hasOnlyActiveSellOrders()) ||
+      (state.positionNotional <= -CONFIG.maxPosition && hasOnlyActiveBuyOrders())
+    );
 
-    if (drift >= CONFIG.recenterDistance && idleTicks >= CONFIG.recenterMinIdleTicks && cooldownOk && noActiveOrders) {
-      logWarn('[自动重心] drift=' + (drift * 100).toFixed(2) + '% idleTicks=' + idleTicks + ' center=' + center.toFixed(4) + ' -> ' + state.lastPrice.toFixed(4));
+    if (drift >= CONFIG.recenterDistance && 
+        idleTicks >= CONFIG.recenterMinIdleTicks && 
+        cooldownOk && 
+        (noActiveOrders || fullPositionStuck)) {
+      
+      const reason = fullPositionStuck ? '满仓死锁自动重心' : '自动重心';
+      logWarn('[' + reason + '] drift=' + (drift * 100).toFixed(2) + 
+              '% idleTicks=' + idleTicks + 
+              ' posNotional=' + state.positionNotional.toFixed(2) +
+              ' center=' + center.toFixed(4) + ' -> ' + state.lastPrice.toFixed(4));
 
-      // 撤掉所有活跃订单（尽力而为；simMode 会真正清掉）
-      for (let i = 0; i < state.gridLevels.length; i++) {
-        const g = state.gridLevels[i];
-        if (!g) continue;
-        if (g.state === 'ACTIVE' && g.orderId) {
-          cancelOrder(g);
-          removeOpenOrder(g.orderId);
-        }
-      }
-
-      state.openOrders = state.openOrders.filter(function(o) {
-        if (!o) return false;
-        return o.status !== 'Filled' && o.status !== 'Canceled';
-      });
+      // 强制撤销所有订单（包括卖单/买单）
+      cancelAllOrders();
 
       // 重心并重建网格
       state.centerPrice = state.lastPrice;
