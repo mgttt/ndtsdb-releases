@@ -286,7 +286,15 @@ export class BybitProvider implements TradingProvider {
     }
     
     const result = await this.request('POST', '/v5/order/create', params);
-    return this.parseOrder(result.result);
+    // 兼容 order/create 精简返回：补充调用时的参数
+    return this.parseOrder({
+      ...result.result,
+      symbol: this.toExchangeSymbol(symbol),
+      side: 'Buy',
+      orderType: price ? 'Limit' : 'Market',
+      qty: quantity.toString(),
+      price: price?.toString() || '0',
+    });
   }
   
   /**
@@ -306,7 +314,15 @@ export class BybitProvider implements TradingProvider {
     }
     
     const result = await this.request('POST', '/v5/order/create', params);
-    return this.parseOrder(result.result);
+    // 兼容 order/create 精简返回：补充调用时的参数
+    return this.parseOrder({
+      ...result.result,
+      symbol: this.toExchangeSymbol(symbol),
+      side: 'Sell',
+      orderType: price ? 'Limit' : 'Market',
+      qty: quantity.toString(),
+      price: price?.toString() || '0',
+    });
   }
   
   /**
