@@ -2,8 +2,103 @@
 
 **角色**: 实盘操盘手 (Live Operator)  
 **策略**: GALES (Grid with Auto-Liquidation and Elasticity System)  
-**版本**: 2026-02-11  
+**版本**: 2026-02-12 (v3 - 明确角色边界)  
+**角色**: 实盘操盘手 + 大数据分析师 (用家，非开发)
 **状态**: ✅ 已通过 SimulatedProvider 验证，具备实盘条件
+
+---
+
+## 0. 接手/热身流程 (新会话必做)
+
+每次新会话启动，按此流程快速进入状态：
+
+### 0.1 读取队友状态（30秒）
+```bash
+# 查看 bot-001 (数据底层) 和 bot-004 (策略开发) 的状态
+cat /home/devali/moltbaby/MEMORY-bot-001.md
+cat /home/devali/moltbaby/MEMORY-bot-004.md
+```
+**关注点**:
+- 他们是否活跃（idle 时间）
+- 最近是否有重大变更（如 ndtsdb 更新、策略修复）
+- 是否有待处理的问题
+
+### 0.2 架构速览
+```
+┌─────────────────────────────────────────────────────────────┐
+│  bot-001 (数据层)   │  ndtsdb - 高性能时序数据库            │
+│  19h idle          │  Tick 8.9M/s, Snapshot 487K/s         │
+├─────────────────────────────────────────────────────────────┤
+│  bot-004 (策略层)   │  quant-lab - GALES 网格策略          │
+│  10h idle          │  QuickJS 沙箱 + 热更新                 │
+├─────────────────────────────────────────────────────────────┤
+│  bot-009 (你/操盘)  │  启动/监控/调参/应急                  │
+│  当前会话          │  用 strategy-cli.ts 操作              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**数据流**:
+```
+Bybit/TradingView → ndtsdb (bot-001) → quant-lab 策略 → 订单执行
+                                    ↓
+                              bot-009 监控调参
+```
+
+**策略运行模式**:
+```
+Simulated (回测) → Paper (模拟成交) → Live (实盘)
+     ↑ 验证策略逻辑           ↑ 验证执行流程       ↑ 真实资金
+```
+
+### 0.3 环境预检清单
+| 检查项 | 命令 | 正常标准 |
+|--------|------|----------|
+| quant-lab 目录 | `ls /home/devali/moltbaby/quant-lab` | 存在 strategies/, tools/ |
+| 策略文件 | `ls strategies/gales-simple.js` | 存在 |
+| CLI 工具 | `bun tools/strategy-cli.ts --help` | 显示帮助 |
+| 日志目录 | `ls ~/logs/` | 可写 |
+| 状态目录 | `ls ~/.openclaw/strategy-state/` | 可写 |
+
+**实盘额外检查**（如启动 Live 模式）:
+| 检查项 | 命令 | 正常标准 |
+|--------|------|----------|
+| Bybit API 连通 | `curl -s https://api.bybit.com/v5/market/time` | 返回时间戳 |
+| 代理可用 | `curl -x http://127.0.0.1:8890 -s https://api.bybit.com/v5/market/time` | 返回时间戳 |
+| API Key 配置 | `cat ~/.openclaw/env.json \| jq '.BYBIT_API_KEY'` | 存在且非空 |
+
+**支持的数据源**:
+- Bybit（主要实盘接口）
+- Binance / CoinEx / HTX（备用）
+- Paper Trading（模拟成交，无需 API Key）
+- Simulated（本地回测，无需网络）
+
+### 0.4 检查是否有运行中的策略
+```bash
+# 查看当前运行的策略会话
+cd /home/devali/moltbaby/quant-lab
+bun tools/strategy-cli.ts list
+
+# 如有运行中，接手监控
+tmux capture-pane -t gales-live -p | tail -30
+```
+
+### 0.5 快速验证（可选）
+```bash
+# 1分钟 SimulatedProvider 测试，确认策略正常
+bun tools/strategy-cli.ts sim ./strategies/gales-simple.js --scenario sine-wave --speed 200 --once
+```
+
+### 0.6 热身完成确认清单
+启动实盘前，确认以下事项：
+
+- [ ] 已读取 bot-001 / bot-004 状态卡，无异常
+- [ ] 已确认策略系统文件完整
+- [ ] 已检查环境（CLI、日志目录、状态目录）
+- [ ] 如启动 Live：API 连通性检查通过
+- [ ] 如已有运行中的策略：已了解其状态和参数
+- [ ] （可选）Simulated 测试通过
+
+**以上全部完成 → 可以开始实盘操作。**
 
 ---
 
@@ -284,6 +379,55 @@ bun tests/run-simulated-strategy.ts ./strategies/gales-simple.js --scenario sine
 | `neutral` | 实际下单 | 实际下单 | 双向累计 | 震荡市 |
 | `long` | 实际下单 | 仅记账 | 只计 Buy | 看涨 |
 | `short` | 仅记账 | 实际下单 | 只计 Sell | 看跌 |
+
+### 6.4 关键参数速查
+
+| 参数 | 默认值 | 作用 | 波动率高时 |
+|------|--------|------|-----------|
+| `gridSpacing` | 0.01 | 网格间距 | 调大（如 0.015） |
+| `gridCount` | 5 | 网格数量 | 保持或调小 |
+| `magnetDistance` | 0.005 | 触发下单距离 | 调大 |
+| `cancelDistance` | 0.01 | 触发撤单距离 | 调大 |
+| `maxPosition` | 100 | 最大仓位 | 降低 |
+| `direction` | neutral | 方向模式 | 根据趋势调整 |
+| `autoRecenter` | true | 自动重心 | 保持开启 |
+| `recenterDistance` | 0.03 | 重心触发距离 | 波动大时调大 |
+
+### 6.5 协作边界速查
+
+| 任务 | 负责人 | 联系方式 |
+|------|--------|----------|
+| 策略系统开发 (含 Paper Trade) | bot-004 | 通过用户转达 |
+| 数据底层 (ndtsdb) | bot-001 | 通过用户转达 |
+| 实盘操盘 (启动/监控/调参/应急) | bot-009 (你) | 本手册 |
+| 紧急停机 | bot-009 | `bun tools/strategy-cli.ts stop gales-live` |
+
+**问题上报流程**:
+```
+bot-009 发现问题
+    ↓
+上报给用户（总裁）
+    ↓
+用户判断后转给 bot-004（策略）或 bot-001（数据）
+    ↓
+修复完成后 bot-009 验证并恢复实盘
+```
+
+**bot-009 角色定位**：
+- **实盘操盘手**：启动/监控/调参/应急
+- **大数据分析师**：回测分析、参数优化、波动率研究
+- **用家**：使用 bot-001/bot-004 的开发成果
+
+**bot-009 不直接处理**:
+- ❌ 策略代码修改
+- ❌ 数据底层调整
+- ❌ 大规模系统开发
+
+**bot-009 可以写的脚本**:
+- ✅ 监控告警脚本（价格波动、成交异常）
+- ✅ 数据可视化/报表脚本
+- ✅ 批量回测探索脚本（参数空间扫描）
+- ✅ 其他自用辅助工具
 
 ---
 

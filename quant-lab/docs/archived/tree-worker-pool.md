@@ -1,3 +1,11 @@
+# [ARCHIVED] tree-worker-pool
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 树状 Worker Pool 设计
 
 > 从扁平到树状，支持层级调度

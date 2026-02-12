@@ -17,7 +17,7 @@ export interface StrategySchedulerConfig {
   /** 数据目录 */
   dataDir?: string;
   /** IPC 存储目录 */
-  ipcDir?: string;
+  poolDir?: string;
   /** 任务超时（分钟） */
   taskTimeoutMinutes?: number;
 }
@@ -47,18 +47,18 @@ export class StrategyScheduler {
   constructor(config: StrategySchedulerConfig) {
     this.config = {
       dataDir: './data',
-      ipcDir: '.ipc/backtest-pool',
+      poolDir: '.workpool/backtest',
       taskTimeoutMinutes: 10,
       ...config,
     };
 
     // 初始化 Pool
-    const store = new FileStore(this.config.ipcDir);
+    const store = new FileStore(this.config.poolDir);
     this.pool = new Pool(store);
 
     console.log(`[StrategyScheduler] 初始化完成`);
     console.log(`  最大 Workers: ${this.config.maxWorkers}`);
-    console.log(`  IPC 目录: ${this.config.ipcDir}`);
+    console.log(`  工作池目录: ${this.config.poolDir}`);
   }
 
   /**

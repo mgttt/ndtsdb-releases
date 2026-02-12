@@ -22,3 +22,6 @@ export * from './adapters/ProcessAdapter';
 
 // Phase 2 - Daemon & IPC
 export * from './daemon';
+
+// Phase 4 - Session Management
+export * from './session';

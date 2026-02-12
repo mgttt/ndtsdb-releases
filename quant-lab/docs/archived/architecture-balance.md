@@ -1,3 +1,11 @@
+# [ARCHIVED] architecture-balance
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 架构设计 v2 - 平衡与扩展
 
 > 核心简单完备，扩展分层可选

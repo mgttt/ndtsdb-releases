@@ -1,3 +1,11 @@
+# [ARCHIVED] three-layer-optimized
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 三层架构 v3.2 - 优化版
 
 > Worker | QuickJS 沙箱 | 桥接优化

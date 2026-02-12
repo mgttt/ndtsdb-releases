@@ -38,7 +38,7 @@ export class StrategyEngine extends TreeEngine {
   private config: Required<StrategyEngineConfig>;
 
   constructor(config: StrategyEngineConfig) {
-    const store = new FileStore(`${config.workDir}/.ipc/strategy-pool`);
+    const store = new FileStore(`${config.workDir}/.workpool/strategy`);
     
     super({
       store,

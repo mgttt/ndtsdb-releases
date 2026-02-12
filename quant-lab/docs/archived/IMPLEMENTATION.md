@@ -1,3 +1,11 @@
+# [ARCHIVED] IMPLEMENTATION
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 最终设计 - v1.0 实施版
 
 > 2026-02-08 固化版本

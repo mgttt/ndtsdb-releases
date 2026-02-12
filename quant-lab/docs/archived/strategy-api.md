@@ -1,3 +1,11 @@
+# [ARCHIVED] strategy-api
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 策略 API v3.0 - 生命周期驱动
 
 > st_init / st_heartbeat / st_exit 设计

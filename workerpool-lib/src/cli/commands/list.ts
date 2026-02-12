@@ -7,7 +7,7 @@ import { Table, formatDuration, formatBytes } from '../table';
 
 export async function listCommand(
   _args: string[],
-  _options: Record<string, string | boolean>,
+  options: Record<string, string | boolean>,
   daemon: Daemon
 ): Promise<void> {
   try {
@@ -17,7 +17,13 @@ export async function listCommand(
       process.exit(1);
     }
 
-    const processes = result.data;
+    let processes = result.data;
+    
+    // 按 group 过滤
+    if (options.group) {
+      const group = options.group as string;
+      processes = processes.filter((p: any) => p.config?.group === group);
+    }
     if (processes.length === 0) {
       console.log('[wp] 没有管理的进程');
       return;

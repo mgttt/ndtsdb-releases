@@ -1,3 +1,11 @@
+# [ARCHIVED] three-layer-with-quickjs
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 三层架构 v3.1 - 含 QuickJS 沙箱
 
 > workerpool 基建 | st-worker (Node.js) | QuickJS 沙箱 (策略 JS)

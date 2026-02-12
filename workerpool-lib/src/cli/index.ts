@@ -15,6 +15,11 @@ import { killCommand } from './commands/kill';
 import { signalCommand } from './commands/signal';
 import { saveCommand } from './commands/save';
 import { loadCommand } from './commands/load';
+import { sessionCommand } from './commands/session';
+import { shCommand } from './commands/sh';
+import { attachCommand } from './commands/attach';
+import { scaleCommand } from './commands/scale';
+import { monitCommand } from './commands/monit';
 
 export * from './table';
 
@@ -61,6 +66,21 @@ export class CLI {
         break;
       case 'load':
         await loadCommand(parsed.args, parsed.options, this.daemon);
+        break;
+      case 'session':
+        await sessionCommand(parsed.args, parsed.options);
+        break;
+      case 'sh':
+        await shCommand(parsed.args, parsed.options);
+        break;
+      case 'attach':
+        await attachCommand(parsed.args, parsed.options);
+        break;
+      case 'scale':
+        await scaleCommand(parsed.args, parsed.options, this.daemon);
+        break;
+      case 'monit':
+        await monitCommand(parsed.args, parsed.options, this.daemon);
         break;
       case 'help':
       default:

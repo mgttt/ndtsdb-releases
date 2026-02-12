@@ -1,3 +1,11 @@
+# [ARCHIVED] three-layer-architecture
+
+> **归档日期**: 2026-02-11
+> **原因**: 设计已迭代/功能已实现/方案已废弃
+> **最新状态见**: README.md / DESIGN.md / ROADMAP.md
+
+---
+
 # Quant-Lab 三层架构 v3 - 双生命周期设计
 
 > workerpool 基建 | st-worker 工作轮 | st 策略 JS

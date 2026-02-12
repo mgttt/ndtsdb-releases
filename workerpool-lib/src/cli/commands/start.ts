@@ -18,8 +18,11 @@ export async function startCommand(
   }
 
   // 解析配置
+  const name = (options.name as string) || script.split('/').pop()!.replace(/\.[^.]+$/, '');
+  const instances = options.instances ? parseInt(options.instances as string, 10) : 1;
+  
   const config: ProcessConfig = {
-    name: (options.name as string) || script.split('/').pop()!.replace(/\.[^.]+$/, ''),
+    name,
     script,
     interpreter: (options.interpreter as 'auto' | 'bun' | 'node' | 'bash' | 'python3') || 'auto',
     cwd: (options.cwd as string) || process.cwd(),
@@ -29,6 +32,31 @@ export async function startCommand(
     maxMemory: options['max-memory'] ? parseInt(options['max-memory'] as string, 10) : undefined,
     group: (options.group as string) || undefined,
   };
+
+  // Cluster 模式：启动多个实例
+  if (instances > 1) {
+    console.log(`[wp] 启动 ${instances} 个实例...`);
+    for (let i = 0; i < instances; i++) {
+      const instanceName = i === 0 ? name : `${name}-${i}`;
+      const instanceConfig = { ...config, name: instanceName };
+      
+      try {
+        const result = await daemon.sendCommand({
+          action: 'start',
+          payload: { config: instanceConfig },
+        });
+
+        if (result.ok) {
+          console.log(`[wp] 已启动: ${instanceName} (PID: ${result.data?.pid})`);
+        } else {
+          console.error(`[wp] 启动失败: ${instanceName} - ${result.error}`);
+        }
+      } catch (err) {
+        console.error(`[wp] 启动失败: ${instanceName}`, err);
+      }
+    }
+    return;
+  }
 
   // 解析环境变量 --env KEY=VAL
   if (options.env) {
