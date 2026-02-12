@@ -75,7 +75,10 @@ const CONFIG = {
 if (typeof ctx !== 'undefined' && ctx && ctx.strategy && ctx.strategy.params) {
   const rawParams = ctx.strategy.params;
   const p = (typeof rawParams === 'string') ? JSON.parse(rawParams) : rawParams;
-  if (p.symbol) CONFIG.symbol = p.symbol;
+  // 防御性检查：symbol 必须是有效字符串
+  if (p.symbol && typeof p.symbol === 'string' && p.symbol.length > 0) {
+    CONFIG.symbol = p.symbol;
+  }
   if (p.gridCount) CONFIG.gridCount = p.gridCount;
   if (p.gridSpacing) CONFIG.gridSpacing = p.gridSpacing;
   if (p.gridSpacingUp !== undefined) CONFIG.gridSpacingUp = p.gridSpacingUp;

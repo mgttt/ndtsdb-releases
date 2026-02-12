@@ -415,6 +415,14 @@ export class QuickJSStrategy {
 
     for (const { params, resolve, reject } of orders) {
       try {
+        // 防御性检查：symbol 必须有效
+        if (!params.symbol || typeof params.symbol !== 'string') {
+          throw new Error(`Invalid symbol: ${params.symbol}`);
+        }
+        if (!params.qty || params.qty <= 0) {
+          throw new Error(`Invalid qty: ${params.qty}`);
+        }
+
         let order: Order;
         
         if (params.side === 'Buy') {
