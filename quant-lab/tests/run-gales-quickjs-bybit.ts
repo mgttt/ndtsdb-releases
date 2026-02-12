@@ -282,6 +282,15 @@ class QuickJSStrategyEngine {
         return this.ctx.newString(JSON.stringify({ orderId: pendingId, status: 'New' }));
       } else {
         // Live 模式：调用真实 API
+        // 精度截断：MYX qtyStep=1（整数），tickSize=0.001（3位小数）
+        params.qty = Math.floor(params.qty);
+        params.price = Math.round(params.price * 1000) / 1000;
+        
+        if (params.qty < 1) {
+          console.warn(`[bridge] 数量不足最小值 (${params.qty}), 跳过`);
+          return this.ctx.newString(JSON.stringify({ orderId: 'skip', status: 'rejected', reason: 'qty < 1' }));
+        }
+        
         console.log(`[bridge][LIVE] placeOrder:`, params);
         
         // 异步下单（不阻塞策略）
