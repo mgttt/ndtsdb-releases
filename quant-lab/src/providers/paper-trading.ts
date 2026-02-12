@@ -328,6 +328,13 @@ export class PaperTradingProvider {
   }
   
   /**
+   * P0-3: 获取单个订单
+   */
+  getOrder(orderId: string): Order | null {
+    return this.orders.find(o => o.orderId === orderId) || null;
+  }
+  
+  /**
    * 重置状态（用于测试）
    */
   reset(): void {

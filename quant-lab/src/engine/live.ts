@@ -28,6 +28,9 @@ export interface TradingProvider {
   getAccount(): Promise<Account>;
   getPosition(symbol: string): Promise<Position | null>;
   getPositions(): Promise<Position[]>;
+  // P0-3: 订单状态轮询
+  getOrders?(): Promise<Order[]>;
+  getOrder?(orderId: string): Promise<Order | null>;
 }
 
 /**
@@ -58,6 +61,11 @@ export class LiveEngine {
   
   // WebSocket 连接（抽象，实际由 Provider 提供）
   private wsHandlers: Map<string, (data: any) => void> = new Map();
+  
+  // P0-3: 订单状态轮询
+  private orderPollInterval: number = 5000; // 5秒轮询一次
+  private orderPollTimer?: NodeJS.Timeout;
+  private trackedOrderIds: Set<string> = new Set(); // 跟踪未完成订单
   
   constructor(strategy: Strategy, config: LiveConfig, provider?: TradingProvider) {
     this.strategy = strategy;
@@ -104,6 +112,9 @@ export class LiveEngine {
     // 订阅 K线（需要外部 Provider 实现）
     await this.subscribeKlines();
     
+    // P0-3: 启动订单状态轮询
+    this.startOrderPolling();
+    
     console.log(`[LiveEngine] 实盘引擎启动完成`);
   }
   
@@ -115,6 +126,12 @@ export class LiveEngine {
     
     this.running = false;
     this.stopped = true;
+    
+    // P0-3: 停止订单轮询
+    if (this.orderPollTimer) {
+      clearInterval(this.orderPollTimer);
+      this.orderPollTimer = undefined;
+    }
     
     // 调用策略停止
     const ctx = this.createContext();
@@ -386,6 +403,12 @@ export class LiveEngine {
     
     this.orders.push(order);
     
+    // P0-3: 如果订单未完成，加入跟踪列表
+    if (order.status === 'PENDING' || order.status === 'PARTIAL_FILLED') {
+      this.trackedOrderIds.add(order.orderId);
+      console.log(`[LiveEngine] 开始跟踪订单: ${order.orderId}`);
+    }
+    
     // 调用策略的 onOrder 回调（如果有）
     if (this.strategy.onOrder) {
       const ctx = this.createContext();
@@ -433,6 +456,12 @@ export class LiveEngine {
     }
     
     this.orders.push(order);
+    
+    // P0-3: 如果订单未完成，加入跟踪列表
+    if (order.status === 'PENDING' || order.status === 'PARTIAL_FILLED') {
+      this.trackedOrderIds.add(order.orderId);
+      console.log(`[LiveEngine] 开始跟踪订单: ${order.orderId}`);
+    }
     
     // 调用策略的 onOrder 回调（如果有）
     if (this.strategy.onOrder) {
@@ -584,5 +613,80 @@ export class LiveEngine {
    */
   getOrders(): Order[] {
     return [...this.orders];
+  }
+  
+  /**
+   * P0-3: 启动订单状态轮询
+   */
+  private startOrderPolling(): void {
+    if (!this.provider || !this.provider.getOrders) {
+      console.log(`[LiveEngine] Provider 不支持订单轮询，跳过`);
+      return;
+    }
+    
+    console.log(`[LiveEngine] 启动订单状态轮询（间隔 ${this.orderPollInterval}ms）`);
+    
+    this.orderPollTimer = setInterval(() => {
+      this.pollOrderStatus().catch((err) => {
+        console.error(`[LiveEngine] 订单状态轮询失败:`, err.message);
+      });
+    }, this.orderPollInterval);
+  }
+  
+  /**
+   * P0-3: 轮询订单状态
+   */
+  private async pollOrderStatus(): Promise<void> {
+    if (!this.provider || !this.provider.getOrders) {
+      return;
+    }
+    
+    // 如果没有跟踪的订单，跳过
+    if (this.trackedOrderIds.size === 0) {
+      return;
+    }
+    
+    try {
+      // 获取所有订单
+      const orders = await this.provider.getOrders();
+      
+      // 检查跟踪的订单
+      for (const orderId of this.trackedOrderIds) {
+        const order = orders.find(o => o.orderId === orderId);
+        
+        if (!order) {
+          console.warn(`[LiveEngine] 订单 ${orderId} 未找到，移除跟踪`);
+          this.trackedOrderIds.delete(orderId);
+          continue;
+        }
+        
+        // 检查订单状态变化
+        const localOrder = this.orders.find(o => o.orderId === orderId);
+        if (!localOrder) {
+          continue;
+        }
+        
+        // 如果状态发生变化，触发回调
+        if (localOrder.status !== order.status) {
+          console.log(`[LiveEngine] 订单状态更新: ${orderId} ${localOrder.status} → ${order.status}`);
+          
+          // 更新本地订单
+          Object.assign(localOrder, order);
+          
+          // 调用策略的 onOrder 回调
+          if (this.strategy.onOrder) {
+            const ctx = this.createContext();
+            await this.strategy.onOrder(order, ctx);
+          }
+          
+          // 如果订单已完成，移除跟踪
+          if (order.status === 'FILLED' || order.status === 'CANCELED') {
+            this.trackedOrderIds.delete(orderId);
+          }
+        }
+      }
+    } catch (error: any) {
+      console.error(`[LiveEngine] 订单状态轮询异常:`, error.message);
+    }
   }
 }

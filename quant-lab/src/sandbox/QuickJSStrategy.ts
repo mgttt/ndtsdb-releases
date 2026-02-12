@@ -287,10 +287,40 @@ export class QuickJSStrategy {
   }
 
   /**
-   * 订单更新（可选）
+   * P0-3: 订单更新（通知策略）
    */
   async onOrder?(order: Order, ctx: StrategyContext): Promise<void> {
-    // TODO: 通知策略订单状态变化
+    if (!this.initialized || !this.ctx || !this.rt) {
+      return;
+    }
+
+    // 检查策略是否定义了 st_onOrderUpdate 函数
+    const globalHandle = this.ctx.global;
+    const stOnOrderUpdateHandle = this.ctx.getProp(globalHandle, 'st_onOrderUpdate');
+    const isFunction = this.ctx.typeof(stOnOrderUpdateHandle) === 'function';
+    stOnOrderUpdateHandle.dispose();
+
+    if (!isFunction) {
+      // 策略没有定义 st_onOrderUpdate，跳过
+      return;
+    }
+
+    try {
+      // 调用 st_onOrderUpdate(order)
+      const orderJson = JSON.stringify(order);
+      const code = `st_onOrderUpdate(${orderJson})`;
+      const result = this.ctx.evalCode(code);
+      
+      if (result.error) {
+        const errorMsg = this.ctx.dump(result.error);
+        console.error(`[QuickJSStrategy] st_onOrderUpdate 执行失败:`, errorMsg);
+        result.error.dispose();
+      } else {
+        result.value.dispose();
+      }
+    } catch (error: any) {
+      console.error(`[QuickJSStrategy] st_onOrderUpdate 调用异常:`, error.message);
+    }
   }
 
   /**
