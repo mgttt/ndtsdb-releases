@@ -396,6 +396,22 @@ export class BybitProvider implements TradingProvider {
   }
   
   /**
+   * 获取最新报价
+   */
+  async getTicker(symbol: string): Promise<{ lastPrice: number; volume24h: number }> {
+    const result = await this.request('GET', '/v5/market/tickers', {
+      category: this.category,
+      symbol,
+    });
+    const ticker = result.result?.list?.[0];
+    if (!ticker) throw new Error(`Ticker not found: ${symbol}`);
+    return {
+      lastPrice: parseFloat(ticker.lastPrice),
+      volume24h: parseFloat(ticker.volume24h || '0'),
+    };
+  }
+
+  /**
    * 发送 REST API 请求
    */
   private async request(

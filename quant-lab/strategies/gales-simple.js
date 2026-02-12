@@ -11,14 +11,14 @@
 const CONFIG = {
   symbol: 'MYXUSDT',
   gridCount: 5,
-  gridSpacing: 0.01,           // 默认网格间距（向后兼容）
+  gridSpacing: 0.02,           // 默认网格间距（向后兼容）
   orderSize: 10,               // 默认订单大小（向后兼容）
 
   // 非对称网格支持（可选，不传时使用 gridSpacing/orderSize）
-  gridSpacingUp: null,         // 升方向（Sell）网格间距，如 0.02
-  gridSpacingDown: null,       // 跌方向（Buy）网格间距，如 0.04
-  orderSizeUp: null,           // 升方向（Sell）订单大小，如 50
-  orderSizeDown: null,         // 跌方向（Buy）订单大小，如 100
+  gridSpacingUp: 0.02,         // 升方向（Sell）网格间距，如 0.02
+  gridSpacingDown: 0.04,       // 跌方向（Buy）网格间距，如 0.04
+  orderSizeUp: 50,             // 升方向（Sell）订单大小，如 50
+  orderSizeDown: 100,          // 跌方向（Buy）订单大小，如 100
 
   maxPosition: 100,
 
@@ -54,7 +54,7 @@ const CONFIG = {
   // long: 只做多，卖单仅记账（虚仓）
   // short: 只做空，买单仅记账（虚仓）
   // neutral: 双向交易
-  direction: 'neutral',
+  direction: 'short',
 
   // 熔断机制 (P0 修复)
   circuitBreaker: {
@@ -280,7 +280,14 @@ function checkCircuitBreaker() {
   
   // 1. 回撤熔断
   if (circuitBreakerState.highWaterMark === 0) {
-    circuitBreakerState.highWaterMark = CONFIG.maxPosition;
+    // 冷启动：用当前权益初始化，没持仓时跳过回撤检查
+    const initEquity = Math.abs(state.positionNotional);
+    if (initEquity === 0) {
+      // 没持仓不检查回撤（避免 0/maxPosition = 100% 误触发）
+      circuitBreakerState.highWaterMark = 0;
+    } else {
+      circuitBreakerState.highWaterMark = initEquity;
+    }
   }
   
   const equity = Math.abs(state.positionNotional);
@@ -288,18 +295,21 @@ function checkCircuitBreaker() {
     circuitBreakerState.highWaterMark = equity;
   }
   
-  const drawdown = (circuitBreakerState.highWaterMark - equity) / circuitBreakerState.highWaterMark;
-  if (drawdown > cb.maxDrawdown) {
-    circuitBreakerState.tripped = true;
-    circuitBreakerState.reason = '回撤熔断';
-    circuitBreakerState.tripAt = now;
-    
-    logWarn('[熔断触发] 回撤熔断 drawdown=' + (drawdown * 100).toFixed(2) + '%');
-    
-    // 撤销所有订单
-    cancelAllOrders();
-    
-    return true;
+  // highWaterMark 为 0 时跳过回撤检查（没有持仓历史，避免 0 除法误触发）
+  if (circuitBreakerState.highWaterMark > 0) {
+    const drawdown = (circuitBreakerState.highWaterMark - equity) / circuitBreakerState.highWaterMark;
+    if (drawdown > cb.maxDrawdown) {
+      circuitBreakerState.tripped = true;
+      circuitBreakerState.reason = '回撤熔断';
+      circuitBreakerState.tripAt = now;
+      
+      logWarn('[熔断触发] 回撤熔断 drawdown=' + (drawdown * 100).toFixed(2) + '%');
+      
+      // 撤销所有订单
+      cancelAllOrders();
+      
+      return true;
+    }
   }
   
   // 2. 仓位熔断
