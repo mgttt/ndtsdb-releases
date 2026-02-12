@@ -619,6 +619,12 @@ function hedgeResidual(grid, order) {
 
   // 真实下单：市价单对冲
   try {
+    // 防御性检查：symbol 必须有效
+    if (!CONFIG.symbol || typeof CONFIG.symbol !== 'string' || CONFIG.symbol.length === 0) {
+      logError('[hedgeResidual] CONFIG.symbol 无效: ' + CONFIG.symbol);
+      throw new Error('Invalid symbol: ' + CONFIG.symbol);
+    }
+
     const hedgeParams = {
       symbol: CONFIG.symbol,
       side: hedgeSide,
@@ -1068,6 +1074,15 @@ function st_onParamsUpdate(newParamsJson) {
     CONFIG.direction = newParams.direction;
     logInfo('[Gales] 策略方向: ' + CONFIG.direction);
   }
+  // symbol 热更新（防御性检查）
+  if (newParams.symbol !== undefined) {
+    if (newParams.symbol && typeof newParams.symbol === 'string' && newParams.symbol.length > 0) {
+      CONFIG.symbol = newParams.symbol;
+      logInfo('[Gales] 交易对: ' + CONFIG.symbol);
+    } else {
+      logWarn('[Gales] 忽略无效的 symbol: ' + newParams.symbol);
+    }
+  }
 
   // 重新初始化网格（保持当前价格）
   if (state.initialized) {
@@ -1328,6 +1343,12 @@ function placeOrder(grid) {
 
   // TODO: 真实下单（通过 bridge_placeOrder）
   try {
+    // 防御性检查：symbol 必须有效
+    if (!CONFIG.symbol || typeof CONFIG.symbol !== 'string' || CONFIG.symbol.length === 0) {
+      logError('[placeOrder] CONFIG.symbol 无效: ' + CONFIG.symbol);
+      throw new Error('Invalid symbol: ' + CONFIG.symbol);
+    }
+
     const params = {
       symbol: CONFIG.symbol,
       side: grid.side,

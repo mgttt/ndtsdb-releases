@@ -559,6 +559,10 @@ export class BybitProvider implements TradingProvider {
    * 解析订单响应
    */
   private parseOrder(data: any): Order {
+    if (!data || !data.symbol) {
+      console.warn('[BybitProvider] parseOrder: invalid data', data);
+      throw new Error('Invalid order data: missing symbol');
+    }
     return {
       id: `${data.symbol}:${data.orderId}`,
       symbol: this.fromExchangeSymbol(data.symbol),
@@ -615,6 +619,10 @@ export class BybitProvider implements TradingProvider {
    * 转换符号格式：BTCUSDT → BTC/USDT
    */
   private fromExchangeSymbol(symbol: string): string {
+    if (!symbol || typeof symbol !== 'string') {
+      console.warn('[BybitProvider] fromExchangeSymbol: invalid symbol', symbol);
+      return symbol || 'UNKNOWN';
+    }
     if (symbol.endsWith('USDT')) {
       return `${symbol.slice(0, -4)}/USDT`;
     }
