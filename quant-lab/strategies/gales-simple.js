@@ -61,7 +61,8 @@ const CONFIG = {
 
 // 从 ctx.strategy.params 覆盖参数
 if (typeof ctx !== 'undefined' && ctx && ctx.strategy && ctx.strategy.params) {
-  const p = ctx.strategy.params;
+  const rawParams = ctx.strategy.params;
+  const p = (typeof rawParams === 'string') ? JSON.parse(rawParams) : rawParams;
   if (p.symbol) CONFIG.symbol = p.symbol;
   if (p.gridCount) CONFIG.gridCount = p.gridCount;
   if (p.gridSpacing) CONFIG.gridSpacing = p.gridSpacing;

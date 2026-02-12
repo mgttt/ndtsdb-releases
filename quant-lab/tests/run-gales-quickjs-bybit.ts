@@ -365,8 +365,12 @@ class QuickJSStrategyEngine {
     const strategyHandle = this.ctx.newObject();
     const paramsHandle = this.ctx.newString(JSON.stringify({
       symbol: 'MYXUSDT',
-      gridCount: 5,
-      simMode: false, // paper trade
+      direction: 'short',
+      gridSpacingUp: 0.02,
+      gridSpacingDown: 0.04,
+      orderSizeUp: 50,
+      orderSizeDown: 100,
+      simMode: false, // 实盘
     }));
 
     this.ctx.setProp(strategyHandle, 'id', this.ctx.newString('gales-quickjs'));
