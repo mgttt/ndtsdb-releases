@@ -21,6 +21,7 @@ export interface BybitProviderConfig {
   apiKey: string;
   apiSecret: string;
   testnet?: boolean;
+  demo?: boolean;  // Demo Trading 模式 (api-demo.bybit.com)
   proxy?: string;
   category?: 'spot' | 'linear' | 'inverse';  // 产品类型
 }
@@ -69,7 +70,13 @@ export class BybitProvider implements TradingProvider {
     this.config = config;
     this.category = config.category || 'linear';
     
-    if (config.testnet) {
+    if (config.demo) {
+      // Demo Trading 模式: api-demo.bybit.com
+      // 公共数据流仍用主网 (demo 只支持私有流)
+      this.baseUrl = 'https://api-demo.bybit.com';
+      this.wsUrl = `wss://stream.bybit.com/v5/public/${this.category}`;
+      console.log('[BybitProvider] Demo Trading 模式');
+    } else if (config.testnet) {
       this.baseUrl = 'https://api-testnet.bybit.com';
       this.wsUrl = `wss://stream-testnet.bybit.com/v5/public/${this.category}`;
     } else {
