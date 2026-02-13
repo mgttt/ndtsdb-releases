@@ -285,7 +285,28 @@ export class BybitProvider implements TradingProvider {
       params.price = price.toString();
     }
     
-    const result = await this.request('POST', '/v5/order/create', params);
+    console.log(`[BybitProvider] 下单请求: Buy ${quantity} ${symbol} @ ${price || 'Market'}`);
+    
+    let result: any;
+    try {
+      result = await this.request('POST', '/v5/order/create', params);
+    } catch (error: any) {
+      console.error(`[BybitProvider] 下单失败: ${error.message}`);
+      throw error;
+    }
+    
+    if (!result || !result.result) {
+      console.error(`[BybitProvider] 下单响应异常:`, result);
+      throw new Error('Order response missing result field');
+    }
+    
+    if (!result.result.orderId) {
+      console.error(`[BybitProvider] 下单响应缺少 orderId:`, result.result);
+      throw new Error('Order response missing orderId');
+    }
+    
+    console.log(`[BybitProvider] 下单成功: orderId=${result.result.orderId}`);
+    
     // 兼容 order/create 精简返回：补充调用时的参数
     return this.parseOrder({
       ...result.result,
@@ -313,7 +334,28 @@ export class BybitProvider implements TradingProvider {
       params.price = price.toString();
     }
     
-    const result = await this.request('POST', '/v5/order/create', params);
+    console.log(`[BybitProvider] 下单请求: Sell ${quantity} ${symbol} @ ${price || 'Market'}`);
+    
+    let result: any;
+    try {
+      result = await this.request('POST', '/v5/order/create', params);
+    } catch (error: any) {
+      console.error(`[BybitProvider] 下单失败: ${error.message}`);
+      throw error;
+    }
+    
+    if (!result || !result.result) {
+      console.error(`[BybitProvider] 下单响应异常:`, result);
+      throw new Error('Order response missing result field');
+    }
+    
+    if (!result.result.orderId) {
+      console.error(`[BybitProvider] 下单响应缺少 orderId:`, result.result);
+      throw new Error('Order response missing orderId');
+    }
+    
+    console.log(`[BybitProvider] 下单成功: orderId=${result.result.orderId}`);
+    
     // 兼容 order/create 精简返回：补充调用时的参数
     return this.parseOrder({
       ...result.result,
@@ -552,13 +594,38 @@ export class BybitProvider implements TradingProvider {
       args.push('--data', body);
     }
 
-    const out = execFileSync('curl', args, { encoding: 'utf8' });
+    let out: string;
+    try {
+      out = execFileSync('curl', args, { encoding: 'utf8' });
+    } catch (error: any) {
+      // SSL 错误或其他 curl 失败
+      const errorMsg = error.stderr?.toString() || error.message || 'Unknown curl error';
+      console.error(`[BybitProvider] Curl failed: ${errorMsg}`);
+      console.error(`[BybitProvider] Command: curl ${args.join(' ')}`);
+      throw new Error(`Bybit API request failed (curl): ${errorMsg}`);
+    }
+
     const text = (out || '').trim();
 
+    if (!text) {
+      throw new Error('Bybit API returned empty response');
+    }
+
     try {
-      return text ? JSON.parse(text) : null;
-    } catch {
-      throw new Error(`Bybit curl 响应不是 JSON: ${text.slice(0, 300)}`);
+      const result = JSON.parse(text);
+      
+      // 检查 Bybit API 错误响应
+      if (result.retCode !== 0) {
+        console.error(`[BybitProvider] API error: ${result.retMsg} (code: ${result.retCode})`);
+        throw new Error(`Bybit API error: ${result.retMsg}`);
+      }
+      
+      return result;
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error(`Bybit curl 响应不是 JSON: ${text.slice(0, 300)}`);
+      }
+      throw error;
     }
   }
 
