@@ -465,7 +465,9 @@ export class TradingViewProvider extends WebSocketDataProvider {
     
     // BYBIT:BTCUSDT → BTC/USDT
     const parts = symbol.split(':');
-    const pair = parts.length > 1 ? parts[1] : parts[0];
+    const rawPair = parts.length > 1 ? parts[1] : parts[0];
+    // TradingView perpetual contract suffix: MYXUSDT.P -> MYXUSDT
+    const pair = rawPair.endsWith('.P') ? rawPair.slice(0, -2) : rawPair;
     
     if (pair.endsWith('USDT')) {
       const base = pair.replace('USDT', '');
