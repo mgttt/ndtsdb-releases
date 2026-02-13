@@ -531,12 +531,21 @@ export class BybitProvider implements TradingProvider {
       options.body = body;
     }
     
-    const response = await undiciFetch(url, {
-      ...options,
-      dispatcher: this.proxyAgent,
-    } as any);
+    let response: any;
+    let text: string;
+    
+    try {
+      response = await undiciFetch(url, {
+        ...options,
+        dispatcher: this.proxyAgent,
+      } as any);
 
-    const text = await response.text();
+      text = await response.text();
+    } catch (fetchError: any) {
+      // Fetch 失败（SSL 错误、网络错误等）→ fallback 到 curl
+      console.warn(`[BybitProvider] Fetch failed (${method} ${endpoint}): ${fetchError.message}, fallback to curl`);
+      return this.requestViaCurl(method, url, body || undefined, options.headers as any);
+    }
 
     // CloudFront region block page (HTML)
     const isCloudFrontBlock =
@@ -544,7 +553,7 @@ export class BybitProvider implements TradingProvider {
       text.includes('The request could not be satisfied');
 
     if (isCloudFrontBlock) {
-      // Fallback to curl with explicit --proxy (works more reliably in some environments)
+      console.warn(`[BybitProvider] CloudFront 403 detected (${method} ${endpoint}), fallback to curl`);
       return this.requestViaCurl(method, url, body || undefined, options.headers as any);
     }
 
