@@ -762,8 +762,13 @@ function applyActiveOrderPolicy(grid, distance) {
  */
 function st_onOrderUpdate(orderJson) {
   try {
+    logDebug('[DEBUG] st_onOrderUpdate called, raw: ' + typeof orderJson);
     const order = (typeof orderJson === 'string') ? JSON.parse(orderJson) : orderJson;
-    if (!order || !order.orderId) return;
+    logDebug('[DEBUG] parsed order: ' + JSON.stringify(order));
+    if (!order || !order.orderId) {
+      logDebug('[DEBUG] st_onOrderUpdate early return: no orderId');
+      return;
+    }
 
     onOrderUpdate(order);
 
@@ -899,6 +904,7 @@ function printGridStatus() {
  * 初始化
  */
 function st_init() {
+  logDebug('[DEBUG] st_init called');
   logInfo('策略初始化...');
   logInfo('Symbol: ' + CONFIG.symbol);
   logInfo('GridCount: ' + CONFIG.gridCount);
@@ -1391,6 +1397,7 @@ function placeOrder(grid) {
       qty: quantity,
       price: orderPrice,
       orderLinkId: orderLinkId,
+      gridId: grid.id,  // P0 修复：必须传递 gridId（notifyOrderUpdate 依赖）
     };
 
     const result = bridge_placeOrder(JSON.stringify(params));

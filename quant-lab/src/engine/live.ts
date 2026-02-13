@@ -22,8 +22,8 @@ import { KlineDatabase, StreamingIndicators } from 'quant-lib';
 export interface TradingProvider {
   subscribeKlines(symbols: string[], interval: string, callback: (bar: Kline) => void): Promise<void>;
   subscribeTicks?(symbols: string[], callback: (tick: Tick) => void): Promise<void>;
-  buy(symbol: string, quantity: number, price?: number): Promise<Order>;
-  sell(symbol: string, quantity: number, price?: number): Promise<Order>;
+  buy(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order>;
+  sell(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order>;
   cancelOrder(orderId: string): Promise<void>;
   getAccount(): Promise<Account>;
   getPosition(symbol: string): Promise<Position | null>;
@@ -362,17 +362,19 @@ export class LiveEngine {
   /**
    * 买入（开多仓或平空仓）
    */
-  private async buy(symbol: string, quantity: number, price?: number): Promise<Order> {
+  private async buy(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     // 检查风控
     if (this.config.maxPositionSize && quantity > this.config.maxPositionSize) {
       throw new Error(`Position size ${quantity} exceeds max ${this.config.maxPositionSize}`);
     }
     
+    console.log(`[LiveEngine] [P0 DEBUG] buy() 收到参数: symbol=${symbol}, qty=${quantity}, price=${price}, orderLinkId=${orderLinkId}`);
+    
     let order: Order;
     
     if (this.provider) {
       // 使用 Provider 执行订单
-      order = await this.provider.buy(symbol, quantity, price);
+      order = await this.provider.buy(symbol, quantity, price, orderLinkId);
       console.log(`[LiveEngine] 买入订单成交（Provider）: ${symbol} ${quantity} @ ${order.filledPrice}`);
     } else {
       // 无 Provider：模拟成交
@@ -421,12 +423,14 @@ export class LiveEngine {
   /**
    * 卖出（开空仓或平多仓）
    */
-  private async sell(symbol: string, quantity: number, price?: number): Promise<Order> {
+  private async sell(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
+    console.log(`[LiveEngine] [P0 DEBUG] sell() 收到参数: symbol=${symbol}, qty=${quantity}, price=${price}, orderLinkId=${orderLinkId}`);
+    
     let order: Order;
     
     if (this.provider) {
       // 使用 Provider 执行订单
-      order = await this.provider.sell(symbol, quantity, price);
+      order = await this.provider.sell(symbol, quantity, price, orderLinkId);
       console.log(`[LiveEngine] 卖出订单成交（Provider）: ${symbol} ${quantity} @ ${order.filledPrice}`);
     } else {
       // 无 Provider：模拟成交

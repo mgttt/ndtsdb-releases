@@ -294,6 +294,9 @@ export class BybitProvider implements TradingProvider {
       params.orderLinkId = orderLinkId;
     }
     
+    // P0 DEBUG：确认 orderLinkId 是否被传递
+    console.log(`[BybitProvider] [P0 DEBUG] buy() 参数:`, { symbol, quantity, price, orderLinkId });
+    console.log(`[BybitProvider] [P0 DEBUG] buy() params:`, params);
     console.log(`[BybitProvider] 下单请求: Buy ${quantity} ${symbol} @ ${price || 'Market'}`);
     
     let result: any;
@@ -347,6 +350,9 @@ export class BybitProvider implements TradingProvider {
       params.orderLinkId = orderLinkId;
     }
     
+    // P0 DEBUG：确认 orderLinkId 是否被传递
+    console.log(`[BybitProvider] [P0 DEBUG] sell() 参数:`, { symbol, quantity, price, orderLinkId });
+    console.log(`[BybitProvider] [P0 DEBUG] sell() params:`, params);
     console.log(`[BybitProvider] 下单请求: Sell ${quantity} ${symbol} @ ${price || 'Market'}`);
     
     let result: any;
@@ -549,6 +555,12 @@ export class BybitProvider implements TradingProvider {
       'Accept': 'application/json',
       'User-Agent': 'quant-lab/3.0',
     };
+    
+    // P0 DEBUG：打印实际发送的 body（特别是下单请求）
+    if (method === 'POST' && endpoint === '/v5/order/create') {
+      console.log(`[BybitProvider] [P0 DEBUG] 下单请求 body:`, body);
+      console.log(`[BybitProvider] [P0 DEBUG] 下单请求 params:`, params);
+    }
     
     // 直接使用 curl（避免 undici fetch 被 CloudFront WAF 拦截）
     return this.requestViaCurl(method, url, body || undefined, headers);

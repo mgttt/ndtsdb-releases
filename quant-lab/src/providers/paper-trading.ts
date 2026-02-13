@@ -85,7 +85,7 @@ export class PaperTradingProvider {
   /**
    * 买入
    */
-  async buy(symbol: string, quantity: number, price?: number): Promise<Order> {
+  async buy(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     const lastPrice = this.lastPrices.get(symbol);
     if (!lastPrice && !price) {
       throw new Error(`No price available for ${symbol}`);
@@ -106,7 +106,7 @@ export class PaperTradingProvider {
     
     // 创建订单
     const order: Order = {
-      orderId: `PAPER-${this.nextOrderId++}`,
+      orderId: orderLinkId || `PAPER-${this.nextOrderId++}`,  // P0 修复：使用 orderLinkId（如果提供）
       symbol,
       side: 'BUY',
       type: price ? 'LIMIT' : 'MARKET',
@@ -137,7 +137,7 @@ export class PaperTradingProvider {
   /**
    * 卖出
    */
-  async sell(symbol: string, quantity: number, price?: number): Promise<Order> {
+  async sell(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     const lastPrice = this.lastPrices.get(symbol);
     if (!lastPrice && !price) {
       throw new Error(`No price available for ${symbol}`);
@@ -153,7 +153,7 @@ export class PaperTradingProvider {
     
     // 创建订单
     const order: Order = {
-      orderId: `PAPER-${this.nextOrderId++}`,
+      orderId: orderLinkId || `PAPER-${this.nextOrderId++}`,  // P0 修复：使用 orderLinkId（如果提供）
       symbol,
       side: 'SELL',
       type: price ? 'LIMIT' : 'MARKET',

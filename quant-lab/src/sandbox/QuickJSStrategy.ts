@@ -328,6 +328,36 @@ export class QuickJSStrategy {
   }
 
   /**
+   * P0 修复：通知策略订单更新（pending → 真实 orderId）
+   */
+  notifyOrderUpdate(orderUpdate: { orderId: string; gridId?: number; status?: string; cumQty?: number; avgPrice?: number }): void {
+    if (!this.initialized || !this.ctx) {
+      console.warn(`[QuickJSStrategy] notifyOrderUpdate: 策略未初始化`);
+      return;
+    }
+
+    console.log(`[QuickJSStrategy] notifyOrderUpdate: 通知策略订单更新`, orderUpdate);
+
+    try {
+      // 调用沙箱里的 st_onOrderUpdate
+      const orderJson = JSON.stringify(orderUpdate);
+      const code = `st_onOrderUpdate(${orderJson})`;
+      const result = this.ctx.evalCode(code);
+      
+      if (result.error) {
+        const errorMsg = this.ctx.dump(result.error);
+        console.error(`[QuickJSStrategy] notifyOrderUpdate 执行失败:`, errorMsg);
+        result.error.dispose();
+      } else {
+        console.log(`[QuickJSStrategy] notifyOrderUpdate 执行成功`);
+        result.value.dispose();
+      }
+    } catch (error: any) {
+      console.error(`[QuickJSStrategy] notifyOrderUpdate 调用异常:`, error.message);
+    }
+  }
+
+  /**
    * 热更新参数（不重启沙箱）
    */
   async updateParams(newParams: Record<string, any>): Promise<void> {
@@ -429,6 +459,10 @@ export class QuickJSStrategy {
 
         let order: Order;
         
+        console.log(`[QuickJSStrategy] processPendingOrders: 下单参数`, params);
+        console.log(`[QuickJSStrategy] [P0 DEBUG] 准备调用 ${params.side}(symbol=${params.symbol}, qty=${params.qty}, price=${params.price}, orderLinkId=${params.orderLinkId})`);
+        console.log(`[QuickJSStrategy] [P0 DEBUG] gridId=${params.gridId}`);
+        
         if (params.side === 'Buy') {
           order = await this.strategyCtx.buy(
             params.symbol,
@@ -445,8 +479,23 @@ export class QuickJSStrategy {
           );
         }
 
+        console.log(`[QuickJSStrategy] processPendingOrders: 下单成功`, { orderId: order.id, symbol: order.symbol, gridId: params.gridId });
+
+        // P0 关键修复：下单成功后必须通知策略（回写真实 orderId）
+        if (params.gridId) {
+          this.notifyOrderUpdate({
+            orderId: order.id,
+            gridId: params.gridId,
+            status: order.status,
+            cumQty: order.filledQty || 0,
+            avgPrice: order.avgPrice || order.price || 0,
+          });
+          console.log(`[QuickJSStrategy] processPendingOrders: 已通知策略 gridId=${params.gridId} orderId=${order.id}`);
+        }
+
         resolve({ orderId: order.id });
       } catch (error: any) {
+        console.error(`[QuickJSStrategy] processPendingOrders: 下单失败`, error);
         reject(error);
       }
     }
@@ -527,7 +576,9 @@ export class QuickJSStrategy {
       const paramsJson = this.ctx!.getString(paramsHandle);
       const params = JSON.parse(paramsJson);
 
-      console.log(`[QuickJSStrategy] 下单请求:`, params);
+      console.log(`[QuickJSStrategy] bridge_placeOrder 收到 paramsJson:`, paramsJson);
+      console.log(`[QuickJSStrategy] bridge_placeOrder 解析后 params:`, params);
+      console.log(`[QuickJSStrategy] [P0 DEBUG] gridId=${params.gridId}, orderLinkId=${params.orderLinkId}`);
 
       // 加入待处理队列（下次 tick 时执行）
       const tempId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
