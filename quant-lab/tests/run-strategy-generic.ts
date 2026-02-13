@@ -3,10 +3,11 @@
  * 通用策略启动器
  * 
  * 用法:
- *   bun tests/run-strategy-generic.ts <strategy-file> [--live] [params-json] [exchange] [account]
+ *   bun tests/run-strategy-generic.ts <strategy-file> [--live] [--demo] [params-json] [exchange] [account]
  * 
  * 参数:
  *   --live          实盘模式（连接真实订单流；需环境变量 DRY_RUN=false）
+ *   --demo          Demo Trading 模式（使用 api-demo.bybit.com）
  *   params-json     策略参数 JSON（默认 {}）
  *   exchange        交易所（默认 bybit）
  *   account         账号别名（默认 wjcgm@bbt-sub1）
@@ -17,6 +18,9 @@
  *   
  *   # 实盘模式
  *   DRY_RUN=false bun tests/run-strategy-generic.ts ./strategies/gales-simple.js --live
+ *   
+ *   # Demo Trading 模式
+ *   bun tests/run-strategy-generic.ts ./strategies/gales-simple.js --demo '{"symbol":"MYXUSDT"}'
  *   
  *   # 自定义参数
  *   bun tests/run-strategy-generic.ts ./strategies/gales-simple.js --live '{"gridCount":10}' bybit wjcgm@bbt-sub1
@@ -40,11 +44,15 @@ if (args.length === 0) {
 
 const strategyFile = args[0];
 let liveMode = false;
+let demoMode = false;
 let argIdx = 1;
 
-// 检查 --live 参数
+// 检查 --live 和 --demo 参数
 if (args[1] === '--live') {
   liveMode = true;
+  argIdx = 2;
+} else if (args[1] === '--demo') {
+  demoMode = true;
   argIdx = 2;
 }
 
@@ -106,6 +114,7 @@ async function main() {
     exchange,
     accountId,
     liveMode,
+    demoMode,
     isDryRun,
   });
 
@@ -117,25 +126,50 @@ async function main() {
     console.warn('🔴 [实盘模式] 连接真实订单流！');
   }
 
+  if (demoMode) {
+    console.warn('🟡 [Demo Trading 模式] 使用 api-demo.bybit.com');
+  }
+
   // 1. 初始化交易所连接
   let provider: any;
 
   if (exchange === 'bybit') {
-    const accountConfig = ACCOUNTS[accountId as keyof typeof ACCOUNTS];
-    if (!accountConfig) {
-      console.error(`未找到账号配置: ${accountId}`);
-      process.exit(1);
+    if (demoMode) {
+      // Demo Trading 模式：使用环境变量中的 Demo API Key
+      const demoApiKey = process.env.BYBIT_DEMO_API_KEY;
+      const demoApiSecret = process.env.BYBIT_DEMO_API_SECRET;
+      
+      if (!demoApiKey || !demoApiSecret) {
+        console.error('错误: Demo 模式需要设置 BYBIT_DEMO_API_KEY 和 BYBIT_DEMO_API_SECRET 环境变量');
+        process.exit(1);
+      }
+
+      provider = new BybitProvider({
+        apiKey: demoApiKey,
+        apiSecret: demoApiSecret,
+        demo: true,
+        proxy: 'http://127.0.0.1:8890',
+        category: 'linear',
+      });
+
+      console.log('[Exchange] Bybit Provider 初始化完成 (Demo Trading)\n');
+    } else {
+      const accountConfig = ACCOUNTS[accountId as keyof typeof ACCOUNTS];
+      if (!accountConfig) {
+        console.error(`未找到账号配置: ${accountId}`);
+        process.exit(1);
+      }
+
+      provider = new BybitProvider({
+        apiKey: accountConfig.apiKey,
+        apiSecret: accountConfig.apiSecret,
+        testnet: accountConfig.testnet || false,
+        proxy: accountConfig.proxy || 'http://127.0.0.1:8890',
+        category: 'linear',
+      });
+
+      console.log(`[Exchange] Bybit Provider 初始化完成 (${accountId})\n`);
     }
-
-    provider = new BybitProvider({
-      apiKey: accountConfig.apiKey,
-      apiSecret: accountConfig.apiSecret,
-      testnet: accountConfig.testnet || false,
-      proxy: accountConfig.proxy || 'http://127.0.0.1:8890',
-      category: 'linear',
-    });
-
-    console.log(`[Exchange] Bybit Provider 初始化完成 (${accountId})\n`);
   } else {
     console.error(`暂不支持的交易所: ${exchange}`);
     process.exit(1);

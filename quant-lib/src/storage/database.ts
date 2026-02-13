@@ -33,7 +33,7 @@ export class KlineDatabase {
   private tables: Map<string, PartitionedTable> = new Map(); // interval -> PartitionedTable
   private config: DatabaseConfig;
 
-  constructor(config: DatabaseConfig | string = './data/ndtsdb-v2') {
+  constructor(config: DatabaseConfig | string = `${process.env.HOME}/.quant-lib/data/ndtsdb-v2`) {
     if (typeof config === 'string') {
       this.config = {
         path: config,
@@ -47,7 +47,7 @@ export class KlineDatabase {
         autoInit: true,
         ...config
       };
-      this.dataDir = config.path || './data/ndtsdb-v2';
+      this.dataDir = config.path || `${process.env.HOME}/.quant-lib/data/ndtsdb-v2`;
     }
 
     // 确保目录存在

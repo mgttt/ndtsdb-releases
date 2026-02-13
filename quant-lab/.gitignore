@@ -1,5 +1,6 @@
 # 运行时数据（不提交）
 runtime/
+state/
 
 # 敏感配置（如果有的话）
 pools/*-prod.jsonl
@@ -7,3 +8,12 @@ pools/*-prod.jsonl
 # 临时文件
 *.tmp
 *.bak
+dist/
+state/
+runtime/
+pools/
+.ipc/
+data/
+logs/
+*.duckdb
+node_modules/

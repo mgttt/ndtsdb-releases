@@ -38,7 +38,7 @@ export class DatabaseFactory {
     this.config = {
       defaultProvider: 'ndtsdb',
       providers: {
-        ndtsdb: { type: 'ndtsdb', dataDir: './data/ndtsdb' },
+        ndtsdb: { type: 'ndtsdb', dataDir: process.env.QUANT_DATA_DIR || `${process.env.HOME}/.quant-lib/data/ndtsdb` },
         memory: { type: 'memory' }
       },
       ...config

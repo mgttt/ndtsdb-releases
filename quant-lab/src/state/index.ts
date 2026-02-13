@@ -11,10 +11,14 @@ export class StateManager {
 
   /**
    * 创建状态管理器
-   * @param stateDir 状态文件保存目录（默认：./runtime/state）
+   * @param stateDir 状态文件保存目录（默认：~/.quant-lab/state/）
    */
-  constructor(stateDir: string = './runtime/state') {
-    this.stateDir = stateDir.replace(/\/$/, ''); // 去除尾部斜杠
+  constructor(stateDir?: string) {
+    // 默认：~/.quant-lab/state/ （支持环境变量 QUANT_STATE_DIR 覆盖）
+    const defaultStateDir = process.env.QUANT_STATE_DIR || 
+                           `${process.env.HOME || process.env.USERPROFILE || '.'}/.quant-lab/state`;
+    
+    this.stateDir = (stateDir || defaultStateDir).replace(/\/$/, ''); // 去除尾部斜杠
   }
 
   /**

@@ -68,7 +68,7 @@ export class NdtsdbProvider implements DatabaseProvider {
 
   constructor(config: DatabaseProviderConfig) {
     this.config = {
-      dataDir: './data/ndtsdb',
+      dataDir: process.env.QUANT_DATA_DIR || join(process.env.HOME || '', '.quant-lib/data/ndtsdb'),
       partitionBy: 'day',
       cacheSize: 100000,
       ...config,

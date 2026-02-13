@@ -64,8 +64,12 @@ export class QuickJSStrategy {
   private fileLastModified = 0;
 
   constructor(config: QuickJSStrategyConfig) {
+    // 默认 state 目录：~/.quant-lab/state/ （支持环境变量覆盖）
+    const defaultStateDir = process.env.QUANT_STATE_DIR || 
+                           join(process.env.HOME || process.env.USERPROFILE || '.', '.quant-lab/state');
+    
     this.config = {
-      stateDir: './state',
+      stateDir: defaultStateDir,
       timeoutMs: 60000,
       memoryLimitMB: 64,
       params: {},
