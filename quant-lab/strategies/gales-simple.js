@@ -589,6 +589,13 @@ function findGridById(gridId) {
   return null;
 }
 
+function findGridByOrderLinkId(orderLinkId) {
+  for (let i = 0; i < state.gridLevels.length; i++) {
+    if (state.gridLevels[i].orderLinkId === orderLinkId) return state.gridLevels[i];
+  }
+  return null;
+}
+
 function recordFill(grid, order, reason) {
   const fillPct = order.qty > 0 ? ((order.cumQty || 0) / order.qty) : 0;
   grid.lastFillPct = fillPct;
@@ -760,13 +767,42 @@ function st_onOrderUpdate(orderJson) {
 
     onOrderUpdate(order);
 
-    // 同步 grid 状态（如果能定位到 grid）
+    // P0 修复：pending → 真实 orderId 映射回写
+    let grid = null;
+    
+    // 优先通过 gridId 定位
     if (order.gridId) {
-      const grid = findGridById(order.gridId);
-      if (grid && grid.orderId === order.orderId) {
-        // 让 policy 在下一次 heartbeat 统一处理
-        grid.lastExternalUpdateAt = Date.now();
+      grid = findGridById(order.gridId);
+    }
+    
+    // 其次通过 orderLinkId 定位（交易所推送通常带 orderLinkId）
+    if (!grid && order.orderLinkId) {
+      grid = findGridByOrderLinkId(order.orderLinkId);
+      // 补充 gridId 方便后续使用
+      if (grid) {
+        order.gridId = grid.id;
       }
+    }
+    
+    if (grid) {
+      // 关键修复：无论 grid.orderId 是什么，都回写真实 orderId
+      // 场景：grid.orderId = pending-xxx → order.orderId = MYXUSDT:12345678
+      const oldId = grid.orderId;
+      const newId = order.orderId;
+      
+      if (oldId !== newId) {
+        logInfo('[P0] pending → 真实 orderId: ' + oldId + ' → ' + newId + ' (gridId=' + grid.id + ')');
+        grid.orderId = newId;
+        
+        // 同步更新 openOrders 中的 orderId
+        const openOrder = state.openOrders.find(o => o.orderId === oldId);
+        if (openOrder) {
+          openOrder.orderId = newId;
+        }
+      }
+      
+      // 让 policy 在下一次 heartbeat 统一处理
+      grid.lastExternalUpdateAt = Date.now();
     }
 
     saveState();

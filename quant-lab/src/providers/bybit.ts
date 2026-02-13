@@ -12,7 +12,6 @@ import type { Kline } from 'quant-lib';
 import type { TradingProvider } from '../engine/live';
 import { createHmac } from 'crypto';
 import { execFileSync } from 'node:child_process';
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
 
 /**
  * Bybit 配置
@@ -55,7 +54,6 @@ export class BybitProvider implements TradingProvider {
   private baseUrl: string;
   private wsUrl: string;
   private category: string;
-  private proxyAgent?: ProxyAgent;
   
   // WebSocket 连接
   private ws?: WebSocket;
@@ -85,7 +83,7 @@ export class BybitProvider implements TradingProvider {
     }
 
     if (config.proxy) {
-      this.proxyAgent = new ProxyAgent(config.proxy);
+      console.log(`[BybitProvider] 使用代理: ${config.proxy} (curl)`);
       console.log(`[BybitProvider] 使用代理: ${config.proxy}`);
     }
   }
@@ -279,7 +277,7 @@ export class BybitProvider implements TradingProvider {
   /**
    * 买入
    */
-  async buy(symbol: string, quantity: number, price?: number): Promise<Order> {
+  async buy(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     const params: Record<string, any> = {
       category: this.category,
       symbol: this.toExchangeSymbol(symbol),
@@ -290,6 +288,10 @@ export class BybitProvider implements TradingProvider {
     
     if (price) {
       params.price = price.toString();
+    }
+    
+    if (orderLinkId) {
+      params.orderLinkId = orderLinkId;
     }
     
     console.log(`[BybitProvider] 下单请求: Buy ${quantity} ${symbol} @ ${price || 'Market'}`);
@@ -328,7 +330,7 @@ export class BybitProvider implements TradingProvider {
   /**
    * 卖出
    */
-  async sell(symbol: string, quantity: number, price?: number): Promise<Order> {
+  async sell(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     const params: Record<string, any> = {
       category: this.category,
       symbol: this.toExchangeSymbol(symbol),
@@ -339,6 +341,10 @@ export class BybitProvider implements TradingProvider {
     
     if (price) {
       params.price = price.toString();
+    }
+    
+    if (orderLinkId) {
+      params.orderLinkId = orderLinkId;
     }
     
     console.log(`[BybitProvider] 下单请求: Sell ${quantity} ${symbol} @ ${price || 'Market'}`);
@@ -378,8 +384,27 @@ export class BybitProvider implements TradingProvider {
    * 取消订单
    */
   async cancelOrder(orderId: string): Promise<void> {
+    // 检测 pending 订单（本地临时 ID，还未提交到交易所）
+    if (orderId.startsWith('pending-')) {
+      console.log(`[BybitProvider] 跳过撤单：pending 订单未提交到交易所 (${orderId})`);
+      return;
+    }
+    
     // orderId format: "symbol:id"
-    const [symbolPart, id] = orderId.split(':');
+    const parts = orderId.split(':');
+    
+    if (parts.length !== 2) {
+      console.error(`[BybitProvider] Invalid orderId format: ${orderId} (expected "symbol:id")`);
+      throw new Error(`Invalid orderId format: ${orderId} (expected "symbol:id")`);
+    }
+    
+    const [symbolPart, id] = parts;
+    
+    if (!symbolPart || !id) {
+      throw new Error(`Invalid orderId: missing symbol or id (${orderId})`);
+    }
+    
+    console.log(`[BybitProvider] 撤单请求: ${orderId} (symbol=${symbolPart}, id=${id})`);
     
     const params = {
       category: this.category,
@@ -388,6 +413,7 @@ export class BybitProvider implements TradingProvider {
     };
     
     await this.request('POST', '/v5/order/cancel', params);
+    console.log(`[BybitProvider] 撤单成功: ${orderId}`);
   }
   
   /**
@@ -477,7 +503,7 @@ export class BybitProvider implements TradingProvider {
   }
 
   /**
-   * 发送 REST API 请求
+   * 发送 REST API 请求（直接使用 curl，避免 CloudFront WAF 拦截）
    */
   private async request(
     method: string,
@@ -513,69 +539,19 @@ export class BybitProvider implements TradingProvider {
     // 构建 URL
     const url = `${this.baseUrl}${endpoint}${queryString ? '?' + queryString : ''}`;
     
-    const options: RequestInit = {
-      method,
-      headers: {
-        'X-BAPI-API-KEY': this.config.apiKey,
-        'X-BAPI-SIGN': signature,
-        'X-BAPI-SIGN-TYPE': '2',
-        'X-BAPI-TIMESTAMP': timestamp,
-        'X-BAPI-RECV-WINDOW': recvWindow,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'quant-lab/3.0',
-      },
+    const headers = {
+      'X-BAPI-API-KEY': this.config.apiKey,
+      'X-BAPI-SIGN': signature,
+      'X-BAPI-SIGN-TYPE': '2',
+      'X-BAPI-TIMESTAMP': timestamp,
+      'X-BAPI-RECV-WINDOW': recvWindow,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'quant-lab/3.0',
     };
     
-    if (method !== 'GET') {
-      options.body = body;
-    }
-    
-    let response: any;
-    let text: string;
-    
-    try {
-      response = await undiciFetch(url, {
-        ...options,
-        dispatcher: this.proxyAgent,
-      } as any);
-
-      text = await response.text();
-    } catch (fetchError: any) {
-      // Fetch 失败（SSL 错误、网络错误等）→ fallback 到 curl
-      console.warn(`[BybitProvider] Fetch failed (${method} ${endpoint}): ${fetchError.message}, fallback to curl`);
-      return this.requestViaCurl(method, url, body || undefined, options.headers as any);
-    }
-
-    // CloudFront region block page (HTML)
-    const isCloudFrontBlock =
-      response.status === 403 &&
-      text.includes('The request could not be satisfied');
-
-    if (isCloudFrontBlock) {
-      console.warn(`[BybitProvider] CloudFront 403 detected (${method} ${endpoint}), fallback to curl`);
-      return this.requestViaCurl(method, url, body || undefined, options.headers as any);
-    }
-
-    let result: any;
-    try {
-      result = text ? JSON.parse(text) : null;
-    } catch {
-      if (!response.ok) {
-        throw new Error(`Bybit API HTTP ${response.status}: ${text.slice(0, 300)}`);
-      }
-      throw new Error(`Bybit API 响应不是 JSON: ${text.slice(0, 300)}`);
-    }
-
-    if (!response.ok) {
-      throw new Error(`Bybit API HTTP ${response.status}: ${result?.retMsg || response.statusText}`);
-    }
-
-    if (result?.retCode !== 0) {
-      throw new Error(`Bybit API 错误: ${result?.retMsg}`);
-    }
-
-    return result;
+    // 直接使用 curl（避免 undici fetch 被 CloudFront WAF 拦截）
+    return this.requestViaCurl(method, url, body || undefined, headers);
   }
   
   /**

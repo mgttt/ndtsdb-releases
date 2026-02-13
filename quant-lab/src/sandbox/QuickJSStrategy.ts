@@ -433,13 +433,15 @@ export class QuickJSStrategy {
           order = await this.strategyCtx.buy(
             params.symbol,
             params.qty,
-            params.price
+            params.price,
+            params.orderLinkId  // P0 修复：传递 orderLinkId（幂等性）
           );
         } else {
           order = await this.strategyCtx.sell(
             params.symbol,
             params.qty,
-            params.price
+            params.price,
+            params.orderLinkId  // P0 修复：传递 orderLinkId（幂等性）
           );
         }
 
