@@ -591,6 +591,18 @@ export class BybitProvider implements TradingProvider {
       args.push('-x', proxy);
     }
 
+    // SSL 重试机制：GET 请求加重试（行情/持仓/订单查询）
+    if (method === 'GET') {
+      args.push('--retry', '2');          // 最多重试 2 次
+      args.push('--retry-delay', '1');    // 重试间隔 1 秒
+      args.push('--retry-all-errors');    // 重试所有错误（包括 SSL）
+      console.log(`[BybitProvider] GET 请求启用重试（--retry 2）`);
+    } else {
+      // POST 请求（下单/撤单）不盲目重试，避免重复下单
+      // 幂等性由 orderLinkId 保证
+      console.log(`[BybitProvider] POST 请求不启用重试（保证幂等性）`);
+    }
+
     // Headers
     for (const [k, v] of Object.entries(headers)) {
       args.push('-H', `${k}: ${v}`);
@@ -607,7 +619,7 @@ export class BybitProvider implements TradingProvider {
     } catch (error: any) {
       // SSL 错误或其他 curl 失败
       const errorMsg = error.stderr?.toString() || error.message || 'Unknown curl error';
-      console.error(`[BybitProvider] Curl failed: ${errorMsg}`);
+      console.error(`[BybitProvider] Curl failed (${method}): ${errorMsg}`);
       console.error(`[BybitProvider] Command: curl ${args.join(' ')}`);
       throw new Error(`Bybit API request failed (curl): ${errorMsg}`);
     }
