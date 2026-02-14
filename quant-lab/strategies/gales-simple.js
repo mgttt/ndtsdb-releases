@@ -15,8 +15,8 @@ const CONFIG = {
   orderSize: 10,               // 默认订单大小（向后兼容）
 
   // 非对称网格支持（可选，不传时使用 gridSpacing/orderSize）
-  gridSpacingUp: 0.02,         // 升方向（Sell）网格间距，如 0.02
-  gridSpacingDown: 0.04,       // 跌方向（Buy）网格间距，如 0.04
+  gridSpacingUp: 0.01,         // 升方向（Sell）网格间距，止盈紧
+  gridSpacingDown: 0.007,      // 跌方向（Buy）网格间距，加仓稍紧，确保在磁铁范围内
   orderSizeUp: 50,             // 升方向（Sell）订单大小，如 50
   orderSizeDown: 100,          // 跌方向（Buy）订单大小，如 100
 
