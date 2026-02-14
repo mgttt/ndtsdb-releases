@@ -1013,17 +1013,28 @@ function st_heartbeat(tickJson) {
   // 成交/状态更新后再对齐一次
   reconcileGridOrderLinks();
 
-  // 检查网格
+  // P0 修复：磁铁策略 - 只挂最近的一个网格
+  // 1. 找到最近的 IDLE 网格
+  let nearestGrid = null;
+  let minDistance = Infinity;
+  
   for (let i = 0; i < state.gridLevels.length; i++) {
     const grid = state.gridLevels[i];
-    const distance = Math.abs(state.lastPrice - grid.price) / grid.price;
-
     if (grid.state === 'IDLE') {
-      if (shouldPlaceOrder(grid, distance)) {
-        placeOrder(grid);
+      const distance = Math.abs(state.lastPrice - grid.price) / grid.price;
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearestGrid = grid;
       }
     } else if (grid.state === 'ACTIVE') {
-      applyActiveOrderPolicy(grid, distance);
+      applyActiveOrderPolicy(grid, Math.abs(state.lastPrice - grid.price) / grid.price);
+    }
+  }
+  
+  // 2. 只检查最近的一个是否在磁铁范围内
+  if (nearestGrid) {
+    if (shouldPlaceOrder(nearestGrid, minDistance)) {
+      placeOrder(nearestGrid);
     }
   }
 
