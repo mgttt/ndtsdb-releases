@@ -913,6 +913,40 @@ function st_init() {
   logInfo('SimMode: ' + CONFIG.simMode);
 
   loadState();
+
+  // P0 修复：从交易所同步实际持仓
+  try {
+    const positionJson = bridge_getPosition(CONFIG.symbol);
+    
+    if (positionJson === 'null' || positionJson === null || positionJson === '') {
+      logInfo('[Init] 当前无持仓，初始化为空仓');
+      state.positionNotional = 0;
+    } else {
+      const position = JSON.parse(positionJson);
+      
+      logInfo('[Init] 检测到现有持仓:');
+      logInfo('[Init]   symbol: ' + position.symbol);
+      logInfo('[Init]   side: ' + position.side);
+      logInfo('[Init]   size: ' + position.size);
+      logInfo('[Init]   positionNotional: ' + position.positionNotional);
+      
+      // 同步到策略状态
+      state.positionNotional = position.positionNotional || 0;
+      
+      // 根据方向调整符号（short模式下Sell为负）
+      if (CONFIG.direction === 'short' && position.side === 'Sell') {
+        state.positionNotional = -Math.abs(state.positionNotional);
+        logInfo('[Init] short模式调整: positionNotional = ' + state.positionNotional);
+      }
+      
+      logInfo('[Init] ✅ 持仓同步完成: positionNotional=' + state.positionNotional.toFixed(2));
+    }
+    
+    saveState();
+  } catch (e) {
+    logWarn('[Init] 获取持仓失败: ' + e + '，使用默认空仓');
+    state.positionNotional = 0;
+  }
 }
 
 /**
