@@ -18,12 +18,12 @@ console.log();
 console.log('[测试 1] DRY_RUN 环境变量');
 console.log(`  当前值: ${process.env.DRY_RUN || 'undefined'}`);
 console.log(`  默认模式: Paper Trade (DRY_RUN=true)`);
-console.log(`  切换到 Live: DRY_RUN=false bun run-gales-quickjs-bybit.ts`);
+console.log(`  切换到 Live: DRY_RUN=false bun tests/archived/run-gales-quickjs-bybit.ts`);
 console.log();
 
 // 测试 2: 代码修复检查
 const fs = require('fs');
-const code = fs.readFileSync('./tests/run-gales-quickjs-bybit.ts', 'utf8');
+const code = fs.readFileSync('./tests/archived/run-gales-quickjs-bybit.ts', 'utf8');
 
 const checks = [
   {
@@ -91,8 +91,8 @@ if (allPassed) {
   console.log('  ✅ 所有 P0 修复已完成');
   console.log();
   console.log('[下一步]');
-  console.log('  1. 启动 Paper Trade: bun tests/run-gales-quickjs-bybit.ts');
-  console.log('  2. 启动 Live: DRY_RUN=false bun tests/run-gales-quickjs-bybit.ts');
+  console.log('  1. 启动 Paper Trade: bun tests/archived/run-gales-quickjs-bybit.ts');
+  console.log('  2. 启动 Live: DRY_RUN=false bun tests/archived/run-gales-quickjs-bybit.ts');
   console.log('  3. 验证订单状态回推（观察日志中的 st_onOrderUpdate）');
 } else {
   console.log('  ❌ 部分检查未通过，请检查代码');
