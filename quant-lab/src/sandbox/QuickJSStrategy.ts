@@ -140,6 +140,9 @@ export class QuickJSStrategy {
       }
       result.value.dispose();
 
+      // 6.5. P0 修复：在 st_init 之前刷新缓存，确保 bridge_getPosition 有数据
+      await this.refreshCache(this.strategyCtx!);
+
       // 7. 调用 st_init
       await this.callStrategyFunction('st_init');
 
