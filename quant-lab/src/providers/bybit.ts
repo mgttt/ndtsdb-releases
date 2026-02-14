@@ -707,15 +707,38 @@ export class BybitProvider implements TradingProvider {
   
   /**
    * 解析持仓响应
+   * 
+   * Bybit Position API 字段：
+   * - size: 持仓数量（linear: 币数量；inverse: USD 张数）
+   * - positionValue: 持仓价值（linear: USDT 价值；inverse: BTC 价值）
+   * - avgPrice: 开仓均价
+   * - markPrice: 标记价格（用作 currentPrice）
+   * - unrealisedPnl: 未实现盈亏
    */
   private parsePosition(data: any): Position {
+    // P0 修复：添加 currentPrice 字段（使用 markPrice）
+    const currentPrice = parseFloat(data.markPrice) || 0;
+    const size = parseFloat(data.size);
+    const avgPrice = parseFloat(data.avgPrice);
+    const positionValue = parseFloat(data.positionValue);
+    
+    // P0 修复：side 映射
+    // Bybit API 返回 'Buy' 或 'Sell'
+    const side = data.side === 'Buy' ? 'LONG' : 'SHORT';
+    
+    // P0 调试日志（增强：包含 side 信息）
+    console.log(`[BybitProvider] parsePosition: symbol=${data.symbol}, side=${data.side} → ${side}, size=${size}, positionValue=${positionValue}, markPrice=${data.markPrice}`);
+    
     return {
       symbol: this.fromExchangeSymbol(data.symbol),
-      side: data.side === 'Buy' ? 'LONG' : 'SHORT',
-      quantity: parseFloat(data.size),
-      entryPrice: parseFloat(data.avgPrice),
-      unrealizedPnl: parseFloat(data.unrealisedPnl),
+      side: side,
+      quantity: size,  // 持仓数量（币数量）
+      entryPrice: avgPrice,
+      currentPrice: currentPrice,  // P0 新增：当前价格（markPrice）
+      unrealizedPnl: parseFloat(data.unrealisedPnl) || 0,
       realizedPnl: 0,
+      // P0 新增：持仓价值（USDT）
+      positionNotional: positionValue,
     };
   }
   

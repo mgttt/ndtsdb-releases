@@ -916,34 +916,44 @@ function st_init() {
 
   // P0 修复：从交易所同步实际持仓
   try {
+    logInfo('[Init] P0 DEBUG: 准备调用 bridge_getPosition, symbol=' + CONFIG.symbol);
     const positionJson = bridge_getPosition(CONFIG.symbol);
+    logInfo('[Init] P0 DEBUG: bridge_getPosition 返回: ' + JSON.stringify(positionJson));
     
-    if (positionJson === 'null' || positionJson === null || positionJson === '') {
+    if (positionJson === 'null' || positionJson === null || positionJson === undefined || positionJson === '') {
+      logInfo('[Init] P0 DEBUG: 检测到空持仓 (null/undefined/empty)');
       logInfo('[Init] 当前无持仓，初始化为空仓');
       state.positionNotional = 0;
     } else {
+      logInfo('[Init] P0 DEBUG: 开始解析持仓 JSON');
       const position = JSON.parse(positionJson);
       
       logInfo('[Init] 检测到现有持仓:');
       logInfo('[Init]   symbol: ' + position.symbol);
       logInfo('[Init]   side: ' + position.side);
-      logInfo('[Init]   size: ' + position.size);
-      logInfo('[Init]   positionNotional: ' + position.positionNotional);
+      logInfo('[Init]   positionNotional (原始): ' + position.positionNotional);
       
-      // 同步到策略状态
-      state.positionNotional = position.positionNotional || 0;
+      // 直接使用 Bybit 返回的 positionNotional (positionValue)
+      let positionNotional = position.positionNotional || 0;
+      logInfo('[Init]   使用原始 positionNotional: ' + positionNotional);
       
       // 根据方向调整符号（short模式下Sell为负）
-      if (CONFIG.direction === 'short' && position.side === 'Sell') {
-        state.positionNotional = -Math.abs(state.positionNotional);
-        logInfo('[Init] short模式调整: positionNotional = ' + state.positionNotional);
+      // 注意: Position side 可能是 'LONG'/'SHORT'/'FLAT' 或 'Buy'/'Sell'
+      const isShortSide = position.side === 'Sell' || position.side === 'SHORT' || position.side === 'short';
+      if (CONFIG.direction === 'short' && isShortSide) {
+        positionNotional = -Math.abs(positionNotional);
+        logInfo('[Init] short模式调整: positionNotional = ' + positionNotional);
       }
+      
+      // 同步到策略状态
+      state.positionNotional = positionNotional;
       
       logInfo('[Init] ✅ 持仓同步完成: positionNotional=' + state.positionNotional.toFixed(2));
     }
     
     saveState();
   } catch (e) {
+    logWarn('[Init] P0 DEBUG: 获取持仓异常: ' + e);
     logWarn('[Init] 获取持仓失败: ' + e + '，使用默认空仓');
     state.positionNotional = 0;
   }

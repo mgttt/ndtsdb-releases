@@ -441,7 +441,21 @@ export class QuickJSStrategy {
         const positions = await (ctx as any).getPositionsAsync();
         this.cachedPositions.clear();
         for (const pos of positions) {
+          // P0 修复：同时存储两种 symbol 格式（兼容带/不带斜杠）
           this.cachedPositions.set(pos.symbol, pos);
+          
+          // 如果 symbol 包含斜杠（如 MYX/USDT），也存储无斜杠版本（MYXUSDT）
+          if (pos.symbol.includes('/')) {
+            const noSlash = pos.symbol.replace('/', '');
+            this.cachedPositions.set(noSlash, pos);
+          }
+          // 如果 symbol 以 USDT 结尾且不含斜杠（如 MYXUSDT），也存储带斜杠版本（MYX/USDT）
+          else if (pos.symbol.endsWith('USDT') && pos.symbol.length > 4) {
+            const withSlash = `${pos.symbol.slice(0, -4)}/${pos.symbol.slice(-4)}`;
+            this.cachedPositions.set(withSlash, pos);
+          }
+          
+          console.log(`[QuickJSStrategy] 持仓缓存: symbol=${pos.symbol}, quantity=${pos.quantity}`);
         }
         
         console.log(`[QuickJSStrategy] 缓存刷新成功: ${positions.length} 个持仓`);
@@ -453,7 +467,19 @@ export class QuickJSStrategy {
         const account = this.cachedAccount;
         this.cachedPositions.clear();
         for (const pos of account.positions) {
+          // P0 修复：同时存储两种 symbol 格式（兼容带/不带斜杠）
           this.cachedPositions.set(pos.symbol, pos);
+          
+          // 如果 symbol 包含斜杠（如 MYX/USDT），也存储无斜杠版本（MYXUSDT）
+          if (pos.symbol.includes('/')) {
+            const noSlash = pos.symbol.replace('/', '');
+            this.cachedPositions.set(noSlash, pos);
+          }
+          // 如果 symbol 以 USDT 结尾且不含斜杠（如 MYXUSDT），也存储带斜杠版本（MYX/USDT）
+          else if (pos.symbol.endsWith('USDT') && pos.symbol.length > 4) {
+            const withSlash = `${pos.symbol.slice(0, -4)}/${pos.symbol.slice(-4)}`;
+            this.cachedPositions.set(withSlash, pos);
+          }
         }
         
         console.log(`[QuickJSStrategy] 缓存刷新成功: ${account.positions.length} 个持仓`);
@@ -588,6 +614,12 @@ export class QuickJSStrategy {
     const bridge_getPosition = this.ctx.newFunction('bridge_getPosition', (symbolHandle) => {
       const symbol = this.ctx!.getString(symbolHandle);
       const position = this.cachedPositions.get(symbol);
+      
+      // P0 调试日志
+      console.log(`[QuickJSStrategy] bridge_getPosition(${symbol}): found=${!!position}`);
+      if (!position) {
+        console.log(`[QuickJSStrategy] bridge_getPosition: cachedPositions keys:`, Array.from(this.cachedPositions.keys()));
+      }
       
       if (!position) {
         return this.ctx!.newString('null');

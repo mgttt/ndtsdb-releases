@@ -61,11 +61,12 @@ export interface Order {
 export interface Position {
   symbol: string;
   side: PositionSide;
-  quantity: number;
-  entryPrice: number;
-  currentPrice: number;
-  unrealizedPnl: number;
-  realizedPnl: number;
+  quantity: number;          // 持仓数量（币数量）
+  entryPrice: number;        // 开仓均价
+  currentPrice: number;      // 当前价格（markPrice）
+  unrealizedPnl: number;     // 未实现盈亏
+  realizedPnl: number;       // 已实现盈亏
+  positionNotional?: number; // P0 新增：持仓名义价值（USDT），可选字段
 }
 
 /**
