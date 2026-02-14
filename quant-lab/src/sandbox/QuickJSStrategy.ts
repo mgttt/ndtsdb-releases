@@ -426,18 +426,42 @@ export class QuickJSStrategy {
 
   /**
    * 刷新缓存（账户 + 持仓）
+   * P0 修复：支持 BybitStrategyContext 的异步 API
    */
   private async refreshCache(ctx: StrategyContext): Promise<void> {
     try {
-      this.cachedAccount = await ctx.getAccount();
+      // 检测 ctx 类型：如果有 getAccountAsync，说明是 BybitStrategyContext
+      const hasAsyncAPI = 'getAccountAsync' in ctx && typeof (ctx as any).getAccountAsync === 'function';
       
-      const positions = await ctx.getPositions();
-      this.cachedPositions.clear();
-      for (const pos of positions) {
-        this.cachedPositions.set(pos.symbol, pos);
+      if (hasAsyncAPI) {
+        // BybitStrategyContext: 使用异步 API
+        this.cachedAccount = await (ctx as any).getAccountAsync();
+        
+        // 获取所有持仓
+        const positions = await (ctx as any).getPositionsAsync();
+        this.cachedPositions.clear();
+        for (const pos of positions) {
+          this.cachedPositions.set(pos.symbol, pos);
+        }
+        
+        console.log(`[QuickJSStrategy] 缓存刷新成功: ${positions.length} 个持仓`);
+      } else {
+        // LiveEngine/BacktestEngine: 使用同步 API
+        this.cachedAccount = ctx.getAccount();
+        
+        // LiveEngine 没有 getPositions() 方法，需要从 Account 获取
+        const account = this.cachedAccount;
+        this.cachedPositions.clear();
+        for (const pos of account.positions) {
+          this.cachedPositions.set(pos.symbol, pos);
+        }
+        
+        console.log(`[QuickJSStrategy] 缓存刷新成功: ${account.positions.length} 个持仓`);
       }
     } catch (error: any) {
-      console.warn(`[QuickJSStrategy] 缓存刷新失败:`, error.message);
+      console.error(`[QuickJSStrategy] 缓存刷新失败:`, error.message);
+      // P0 修复：抛出错误让调用者知道初始化失败
+      throw error;
     }
   }
 

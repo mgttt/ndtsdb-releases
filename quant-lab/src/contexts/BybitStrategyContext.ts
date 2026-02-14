@@ -193,4 +193,12 @@ export class BybitStrategyContext implements StrategyContext {
   async getPositionAsync(symbol: string): Promise<Position | null> {
     return this.provider.getPosition(symbol);
   }
+  
+  /**
+   * 获取所有持仓（异步）
+   * P0 修复：供 QuickJSStrategy.refreshCache() 调用
+   */
+  async getPositionsAsync(): Promise<Position[]> {
+    return this.provider.getPositions();
+  }
 }
