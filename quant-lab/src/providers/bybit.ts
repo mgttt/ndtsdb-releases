@@ -418,8 +418,20 @@ export class BybitProvider implements TradingProvider {
       orderId: id,
     };
     
-    await this.request('POST', '/v5/order/cancel', params);
-    console.log(`[BybitProvider] 撤单成功: ${orderId}`);
+    try {
+      await this.request('POST', '/v5/order/cancel', params);
+      console.log(`[BybitProvider] 撤单成功: ${orderId}`);
+    } catch (error: any) {
+      // 正常竞态：订单在撤单前已成交/过期/不存在
+      if (error.message && error.message.includes('order not exists or too late to cancel')) {
+        console.log(`[BybitProvider] 撤单已完成（订单已不存在）: ${orderId} - ${error.message}`);
+        return;  // 不抛出异常，视为成功
+      }
+      
+      // 其他真正的撤单错误：继续抛出
+      console.error(`[BybitProvider] 撤单失败: ${orderId} - ${error.message}`);
+      throw error;
+    }
   }
   
   /**

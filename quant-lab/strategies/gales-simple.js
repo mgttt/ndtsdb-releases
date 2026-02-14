@@ -509,12 +509,13 @@ function updatePositionFromFill(side, fillQty, fillPrice) {
   }
 
   if (CONFIG.direction === 'short') {
-    // 做空模式：Sell 增加仓位（负向），Buy 只是虚仓
+    // 做空模式：Sell 增加空仓（更负），Buy 减少空仓（向0靠拢，回补）
     if (side === 'Sell') {
       state.positionNotional -= notional;
     } else {
-      // Buy 成交只是对冲
-      logDebug('[虚仓] short 模式下 Buy 成交仅记账: +' + notional.toFixed(2));
+      // Buy 减少空仓（修复：原来是虚仓逻辑，现在实际影响仓位）
+      state.positionNotional += notional;
+      logDebug('[减空] short 模式下 Buy 成交减空仓: +' + notional.toFixed(2));
     }
     return;
   }
@@ -1230,9 +1231,17 @@ function getEffectiveMagnetDistance() {
 function shouldPlaceOrder(grid, distance) {
   const distancePct = (distance * 100).toFixed(2);
 
+  // P0 Debug: 记录 Buy 网格检查
+  if (grid.side === 'Buy') {
+    logDebug('[P0 DEBUG] shouldPlaceOrder Buy gridId=' + grid.id + ' price=' + grid.price.toFixed(4) + ' distance=' + distancePct + '% state=' + grid.state);
+  }
+
   // 1. 磁铁检查（双向）
   const magnet = getEffectiveMagnetDistance();
   if (distance > magnet) {
+    if (grid.side === 'Buy') {
+      logDebug('[P0 DEBUG] Buy gridId=' + grid.id + ' 距离超磁铁: ' + distancePct + '% > ' + (magnet*100).toFixed(2) + '%');
+    }
     return false;  // 距离太远
   }
 
@@ -1252,6 +1261,9 @@ function shouldPlaceOrder(grid, distance) {
     const cooldownMs = CONFIG.cooldownSec * 1000;
     const elapsed = Date.now() - grid.lastTriggerTime;
     if (elapsed < cooldownMs) {
+      if (grid.side === 'Buy') {
+        logDebug('[P0 DEBUG] Buy gridId=' + grid.id + ' 冷却中: ' + (elapsed/1000).toFixed(1) + 's < ' + CONFIG.cooldownSec + 's');
+      }
       return false;  // 冷却中
     }
   }
@@ -1259,6 +1271,9 @@ function shouldPlaceOrder(grid, distance) {
   // 4. 防重复：如果该 grid 已存在活跃订单（但 grid 状态丢了），则修复并跳过
   const existing = findActiveOrderByGridId(grid.id);
   if (existing) {
+    if (grid.side === 'Buy') {
+      logDebug('[P0 DEBUG] Buy gridId=' + grid.id + ' 已存在活跃单: ' + existing.orderId);
+    }
     syncGridFromOrder(grid, existing);
     return false;
   }
@@ -1304,6 +1319,9 @@ function shouldPlaceOrder(grid, distance) {
   }
 
   // 6. 通过所有检查，可以触发
+  if (grid.side === 'Buy') {
+    logInfo('[P0 DEBUG] ✨ Buy gridId=' + grid.id + ' 通过所有检查，即将触发! price=' + grid.price.toFixed(4) + ' distance=' + distancePct + '%');
+  }
   logInfo('✨ 触发网格 #' + grid.id + ' ' + grid.side + ' @ ' + grid.price.toFixed(4) + ' (距离 ' + distancePct + '%)');
   return true;
 }
