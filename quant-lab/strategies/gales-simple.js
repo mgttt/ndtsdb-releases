@@ -20,7 +20,7 @@ const CONFIG = {
   orderSizeUp: 50,             // 升方向（Sell）订单大小，如 50
   orderSizeDown: 100,          // 跌方向（Buy）订单大小，如 100
 
-  maxPosition: 3500,  // 2026-02-15: 从100调整到3500，匹配实际持仓2897 USDT（占账户3.6%，风险可控）
+  maxPosition: 3937,  // 2026-02-15: 总权益5%（78739×0.05），避免频繁熔断，当前持仓3298/3937=83.8%
 
   magnetDistance: 0.005,     // 0.5%
   cancelDistance: 0.01,      // 1%
