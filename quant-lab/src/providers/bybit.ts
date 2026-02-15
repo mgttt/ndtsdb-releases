@@ -469,10 +469,12 @@ export class BybitProvider implements TradingProvider {
     
     let balance = 0;
     let equity = 0;
+    let availableMargin = 0;  // P0修复：使用totalAvailableBalance
 
     if (result.result?.list?.[0]) {
       const account = result.result.list[0];
       equity = parseFloat(account.totalEquity) || 0;
+      availableMargin = parseFloat(account.totalAvailableBalance) || 0;  // ✅ 使用totalAvailableBalance
 
       // pick USDT walletBalance as a rough available number
       const coin = account.coin?.find((c: any) => c.coin === 'USDT');
@@ -484,7 +486,7 @@ export class BybitProvider implements TradingProvider {
     return {
       balance,
       equity: equity || balance,
-      availableMargin: balance,
+      availableMargin,  // ✅ 修复：使用totalAvailableBalance（66395 USDT）而非walletBalance（0 USDT）
     };
   }
   

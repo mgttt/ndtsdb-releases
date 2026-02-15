@@ -3,7 +3,7 @@
 **High-performance embedded time series database for TypeScript** — 8.9M ticks/sec, 487K snapshots/sec, 3000 products loaded in 60ms.
 
 <!-- VERSION_START -->
-**Version: 0.9.2.6**
+**Version: 0.9.5.0**
 <!-- VERSION_END -->
 
 ```
@@ -302,6 +302,10 @@ bun run tests/sql-test.ts               # SQL parser + executor
 ---
 
 ## Version History
+
+- **v0.9.5.0** (2026-02-15)
+  - Version unified to 0.9.5.0 (package.json/VERSION/README aligned)
+  - All previous 0.9.2.6 features included
 
 - **v0.9.2.6** (2026-02-10)
   - SQL extensions: CTE (WITH), multi-column IN, string concatenation `||`, ROUND/SQRT
