@@ -89,8 +89,8 @@ export interface StrategyContext {
   getPosition(symbol: string): Position | null;
   
   // 订单操作
-  buy(symbol: string, quantity: number, price?: number): Promise<Order>;
-  sell(symbol: string, quantity: number, price?: number): Promise<Order>;
+  buy(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order>;
+  sell(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order>;
   cancelOrder(orderId: string): Promise<void>;
   
   // 数据查询

@@ -29,8 +29,9 @@ export async function restartCommand(
     console.log(`[wp] 重启 ${processes.length} 个进程...`);
     for (const proc of processes) {
       try {
-        await daemon.sendCommand({ action: 'restart', payload: { name: proc.name } });
-        console.log(`[wp] 已重启: ${proc.name}`);
+        const res = await daemon.sendCommand({ action: 'restart', payload: { name: proc.name } });
+        if (res.ok) console.log(`[wp] 已重启: ${proc.name}`);
+        else console.error(`[wp] 重启失败: ${proc.name} - ${res.error || 'unknown error'}`);
       } catch (err) {
         console.error(`[wp] 重启失败: ${proc.name}`, err);
       }
@@ -57,8 +58,9 @@ export async function restartCommand(
 
     for (const proc of processes) {
       try {
-        await daemon.sendCommand({ action: 'restart', payload: { name: proc.name } });
-        console.log(`[wp] 已重启: ${proc.name}`);
+        const res = await daemon.sendCommand({ action: 'restart', payload: { name: proc.name } });
+        if (res.ok) console.log(`[wp] 已重启: ${proc.name}`);
+        else console.error(`[wp] 重启失败: ${proc.name} - ${res.error || 'unknown error'}`);
       } catch (err) {
         console.error(`[wp] 重启失败: ${proc.name}`, err);
       }
@@ -67,8 +69,12 @@ export async function restartCommand(
     // 重启单个进程
     console.log(`[wp] 重启进程: ${target}`);
     try {
-      await daemon.sendCommand({ action: 'restart', payload: { name: target } });
-      console.log(`[wp] 已重启: ${target}`);
+      const res = await daemon.sendCommand({ action: 'restart', payload: { name: target } });
+      if (res.ok) console.log(`[wp] 已重启: ${target}`);
+      else {
+        console.error(`[wp] 重启失败: ${res.error || 'unknown error'}`);
+        process.exit(1);
+      }
     } catch (err) {
       console.error(`[wp] 重启失败: ${err}`);
       process.exit(1);

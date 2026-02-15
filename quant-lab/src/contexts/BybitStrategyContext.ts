@@ -76,8 +76,10 @@ export class BybitStrategyContext implements StrategyContext {
    * - qty: Math.floor(qty / qtyStep) * qtyStep
    * - price: Math.round(price / tickSize) * tickSize
    * - qty < minQty → 跳过下单
+   * 
+   * P0修复：添加orderLinkId参数（幂等性保护）
    */
-  async buy(symbol: string, quantity: number, price?: number): Promise<Order> {
+  async buy(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     // 1. 数量截断（向下取整）
     const truncatedQty = Math.floor(quantity / this.qtyStep) * this.qtyStep;
     
@@ -95,20 +97,21 @@ export class BybitStrategyContext implements StrategyContext {
     
     // 4. 日志
     this.log(
-      `[BybitContext] 买入 ${symbol}: qty=${truncatedQty} (原${quantity}), price=${truncatedPrice || 'Market'}`,
+      `[BybitContext] 买入 ${symbol}: qty=${truncatedQty} (原${quantity}), price=${truncatedPrice || 'Market'}, orderLinkId=${orderLinkId || 'auto'}`,
       'info'
     );
     
-    // 5. 调用 Provider
-    return this.provider.buy(symbol, truncatedQty, truncatedPrice);
+    // 5. 调用 Provider（P0：透传orderLinkId）
+    return this.provider.buy(symbol, truncatedQty, truncatedPrice, orderLinkId);
   }
   
   /**
    * 卖出（做空）
    * 
    * 精度截断规则同 buy()
+   * P0修复：添加orderLinkId参数（幂等性保护）
    */
-  async sell(symbol: string, quantity: number, price?: number): Promise<Order> {
+  async sell(symbol: string, quantity: number, price?: number, orderLinkId?: string): Promise<Order> {
     // 1. 数量截断（向下取整）
     const truncatedQty = Math.floor(quantity / this.qtyStep) * this.qtyStep;
     
@@ -126,12 +129,12 @@ export class BybitStrategyContext implements StrategyContext {
     
     // 4. 日志
     this.log(
-      `[BybitContext] 卖出 ${symbol}: qty=${truncatedQty} (原${quantity}), price=${truncatedPrice || 'Market'}`,
+      `[BybitContext] 卖出 ${symbol}: qty=${truncatedQty} (原${quantity}), price=${truncatedPrice || 'Market'}, orderLinkId=${orderLinkId || 'auto'}`,
       'info'
     );
     
-    // 5. 调用 Provider
-    return this.provider.sell(symbol, truncatedQty, truncatedPrice);
+    // 5. 调用 Provider（P0：透传orderLinkId）
+    return this.provider.sell(symbol, truncatedQty, truncatedPrice, orderLinkId);
   }
   
   /**

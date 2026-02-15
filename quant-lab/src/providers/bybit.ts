@@ -614,9 +614,15 @@ export class BybitProvider implements TradingProvider {
       // 日志优化：删除"启用重试"提示（占56.8%日志，无实际价值）
       // 实际重试错误会在 catch 块打印
     } else {
-      // POST 请求（下单/撤单）不盲目重试，避免重复下单
+      // P1修复：撤单POST可以安全重试（同orderId幂等）
+      if (url.includes('/v5/order/cancel')) {
+        args.push('--retry', '2');
+        args.push('--retry-delay', '1');
+        args.push('--retry-all-errors');
+        // 撤单幂等：同orderId重试安全
+      }
+      // 其他POST请求（下单）不盲目重试，避免重复下单
       // 幂等性由 orderLinkId 保证
-      // 日志优化：删除POST提示（无实际价值）
     }
 
     // Headers

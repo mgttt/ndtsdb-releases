@@ -178,17 +178,23 @@ export class ProcessManager extends EventEmitter {
    * 重启进程
    */
   async restart(name: string): Promise<ProcessState> {
+    // If process is currently online (in-memory), stop then start.
     const instance = this.processes.get(name);
-    if (!instance) {
+
+    // If it's not in memory (e.g., previously stopped), fall back to persisted state.
+    const persisted = this.stateManager.getProcess(name);
+    const config = instance?.config || persisted?.config;
+
+    if (!config) {
       throw new Error(`进程 ${name} 不存在`);
     }
 
-    const config = instance.config;
-    await this.stop(name);
-    
-    // 短暂延迟后重启
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
+    if (instance) {
+      await this.stop(name);
+      // 短暂延迟后重启
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
     return this.start(config);
   }
 
