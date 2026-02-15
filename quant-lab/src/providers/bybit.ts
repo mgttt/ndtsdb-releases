@@ -499,6 +499,12 @@ export class BybitProvider implements TradingProvider {
       return [];
     }
     
+    // P1 调试：打印完整的 Bybit API 响应（仅前 3 个持仓）
+    console.log('[BybitProvider] getPositions raw response (first 3):');
+    result.result.list.slice(0, 3).forEach((p: any, i: number) => {
+      console.log(`  [${i}] symbol=${p.symbol}, side=${p.side}, size=${p.size}, positionValue=${p.positionValue}`);
+    });
+    
     return result.result.list
       .filter((p: any) => parseFloat(p.size) > 0)
       .map((p: any) => this.parsePosition(p));
@@ -722,8 +728,21 @@ export class BybitProvider implements TradingProvider {
     const avgPrice = parseFloat(data.avgPrice);
     const positionValue = parseFloat(data.positionValue);
     
+    // P1 调试：打印完整的 data 对象（关键字段）
+    console.log(`[BybitProvider] parsePosition raw data:`, {
+      symbol: data.symbol,
+      side: data.side,
+      size: data.size,
+      positionIdx: data.positionIdx,
+      positionValue: data.positionValue,
+      unrealisedPnl: data.unrealisedPnl,
+      avgPrice: data.avgPrice,
+      markPrice: data.markPrice,
+    });
+    
     // P0 修复：side 映射
     // Bybit API 返回 'Buy' 或 'Sell'
+    // 文档定义：Buy = long, Sell = short
     const side = data.side === 'Buy' ? 'LONG' : 'SHORT';
     
     // P0 调试日志（增强：包含 side 信息）
