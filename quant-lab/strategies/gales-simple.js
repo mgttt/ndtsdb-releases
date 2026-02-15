@@ -20,7 +20,7 @@ const CONFIG = {
   orderSizeUp: 50,             // 升方向（Sell）订单大小，如 50
   orderSizeDown: 100,          // 跌方向（Buy）订单大小，如 100
 
-  maxPosition: 3937,  // 2026-02-15: 总权益5%（78739×0.05），避免频繁熔断，当前持仓3298/3937=83.8%
+  maxPosition: 7874,  // 2026-02-15: 总权益10%（78739×0.1），避免触顶，熔断只告警不撤单
 
   magnetDistance: 0.005,     // 0.5%
   cancelDistance: 0.01,      // 1%
@@ -60,7 +60,7 @@ const CONFIG = {
   circuitBreaker: {
     enabled: true,
     maxDrawdown: 0.30,          // 最大回撤 30%
-    maxPositionRatio: 0.90,     // 仓位使用率 90%
+    maxPositionRatio: 0.93,     // 仓位使用率 93%（避免频繁熔断）
     maxPriceDrift: 0.50,        // 价格偏离中心 50%
     cooldownAfterTrip: 600,     // 熔断后冷却 10 分钟
   },
@@ -322,12 +322,13 @@ function checkCircuitBreaker() {
     circuitBreakerState.reason = '仓位熔断';
     circuitBreakerState.tripAt = now;
     
-    logWarn('[熔断触发] 仓位熔断 positionRatio=' + (positionRatio * 100).toFixed(2) + '%');
+    logWarn('[熔断触发] 仓位熔断（告警only，不撤单）positionRatio=' + (positionRatio * 100).toFixed(2) + '%');
     
-    // 撤销所有订单
-    cancelAllOrders();
+    // P0修复：取消撤单，只保留告警
+    // cancelAllOrders();
     
-    return true;
+    // 不触发熔断停止，继续交易
+    return false;
   }
   
   // 3. 价格偏离熔断
