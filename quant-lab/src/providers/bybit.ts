@@ -611,11 +611,12 @@ export class BybitProvider implements TradingProvider {
       args.push('--retry', '2');          // 最多重试 2 次
       args.push('--retry-delay', '1');    // 重试间隔 1 秒
       args.push('--retry-all-errors');    // 重试所有错误（包括 SSL）
-      console.log(`[BybitProvider] GET 请求启用重试（--retry 2）`);
+      // 日志优化：删除"启用重试"提示（占56.8%日志，无实际价值）
+      // 实际重试错误会在 catch 块打印
     } else {
       // POST 请求（下单/撤单）不盲目重试，避免重复下单
       // 幂等性由 orderLinkId 保证
-      console.log(`[BybitProvider] POST 请求不启用重试（保证幂等性）`);
+      // 日志优化：删除POST提示（无实际价值）
     }
 
     // Headers
