@@ -121,6 +121,10 @@ let state = {
   lastPlaceTick: 0,        // 上次尝试挂单的 tick（用于判断长期不交易）
   lastRecenterAtMs: 0,     // 上次重心时间
   lastRecenterTick: 0,     // 上次重心发生的 tick
+  
+  // P0修复：110072根治 - 唯一orderLinkId生成
+  runId: 0,                // 本次运行唯一ID
+  orderSeq: 0,             // 订单序列号
 };
 
 // 运行时状态（不持久化）
@@ -163,6 +167,8 @@ function loadState() {
         if (!state.lastPlaceTick) state.lastPlaceTick = 0;
         if (!state.lastRecenterAtMs) state.lastRecenterAtMs = 0;
         if (!state.lastRecenterTick) state.lastRecenterTick = 0;
+        if (!state.runId) state.runId = 0;
+        if (!state.orderSeq) state.orderSeq = 0;
       }
     }
   } catch (e) {
@@ -958,6 +964,11 @@ function st_init() {
     logWarn('[Init] 获取持仓失败: ' + e + '，使用默认空仓');
     state.positionNotional = 0;
   }
+  
+  // P0修复：110072根治 - 生成新的runId
+  state.runId = Date.now();
+  state.orderSeq = 0;
+  logInfo('[Init] P0: 110072根治 - 新runId=' + state.runId + '，orderLinkId将唯一');
 }
 
 /**
@@ -1418,7 +1429,8 @@ function placeOrder(grid) {
     : (CONFIG.orderSizeUp !== null ? CONFIG.orderSizeUp : CONFIG.orderSize);
 
   const quantity = orderSize / orderPrice;
-  const orderLinkId = 'gales-' + grid.id + '-' + grid.side;
+  // P0修复：110072根治 - 使用runId+序列号生成唯一orderLinkId
+  const orderLinkId = 'gales-' + state.runId + '-' + (state.orderSeq++) + '-' + grid.side;
 
   // 记录"有下单行为"（用于 autoRecenter 判断）
   state.lastPlaceTick = state.tickCount || 0;

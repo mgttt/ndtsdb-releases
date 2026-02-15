@@ -303,6 +303,17 @@ export class BybitProvider implements TradingProvider {
     try {
       result = await this.request('POST', '/v5/order/create', params);
     } catch (error: any) {
+      // P0修复：110072幂等成功处理（OrderLinkedID is duplicate）
+      if (error.message?.includes('110072') || error.message?.includes('OrderLinkedID is duplicate')) {
+        if (params.orderLinkId) {
+          console.log(`[BybitProvider] 110072幂等处理：查询订单 orderLinkId=${params.orderLinkId}`);
+          const existingOrder = await this.getOrderByLinkId(params.orderLinkId);
+          if (existingOrder) {
+            console.log(`[BybitProvider] 110072幂等成功：返回已存在订单 ${existingOrder.orderId}`);
+            return existingOrder;
+          }
+        }
+      }
       console.error(`[BybitProvider] 下单失败: ${error.message}`);
       throw error;
     }
@@ -359,6 +370,17 @@ export class BybitProvider implements TradingProvider {
     try {
       result = await this.request('POST', '/v5/order/create', params);
     } catch (error: any) {
+      // P0修复：110072幂等成功处理（OrderLinkedID is duplicate）
+      if (error.message?.includes('110072') || error.message?.includes('OrderLinkedID is duplicate')) {
+        if (params.orderLinkId) {
+          console.log(`[BybitProvider] 110072幂等处理：查询订单 orderLinkId=${params.orderLinkId}`);
+          const existingOrder = await this.getOrderByLinkId(params.orderLinkId);
+          if (existingOrder) {
+            console.log(`[BybitProvider] 110072幂等成功：返回已存在订单 ${existingOrder.orderId}`);
+            return existingOrder;
+          }
+        }
+      }
       console.error(`[BybitProvider] 下单失败: ${error.message}`);
       throw error;
     }
@@ -524,6 +546,30 @@ export class BybitProvider implements TradingProvider {
       lastPrice: parseFloat(ticker.lastPrice),
       volume24h: parseFloat(ticker.volume24h || '0'),
     };
+  }
+
+  /**
+   * P0修复：查询订单（按orderLinkId）
+   * 用于110072幂等成功处理
+   */
+  async getOrderByLinkId(orderLinkId: string): Promise<Order | null> {
+    try {
+      const result = await this.request('GET', '/v5/order/realtime', {
+        category: this.category,
+        orderLinkId,
+      });
+      
+      const orders = result.result?.list || [];
+      if (orders.length === 0) {
+        return null;
+      }
+      
+      // 返回第一个匹配订单
+      return this.parseOrder(orders[0]);
+    } catch (error: any) {
+      console.error(`[BybitProvider] 查询订单失败（orderLinkId=${orderLinkId}）: ${error.message}`);
+      return null;
+    }
   }
 
   /**
