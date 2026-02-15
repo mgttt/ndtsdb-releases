@@ -149,6 +149,9 @@ let circuitBreakerState = {
   reason: '',
   tripAt: 0,
   highWaterMark: 0,  // 最高权益（用于计算回撤）
+  // P1修复：熔断震荡
+  recoveryTickCount: 0,  // 连续满足恢复条件的心跳数
+  blockedSide: '',       // 熔断中禁止的开仓方向 ('Buy'/'Sell')
 };
 
 // 加载状态
@@ -273,18 +276,32 @@ function checkCircuitBreaker() {
   const now = Date.now();
   const cb = CONFIG.circuitBreaker;
   
-  // 冷却期内不重复检查
+  // 冷却期内检查恢复条件
   if (circuitBreakerState.tripped) {
     const elapsed = (now - circuitBreakerState.tripAt) / 1000;
     if (elapsed < cb.cooldownAfterTrip) {
       return true;  // 仍在冷却期
     }
     
-    // 冷却期结束，重置熔断
-    logWarn('[熔断恢复] 冷却期结束，恢复交易');
-    circuitBreakerState.tripped = false;
-    circuitBreakerState.reason = '';
-    return false;
+    // P1修复：熔断震荡 - 需要positionRatio < 阈值 连续3个心跳才恢复
+    const positionRatio = Math.abs(state.positionNotional) / CONFIG.maxPosition;
+    if (positionRatio < cb.maxPositionRatio) {
+      circuitBreakerState.recoveryTickCount = (circuitBreakerState.recoveryTickCount || 0) + 1;
+      if (circuitBreakerState.recoveryTickCount >= 3) {
+        // 连续3个心跳满足条件，重置熔断
+        circuitBreakerState.tripped = false;
+        circuitBreakerState.reason = '';
+        circuitBreakerState.recoveryTickCount = 0;
+        circuitBreakerState.blockedSide = '';
+        logInfo('[熔断恢复] 仓位回落，恢复交易');
+        return false;
+      }
+    } else {
+      // 不满足条件，重置计数
+      circuitBreakerState.recoveryTickCount = 0;
+    }
+    
+    return true;  // 冷却期结束但仓位未回落，继续熔断
   }
   
   // 1. 回撤熔断
@@ -327,6 +344,14 @@ function checkCircuitBreaker() {
     circuitBreakerState.tripped = true;
     circuitBreakerState.reason = '仓位熔断';
     circuitBreakerState.tripAt = now;
+    circuitBreakerState.recoveryTickCount = 0;
+    
+    // P1修复：记录禁止开仓方向
+    if (state.positionNotional > 0) {
+      circuitBreakerState.blockedSide = 'Buy';  // 多仓超限，禁Buy
+    } else if (state.positionNotional < 0) {
+      circuitBreakerState.blockedSide = 'Sell'; // 空仓超限，禁Sell
+    }
     
     logWarn('[熔断触发] 仓位熔断（告警only，不撤单）positionRatio=' + (positionRatio * 100).toFixed(2) + '%');
     
@@ -1347,12 +1372,20 @@ function shouldPlaceOrder(grid, distance) {
 
   // 5. 方向检查
   if (CONFIG.direction === 'long' && grid.side === 'Sell') {
-    // 做多模式：卖单仅记账，不实际限制
+    // 做多模式：卖单仅记账，不实际下单
     logDebug('[方向限制] long 模式下 Sell 仅记账 gridId=' + grid.id);
+    return false;  // P1修复：阻止实际下单
   }
   if (CONFIG.direction === 'short' && grid.side === 'Buy') {
-    // 做空模式：买单仅记账，不实际限制
+    // 做空模式：买单仅记账，不实际下单
     logDebug('[方向限制] short 模式下 Buy 仅记账 gridId=' + grid.id);
+    return false;  // P1修复：阻止实际下单
+  }
+
+  // P1修复：熔断震荡 - 熔断中禁止超限方向开仓
+  if (circuitBreakerState.tripped && circuitBreakerState.blockedSide === grid.side) {
+    logDebug('[熔断限制] 熔断中禁止' + grid.side + '开仓 gridId=' + grid.id);
+    return false;
   }
 
   // 6. 仓位检查（考虑"已持仓 + 未成交挂单"的最坏情况）

@@ -60,8 +60,11 @@ async function step2_verifyAccount(wctx: WorkerContext): Promise<void> {
   log('step', 'Step 2: Verify Account Access');
 
   try {
-    // 测试账号: wjcgm@bbt-sub1 (日本IP锁定)
-    const accountId = 'wjcgm@bbt-sub1';
+    // P1修复：账号必须通过环境变量配置（删除硬编码）
+    const accountId = process.env.TEST_ACCOUNT_ID;
+    if (!accountId) {
+      throw new Error('TEST_ACCOUNT_ID environment variable required. Example: export TEST_ACCOUNT_ID=your-test-account');
+    }
 
     log('info', `Testing account: ${accountId}`);
 
@@ -138,7 +141,7 @@ async function step4_checkOrders(wctx: WorkerContext): Promise<void> {
 
   // 获取最近订单
   try {
-    const client = wctx.apiPool.get('wjcgm@bbt-sub1');
+    const client = wctx.apiPool.get(accountId);  // P1修复：使用环境变量账号
     if (client) {
       const orders = await client.getOrders({ category: 'linear', limit: 10 });
       log('info', `Recent orders: ${orders.length}`);
@@ -157,7 +160,7 @@ async function step4_checkOrders(wctx: WorkerContext): Promise<void> {
 async function main() {
   console.log('\n╔════════════════════════════════════════════════╗');
   console.log('║     Quant-Lab Live Account Test                ║');
-  console.log('║     1000U Sub-Account (wjcgm@bbt-sub1)         ║');
+  console.log(`║     Test Account (${accountId})         ║`);  // P1修复：显示实际账号
   console.log('╚════════════════════════════════════════════════╝\n');
 
   log('warn', 'This will test with REAL account but MINIMAL size');

@@ -57,8 +57,16 @@ if (args[1] === '--live') {
 }
 
 const paramsJson = args[argIdx] || '{}';
-const exchange = args[argIdx + 1] || 'bybit';
-const accountId = args[argIdx + 2] || 'wjcgm@bbt-sub1';
+const exchange = args[argIdx + 1];
+const accountId = args[argIdx + 2];
+
+// P1修复：删除默认账号，强制传参
+if (!exchange) {
+  throw new Error('Missing required argument: exchange. Usage: bun run-strategy-generic.ts <strategy> [--live <params>] <exchange> <accountId>');
+}
+if (!accountId) {
+  throw new Error('Missing required argument: accountId. Usage: bun run-strategy-generic.ts <strategy> [--live <params>] <exchange> <accountId>');
+}
 
 // 验证策略文件
 if (!existsSync(strategyFile)) {
